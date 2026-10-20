@@ -18,8 +18,9 @@
 | `tests/sim2sim` | 已有 `bpx-sim2sim`，Python 3.11.15 | 31 通过 |
 | `tests/sim2real` | 已有 `bpx-real`，Python 3.11.15 | 55 通过，1 跳过 |
 | `tests/project` | 已有 `bpx-sim2sim`，Python 3.11.15 | 7 通过 |
+| `tests/training` | 训练环境（`scripts/training_python.sh`，torch+rsl_rl） | 46 通过 |
 
-共运行 94 项，93 项通过，1 项因不附带策略权重而跳过。
+共运行 140 项，139 项通过，1 项因不附带策略权重而跳过。
 实机相关测试注入模拟 SDK、反馈和策略，覆盖标定、起身流程、发送周期、退出处理、
 只读监控、录制及离线回放，没有创建真实硬件连接。
 新增单策略回归覆盖 ONNX/TorchScript 共用路径入口、模型仅加载一次、
@@ -31,7 +32,26 @@
 PYTHONPATH=src ~/miniconda3/envs/bpx-sim2sim/bin/python -m unittest discover -s tests/sim2sim -v
 PYTHONPATH=src ~/miniconda3/envs/bpx-real/bin/python -m unittest discover -s tests/sim2real -v
 PYTHONPATH=src ~/miniconda3/envs/bpx-sim2sim/bin/python -m unittest discover -s tests/project -v
+bash scripts/training_python.sh -m unittest discover -s tests/training -v
 ```
+
+## 训练算法离线测试（tests/training，2026-10-20 新增）
+
+不启动 Isaac Sim，直接验证算法模块：
+
+- CENet：输出维度（速度 3 / 隐变量可配置）、确定性前向、Decoder 维度、
+  辅助损失有限、所有子模块梯度有效、done 掩码屏蔽无效未来观测、
+  logvar 裁剪。
+- DreamWaQActorCritic：Actor 输入维度 45+3+16=64、动作输出 12 维、
+  Critic 输入 71 维、推理确定性、特征 detach、保存的特征复现、
+  checkpoint 含全部 CENet 参数、部署模块（450→12）与最新帧提取有效性。
+- DreamWaQPPO：扩展 Rollout 存储字段、CENet 参数注册进优化器、
+  完整 rollout+update 流程（含末步全终止的 done 屏蔽）、Actor/CENet/Critic
+  参数均被更新、cenet/* 指标齐全有限、AdaBoot 三种模式与关闭状态。
+- 地形课程：升/降级判定、互斥、静止指令保护、只升不降模式、
+  伪环境接线的等级更新与逐等级统计。
+- 指令课程：初始网格与概率归一化、联合采样边界、探索混合、
+  min_samples/双轴成功门控、边界单元邻域扩展、激活单调性、EMA 更新。
 
 ## 运行与安装
 
@@ -41,13 +61,49 @@ PYTHONPATH=src ~/miniconda3/envs/bpx-sim2sim/bin/python -m unittest discover -s 
 - 已从 `/tmp` 工作目录运行四个安装入口的检查、短仿真、运行前检查和监控帮助。
 - 直接脚本在没有项目 PYTHONPATH、且当前目录位于临时目录时运行成功。
 
+## 训练与导出实测（2026-10-20，Isaac Sim 5.0 headless，RTX 4060）
+
+按任务要求逐项实测，全部通过：
+
+1. **短时 headless 训练（默认配置）**：16 环境 × 3 迭代正常完成。
+   首次启动自动从 URDF 转换 USD（`assets/robots/bpx/usd/bpx.usd`，已缓存），
+   checkpoint（model_0.pt / model_2.pt）与 TensorBoard 事件文件正常保存；
+   63 个标量指标含全部 `cenet/*`、`curriculum/*`、`policy/*` 项。
+2. **地形课程开**：地形平均等级从 0 起步并保持（首迭代误升级伪影已用
+   episode_length==0 保护修复），随机策略下 `move_down_total` 正常累计（5→11）。
+3. **Grid-Adaptive 指令课程开**：初始 3×3=9 单元激活、有效 vx 范围 0.75 m/s，
+   与配置一致；随机策略未达成功阈值，网格不扩张（符合门控设计）。
+4. **地形课程关**：等级随机初始化（均值 ≈ 4.94/10）且全程不变，恢复基线行为。
+5. **恢复训练**：从 model_2.pt 恢复后继续训练并保存 model_3.pt。
+6. **导出**：`scripts/export_policy.py` 输出 ONNX 与 TorchScript
+   （固定形状 (1, 450) → (1, 12)，静态 batch 满足部署诊断契约）。
+7. **部署链路**：导出的 `policies/policy.onnx` 被本仓库 sim2sim 运行时
+   （bpx-sim2sim 环境 + ONNX Runtime）正常加载：450 维历史输入、
+   50 Hz 策略、12 维动作、200 Hz PD 全链路运行。
+8. **sim2real 离线诊断**：实际 ONNX 模型通过维度契约检查（56 项测试通过）。
+
+## 250 迭代实质训练实测（2026-10-20，256 环境，RTX 4060，约 35 分钟）
+
+完整跑通 250 个 PPO 迭代（fps ≈ 2900，checkpoint 每 50 迭代保存），关键趋势：
+
+| 指标 | 起始 | 结束 | 说明 |
+| --- | --- | --- | --- |
+| `policy/mean_reward` | −1.24 | −0.40 | 策略奖励持续提升 |
+| `policy/episode_length` | 20 | 24.9（中途最低 ≈9） | 探索期回落后恢复并超过初始 |
+| `cenet/velocity_mse` | 0.091 | 0.017 | 速度估计精度提升约 5 倍 |
+| `cenet/velocity_error_x/y/z` | 0.18/0.17/0.33 | 0.09/0.08/0.11 m/s | 三轴误差同步下降 |
+| `cenet/prediction_loss` | 22.9 | 10.5 | 下一观测预测持续学习 |
+| `curriculum/terrain/mean_level` | 0 | 0 | 步态未稳前不升级，符合课程设计 |
+
+观察：`cenet/kl_loss` 初期峰值约 140 后回落至 55（β=1e-3 时加权贡献约 0.05，
+远小于 PPO 损失；如需更强正则可增大 `beta_kl`）。地形课程在 250 迭代内
+未触发升级——episode 尚短，属预期行为，收敛训练（1000+ 迭代）中才会爬级。
+
 ## 尚未验证的部分
 
-- 没有真实策略权重，因此未做实际 ONNX/TorchScript 策略效果或导出一致性验证。
+- 未进行千迭代量级的收敛训练与步态质量/地形爬级评估（需数小时 GPU 时间）。
 - 没有启动图形窗口做视觉检查；窗口逻辑与采样线程通过离线测试验证。
-- 源工程未提供 USD，未启动 Isaac Lab 或生成 USD。
 - 未安装新 SDK、连接机器人、发送运动命令或验证实机效果。
-- DreamWaQ 算法及训练任务尚未实现，当前不存在训练收敛结论。
 
 ## 训练环境检查
 

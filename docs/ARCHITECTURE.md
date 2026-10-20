@@ -9,8 +9,10 @@ scripts/ → sim2sim.cli → sim2sim.runner → sim2sim.robot → MuJoCo
 scripts/ → sim2real.cli → sim2real.runner → sim2real.sdk_robot → 官方 SDK
                        ↘ sim2real.monitor → monitor_window / monitor_worker
                                                     ↘ diagnostics / monitor_input
-
-tasks/、algorithms/    后续训练扩展；当前不参与部署运行
+scripts/train.py → isaaclab（ManagerBasedRLEnv + RslRlVecEnvWrapper）
+                → tasks/agents/dreamwaq_ppo.DreamWaQRunner（CENet + PPO 联合训练）
+scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 → 12 维）
+                        → policies/policy.onnx|pt → sim2sim / sim2real 推理
 ```
 
 | 层 | 职责 | 依赖边界 |
@@ -19,8 +21,11 @@ tasks/、algorithms/    后续训练扩展；当前不参与部署运行
 | `runtime/` | 关节契约、观测、历史、推理、起身轨迹、行为切换 | NumPy；推理后端按需导入 |
 | `sim2sim/` | 配置、模型适配、物理循环、CSV、曲线与测试地形 | runtime、MuJoCo |
 | `sim2real/` | SDK 适配、标定、控制、录制回放、只读监控 | runtime；SDK 仅在创建连接对象时导入 |
-| `tasks/mdp/` | 奖励、课程预留模块 | 当前仅模块说明 |
-| `algorithms/` | DreamWaQ 算法预留位置 | 当前仅模块说明 |
+| `tasks/obs_contract.py` | 训练/部署共用观测布局常量 | Python 标准库 |
+| `tasks/rough_env_cfg.py` | Manager-Based 崎岖地形速度跟踪环境、课程开关 | isaaclab（需运行中的 App） |
+| `tasks/mdp/` | 奖励（复用内置）、终止、地形课程、指令课程 | `curriculums`/`command_grid` 仅依赖 torch |
+| `tasks/agents/` | CENet、DreamWaQ Actor-Critic、扩展 PPO、Runner、配置 | torch + rsl_rl（Runner 另需环境包装器） |
+| `algorithms/` | 预留：算法实验位（正式实现在 `tasks/agents/`） | — |
 
 ## 代码阅读顺序
 

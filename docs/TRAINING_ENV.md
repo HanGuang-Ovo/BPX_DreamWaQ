@@ -84,16 +84,23 @@ GPU 在受限沙箱内不可见时应在主机终端复查，不应仅凭该沙�
 这些包涉及 USD 导出、绘图、浏览器或云服务等额外功能，不能据此批量升级共享环境。
 Kit 自带 `pxr`，不要为消除元数据提示直接覆盖它的 USD 库；对应功能需单独验证。
 
-启动本工程 BPX 强化学习训练还缺少以下工程实现：
+启动本工程 BPX 强化学习训练的原缺项（2026-10-20 已全部实现）：
 
-1. 将现有 URDF 转换成可供 Isaac Lab 使用的 BPX USD，并配置关节驱动和传感器。
-2. 添加 Isaac Lab 向量环境、观测、动作、指令、复位、终止条件及 Gymnasium 任务注册。
-3. 实现奖励函数与 PPO/OnPolicyRunner 参数配置。
-4. 实现 DreamWaQ 编码器、估计器、隐变量及其损失，并接入训练和导出流程。
-5. 增加本工程的 train/play/export 入口，验证导出的单策略与部署观测契约一致。
+1. BPX USD：`tasks/rough_env_cfg.py` 在首次训练启动时通过 UrdfConverter 从 URDF
+   自动转换（沿用 `assets/robots/bpx/usd/config.yaml` 的参数），结果缓存复用；
+   可用环境变量 `BPX_FORCE_USD_CONVERSION=1` 强制重转。
+2. Isaac Lab 向量环境、观测（45 维单帧 + 450 维历史 + 71 维特权）、动作、指令、
+   复位、终止与 Gymnasium 注册：`tasks/rough_env_cfg.py`、`tasks/__init__.py`。
+3. 奖励（复用 Isaac Lab 内置 + 任务层 feet_air_time）与 PPO 超参数：
+   `tasks/mdp/rewards.py`、`tasks/agents/rsl_rl_ppo_cfg.py`。
+4. DreamWaQ CENet、速度估计、VAE 隐变量与辅助损失：`tasks/agents/` 三个模块，
+   含扩展 Rollout 存储、AdaBoot 与部署导出（450 维 → 12 维）。
+5. 训练与导出入口：`scripts/train.py`、`scripts/export_policy.py`。
 
-课程与域随机化尚未实现，可在基础训练跑通后添加；它们不是启动最小 PPO 示例的必要条件。
+课程学习（地形 + Grid-Adaptive 指令）已实现且可独立启停；
+域随机化（摩擦、质量、推挤）沿用量级适中的默认配置。
 训练不需要已训练权重，也不需要机器人 SDK、实机网络或 ROS。
+当前尚未完成长时间收敛训练与实机部署闭环，见 [VALIDATION.md](VALIDATION.md)。
 
 本机 16 GB RAM / 8 GB VRAM 低于该版本文档推荐的 32 GB / 16 GB。
 初次任务调试建议无界面、无相机，从 16 个环境开始测量占用，再逐步增加，

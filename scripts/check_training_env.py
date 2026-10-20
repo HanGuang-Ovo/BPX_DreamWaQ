@@ -35,19 +35,24 @@ def package(name, module):
 def project_blockers():
     missing = []
     if not (ROOT / "assets/robots/bpx/usd/bpx.usd").is_file():
-        missing.append("缺少 BPX USD：需将现有 URDF 转换为 Isaac Lab 可用的机器人资源")
+        missing.append("缺少 BPX USD：首次启动 scripts/train.py 时会从 URDF 自动转换")
     task_root = ROOT / "src/bpx_dreamwaq/tasks"
     if not any("gym.register" in p.read_text(encoding="utf-8") for p in task_root.rglob("*.py")):
         missing.append("缺少 BPX Isaac Lab 训练环境、观测/动作/复位配置及 Gymnasium 任务注册")
-    for name, label in (("rewards", "奖励函数"),):
+    for name, label in (("rewards", "奖励函数"), ("curriculums", "课程")):
         tree = ast.parse((task_root / "mdp" / f"{name}.py").read_text(encoding="utf-8"))
         if not any(isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)) for node in tree.body):
             missing.append(f"尚未实现{label}")
-    algorithm_root = ROOT / "src/bpx_dreamwaq/algorithms"
-    if not any(p.name != "__init__.py" for p in algorithm_root.rglob("*.py")):
-        missing.append("尚未接入 PPO/OnPolicyRunner 配置与 DreamWaQ 编码器、估计器和训练逻辑")
+    # DreamWaQ 算法实现位于 tasks/agents（algorithms/ 为实验预留位）。
+    agents_root = task_root / "agents"
+    for filename in ("cenet.py", "dreamwaq_actor_critic.py", "dreamwaq_ppo.py", "rsl_rl_ppo_cfg.py"):
+        if not (agents_root / filename).is_file():
+            missing.append(f"缺少 DreamWaQ 算法模块 tasks/agents/{filename}")
+            break
     if not (ROOT / "scripts/train.py").is_file():
-        missing.append("缺少本工程 train/play/export 训练与导出入口")
+        missing.append("缺少本工程训练入口 scripts/train.py")
+    if not (ROOT / "scripts/export_policy.py").is_file():
+        missing.append("缺少部署导出入口 scripts/export_policy.py")
     return missing
 
 
