@@ -66,7 +66,7 @@ class MonitorWindow:
         self.active = False
         self.history = []
         self.mode = tk.StringVar(value="")
-        self.policy_selection = tk.StringVar(value="当前策略（只读状态机）：等待反馈和电脑手柄")
+        self.policy_selection = tk.StringVar(value="统一策略（只读状态机）：等待反馈和电脑手柄")
         self.robot_state = tk.StringVar(value="机器人反馈：运动状态 —    步态 —    控制来源 —")
         self.remote_input = tk.StringVar(value="电脑遥控器输入：vx — m/s    vy — m/s    wz — rad/s")
         self.show_target = tk.BooleanVar(value=True)
@@ -382,10 +382,9 @@ class MonitorWindow:
         scrollbar.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
         self.parameter_tables.append(mapping)
-        for mode in ("stand", "walk"):
-            self.label(
-                parent, f"{mode.title()} 模型：{self.config.model_path(mode)}", foreground=self.MUTED, wraplength=1300
-            ).pack(anchor="w", padx=12, pady=2)
+        self.label(
+            parent, f"策略模型：{self.config.model_path()}", foreground=self.MUTED, wraplength=1300
+        ).pack(anchor="w", padx=12, pady=2)
         self.label(
             parent, f"配置：{self.config.path}\n坐标覆盖：{self.config.calibration_path}", foreground=self.MUTED
         ).pack(anchor="w", padx=12, pady=8)
@@ -472,7 +471,7 @@ class MonitorWindow:
             gamepad_index=self.gamepad_index,
         )
         self.mode.set("")
-        self.policy_selection.set("当前策略（只读状态机）：等待反馈和电脑手柄")
+        self.policy_selection.set("统一策略（只读状态机）：等待反馈和电脑手柄")
         self.remote_input.set("电脑遥控器输入：vx — m/s    vy — m/s    wz — rad/s")
         self.connect_button.configure(state="disabled")
         self.ip_entry.configure(state="disabled")
@@ -538,7 +537,7 @@ class MonitorWindow:
         ):
             self.refresh_table(stale=True)
             self.policy_status.set("策略预览暂停 · 会话结束或反馈过期；旧值不作为当前输出")
-            self.policy_selection.set("当前策略（只读状态机）：暂停 · 会话结束或反馈过期")
+            self.policy_selection.set("统一策略（只读状态机）：暂停 · 会话结束或反馈过期")
             self.remote_input.set("电脑遥控器输入：— · 当前会话未更新")
             self.draw_robot(stale=True)
         if not self.closing:
@@ -565,7 +564,7 @@ class MonitorWindow:
         if previous != self.mode.get():
             self.history = []
         state_name = {"stand": "Stand", "walk": "Walk", "stopping": "Walk · STOPPING 减速过渡"}.get(control["mode"])
-        self.policy_selection.set("当前策略（只读状态机）：" + (state_name or "暂停 / 等待"))
+        self.policy_selection.set("统一策略（只读状态机）：" + (state_name or "暂停 / 等待"))
         self.robot_state.set(
             f"机器人反馈：{control['motion']}    步态 {control['gait']}    控制来源 {control['control_source']}"
         )

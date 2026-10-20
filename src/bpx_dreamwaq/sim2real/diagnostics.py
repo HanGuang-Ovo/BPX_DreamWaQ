@@ -85,64 +85,61 @@ def feedback_control(config, sample):
     elif motion is None:
         result["reason"] = "SDK/录制没有运动状态反馈"
     elif motion != 6:
-        result["reason"] = result["motion"] + "；不应用 Stand/Walk 预览"
+        result["reason"] = result["motion"] + "；不应用策略预览"
     elif gait != 0:
-        result["reason"] = "当前步态不属于本工程 Stand/Walk 对应范围"
+        result["reason"] = "当前步态不属于本工程策略对应范围"
     elif result["remote_command"] is None:
         result["reason"] = telemetry.get("remote_command_error") or "没有有效电脑手柄输入"
     else:
         result["eligible"] = True
-        result["reason"] = "由实时反馈和电脑手柄自动选择"
+        result["reason"] = "由实时反馈和电脑手柄生成策略指令"
     return result
 
 
 class PolicyPreview:
-    """与部署共用路由，自动预览选中模型；previous_action 来自预览输出。
+    """与部署共用指令路由和单模型接口；previous_action 来自预览输出。
 
     预览没有接管混合、力矩执行和闭环跟踪，不能视为真机正在执行策略。
     """
 
-    def __init__(self, config, *, policies=None, enabled=True):
+    def __init__(self, config, *, policy=None, enabled=True):
         self.config = config
         self.cal = Calibration(config)
-        self.policies = {}
+        self.policy = None
         self.errors = {}
         if enabled:
-            for mode in ("stand", "walk"):
-                try:
-                    policy = (
-                        policies[mode]
-                        if policies is not None
-                        else OnnxPolicy(config.model_path(mode), config.policy["observation_dimension"], 12)
-                    )
-                    session = getattr(policy, "session", None)
-                    if session is not None:
-                        ins, outs = session.get_inputs(), session.get_outputs()
-                        if (
-                            len(ins) != 1
-                            or len(outs) != 1
-                            or ins[0].shape != [1, config.policy["observation_dimension"]]
-                            or outs[0].shape != [1, 12]
-                        ):
-                            raise ValueError("模型必须匹配配置的输入维度及 12 维输出")
-                    self.policies[mode] = policy
-                except Exception as exc:
-                    self.errors[mode] = str(exc)
+            try:
+                model = policy if policy is not None else OnnxPolicy(
+                    config.model_path(), config.policy["observation_dimension"], 12
+                )
+                session = getattr(model, "session", None)
+                if session is not None:
+                    ins, outs = session.get_inputs(), session.get_outputs()
+                    if (
+                        len(ins) != 1
+                        or len(outs) != 1
+                        or ins[0].shape != [1, config.policy["observation_dimension"]]
+                        or outs[0].shape != [1, 12]
+                    ):
+                        raise ValueError("模型必须匹配配置的输入维度及 12 维输出")
+                self.policy = model
+            except Exception as exc:
+                self.errors["policy"] = str(exc)
         else:
-            self.errors = {mode: "策略预览已关闭" for mode in ("stand", "walk")}
+            self.errors["policy"] = "策略预览已关闭"
         self.reset()
+
+    def reset_history(self):
+        self.history = ObservationHistory(
+            self.config.policy["history_length"], include_base_lin_vel=self.config.policy["include_base_lin_vel"]
+        )
+        self.last_action = np.zeros(12, dtype=np.float32)
 
     def reset(self):
         self.guard = StateGuard(self.config)
         self.router = PolicyRouter(self.config.control, self.config.period)
         self.control = {}
-        self.histories = {
-            mode: ObservationHistory(
-                self.config.policy["history_length"], include_base_lin_vel=self.config.policy["include_base_lin_vel"]
-            )
-            for mode in ("stand", "walk")
-        }
-        self.last_actions = {mode: np.zeros(12, dtype=np.float32) for mode in ("stand", "walk")}
+        self.reset_history()
 
     def step(self, sample):
         control = feedback_control(self.config, sample)
@@ -155,56 +152,44 @@ class PolicyPreview:
         q = self.cal.position_from_sdk(sample.q)
         dq = self.cal.velocity_from_sdk(sample.dq)
         gravity, angular = self.cal.imu(sample.quat_xyzw, sample.omega)
-        old_mode = self.router.mode
         command = self.router.step(control["remote_command"])
-        mode = "stand" if self.router.mode == "stand" else "walk"
-        control.update(mode=self.router.mode, policy=mode, model_command=command.tolist())
-        if self.router.mode != old_mode:
-            self.histories[mode] = ObservationHistory(
-                self.config.policy["history_length"], include_base_lin_vel=self.config.policy["include_base_lin_vel"]
-            )
-            self.last_actions[mode] = np.zeros(12, dtype=np.float32)
-        if mode not in self.policies:
+        if self.router.mode == "stand":
+            command = np.zeros(3, dtype=np.float32)
+        control.update(mode=self.router.mode, policy="policy", model_command=command.tolist())
+        if self.policy is None:
             return {}
-        result = {}
-        for mode, policy in ((mode, self.policies[mode]),):
-            cmd = command if mode == "walk" else np.zeros(3)
-            frame = actor_frame(
-                angular,
-                gravity,
-                cmd,
-                q,
-                dq,
-                self.last_actions[mode],
-                self.cal.default,
-                sample.velocity_body if self.config.policy["include_base_lin_vel"] else None,
-            )
-            observation = self.histories[mode].append(frame)
-            try:
-                action = vector(policy(observation), 12, f"{mode} action").astype(np.float32)
-                self.last_actions[mode] = action.copy()
-                target = self.cal.default + self.config.policy["action_scale"] * action
-                outside = [
-                    j.name
-                    for j, v in zip(self.config.joints, target)
-                    if (j.minimum is not None and v < j.minimum) or (j.maximum is not None and v > j.maximum)
-                ]
-                result[mode] = {
-                    "action": action.tolist(),
-                    "target_model": target.tolist(),
-                    "target_sdk": self.cal.position_to_sdk(target).tolist(),
-                    "command": cmd.tolist(),
-                    "outside_limits": outside,
-                }
-                self.errors.pop(mode, None)
-            except Exception as exc:
-                self.errors[mode] = str(exc)
-                self.histories[mode] = ObservationHistory(
-                    self.config.policy["history_length"],
-                    include_base_lin_vel=self.config.policy["include_base_lin_vel"],
-                )
-                self.last_actions[mode] = np.zeros(12, dtype=np.float32)
-        return result
+        frame = actor_frame(
+            angular,
+            gravity,
+            command,
+            q,
+            dq,
+            self.last_action,
+            self.cal.default,
+            sample.velocity_body if self.config.policy["include_base_lin_vel"] else None,
+        )
+        observation = self.history.append(frame)
+        try:
+            action = vector(self.policy(observation), 12, "policy action").astype(np.float32)
+            self.last_action = action.copy()
+            target = self.cal.default + self.config.policy["action_scale"] * action
+            outside = [
+                j.name
+                for j, v in zip(self.config.joints, target)
+                if (j.minimum is not None and v < j.minimum) or (j.maximum is not None and v > j.maximum)
+            ]
+            self.errors.pop("policy", None)
+            return {"policy": {
+                "action": action.tolist(),
+                "target_model": target.tolist(),
+                "target_sdk": self.cal.position_to_sdk(target).tolist(),
+                "command": command.tolist(),
+                "outside_limits": outside,
+            }}
+        except Exception as exc:
+            self.errors["policy"] = str(exc)
+            self.reset_history()
+            return {}
 
 
 def build_snapshot(config, sample, probe=None, *, ready=True):

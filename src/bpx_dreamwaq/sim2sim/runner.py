@@ -4,7 +4,7 @@
 
 - 200 Hz：采样 Init 足端轨迹、更新 PD 力矩、推进 MuJoCo、执行基础跌倒检查；
 - 50 Hz：读取 command、更新 Supervisor、选择策略、构造观测并推理；
-- 策略切换：使用 ActionBlender 保证实际 action 连续；
+- 起身控制器与策略切换：使用 ActionBlender 保证实际 action 连续；
 - 记录：把原始/过滤 command、行为模式、状态、动作和力矩写入 CSV。
 
 不传 ``supervisor`` 时仍走原来的单策略路径，保证旧命令和验证脚本行为不变。
@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 import time
@@ -25,7 +25,6 @@ import numpy as np
 import numpy.typing as npt
 
 from .config import Sim2SimConfig
-from .behaviors import BehaviorPolicies
 from bpx_dreamwaq.runtime.policy import ConstantPolicy, Policy
 from bpx_dreamwaq.runtime.history import ObservationHistory
 from .robot import BpxMujocoRobot
@@ -169,34 +168,20 @@ class Sim2SimRunner:
         config: Sim2SimConfig,
         policy: Policy,
         supervisor: BehaviorSupervisor | None = None,
-        behavior_policies: BehaviorPolicies | None = None,
     ):
         self.config = config
         self.policy = policy
         self.supervisor = supervisor
-        # 策略路由只有在 Supervisor 存在时才有意义，提前拒绝不完整的接线。
-        if behavior_policies is not None and supervisor is None:
-            raise ValueError("配置 behavior_policies 时必须同时配置 supervisor")
-        policies = behavior_policies or BehaviorPolicies(locomotion=policy)
-        if supervisor is not None and policies.waiting is None:
-            # joint_position 与策略 action 零点刻意分离；固定 action 会把初始趴姿
-            # 原样保持到 RB 触发，避免等待阶段被站姿零 action 拉起。
-            reset_action = (
-                np.asarray(config.initial_state.joint_position, dtype=np.float32)
-                - np.asarray(config.initial_state.default_joint_position, dtype=np.float32)
-            ) / config.control.action_scale
-            policies = BehaviorPolicies(
-                locomotion=policies.locomotion,
-                stand=policies.stand,
-                init=policies.init,
-                waiting=ConstantPolicy(reset_action),
-            )
-        self.behavior_policies = policies
         self.model = load_model(config)
         self.data = mujoco.MjData(self.model)
         self.robot = BpxMujocoRobot(self.model, self.data, config)
-        if supervisor is not None and config.init_controller.mode == "pd" and policies.init is None:
-            self.behavior_policies = replace(policies, init=FootTrajectoryInit(self.robot))
+        self.init_controller = FootTrajectoryInit(self.robot) if supervisor is not None else None
+        reset_action = (
+            np.asarray(config.initial_state.joint_position, dtype=np.float32)
+            - np.asarray(config.initial_state.default_joint_position, dtype=np.float32)
+        ) / config.control.action_scale
+        self.waiting_controller = ConstantPolicy(reset_action)
+        if supervisor is not None:
             supervisor.init_available = True
 
     def run(
@@ -251,7 +236,6 @@ class Sim2SimRunner:
             len(self.config.joint_names),
             include_base_lin_vel=self.config.observation.include_base_lin_vel,
         )
-        stand_history: ObservationHistory | None = None
         if self.supervisor is None:
             action = np.zeros(self.config.observation.action_dimension, dtype=np.float32)
         else:
@@ -265,10 +249,10 @@ class Sim2SimRunner:
         termination_reason = "duration"
         next_print_time = 0.0
         behavior_mode = "direct"
-        behavior_policy = "default"
+        behavior_policy = "policy"
         transition_alpha = 1.0
         # Supervisor 模式下第一帧解析实际行为，并从复位姿态对应的 action 平滑接入。
-        active_policy: Policy | None = self.policy if self.supervisor is None else None
+        active_controller: Policy | None = self.policy if self.supervisor is None else None
         action_blender = ActionBlender(
             self.config.observation.action_dimension,
             self.config.supervisor.action_blend_duration,
@@ -284,7 +268,7 @@ class Sim2SimRunner:
 
         def apply_control():
             nonlocal gains
-            is_init_pd = isinstance(active_policy, FootTrajectoryInit)
+            is_init_pd = isinstance(active_controller, FootTrajectoryInit)
             desired_gains = init_gains if is_init_pd else normal_gains
             blend_duration = self.config.supervisor.action_blend_duration
             alpha = quintic((self.data.time - gain_started_at) / blend_duration) if blend_duration else 1.0
@@ -294,11 +278,7 @@ class Sim2SimRunner:
                 torque_limit=self.config.init_controller.torque_limit if is_init_pd else None,
             )
 
-        policy_paths = (
-            _policy_path_text(self.behavior_policies.locomotion, self.config.repository_root),
-            _policy_path_text(self.behavior_policies.stand, self.config.repository_root),
-            _policy_path_text(self.behavior_policies.init, self.config.repository_root),
-        )
+        policy_path = _policy_path_text(self.policy, self.config.repository_root)
         plot_context = nullcontext(None)
         if torque_plot:
             from .torque_plot import TorquePlot
@@ -341,8 +321,8 @@ class Sim2SimRunner:
                                 planar_speed=float(np.linalg.norm(state.base_linear_velocity[:2])),
                                 angular_speed=float(np.linalg.norm(state.base_angular_velocity)),
                                 feet_in_contact=self.robot.feet_in_contact(),
-                                init_trajectory_complete=(not isinstance(active_policy, FootTrajectoryInit)
-                                                          or active_policy.complete),
+                                init_trajectory_complete=(not isinstance(active_controller, FootTrajectoryInit)
+                                                          or active_controller.complete),
                             ),
                             self.config.simulation.policy_dt,
                             init_requested=init_requested,
@@ -358,40 +338,35 @@ class Sim2SimRunner:
                             observation_command = np.zeros(3, dtype=np.float32)
                         else:
                             observation_command = command_array
-                        selected_policy = self.behavior_policies.resolve(decision.mode)
-                        behavior_policy = self.behavior_policies.policy_name(decision.mode)
-                        if selected_policy is not active_policy:
-                            stand_history = None
-                            # 策略对象真正变化时才重新开始混合；WALK→STOPPING 仍使用 locomotion，
-                            # 因此只平滑 command，不会无意义地重复启动 action 混合。
+                        if decision.mode == BehaviorMode.INIT:
+                            selected_controller = self.init_controller
+                            behavior_policy = "init_pd"
+                        elif decision.mode == BehaviorMode.WAITING_INIT:
+                            selected_controller = self.waiting_controller
+                            behavior_policy = "prone_hold"
+                        else:
+                            selected_controller = self.policy
+                            behavior_policy = "policy"
+                        if selected_controller is not active_controller:
+                            # 站立、行走和减速共用模型；仅切换起身/保持控制器时混合动作。
                             action_blender.start(action)
-                            active_policy = selected_policy
+                            active_controller = selected_controller
                             gain_start = gains.copy()
                             gain_started_at = float(self.data.time)
-                            if isinstance(active_policy, FootTrajectoryInit):
-                                active_policy.start()
+                            if isinstance(active_controller, FootTrajectoryInit):
+                                active_controller.start()
                     observation = self.robot.observation(
                         observation_command if self.supervisor is not None else command_array,
                         action,
                     )
-                    if active_policy is None:
-                        raise RuntimeError("没有可执行的 behavior policy")
-                    # 行走历史在所有模式持续更新，保留实际施加的上一动作。
-                    locomotion_frame = observation if self.config.observation.include_base_lin_vel else observation[3:]
-                    history_observation = history.append(locomotion_frame)
-                    if self.supervisor is None or active_policy is self.behavior_policies.locomotion:
-                        policy_observation = history_observation
-                    elif active_policy is self.behavior_policies.stand and getattr(active_policy, "uses_history", False):
-                        # 每次进入 Stand 都开始新历史，首帧重复填满；Stand 指令恒为零。
-                        if stand_history is None:
-                            stand_history = ObservationHistory(10, len(self.config.joint_names), False)
-                        stand_frame = observation[3:].copy()
-                        stand_frame[6:9] = 0.0
-                        policy_observation = stand_history.append(stand_frame)
-                    else:
-                        policy_observation = observation
-                    policy_action = np.asarray(active_policy(policy_observation), dtype=np.float32)
-                    if self.supervisor is None or isinstance(active_policy, FootTrajectoryInit):
+                    if active_controller is None:
+                        raise RuntimeError("没有可执行的控制器")
+                    # 所有模式共用历史，保留实际施加的上一动作。
+                    frame = observation if self.config.observation.include_base_lin_vel else observation[3:]
+                    history_observation = history.append(frame)
+                    policy_observation = history_observation if active_controller is self.policy else observation
+                    policy_action = np.asarray(active_controller(policy_observation), dtype=np.float32)
+                    if self.supervisor is None or isinstance(active_controller, FootTrajectoryInit):
                         action = policy_action
                         transition_alpha = 1.0
                     else:
@@ -409,17 +384,17 @@ class Sim2SimRunner:
                         behavior_policy=behavior_policy,
                         transition_alpha=transition_alpha,
                         raw_command=raw_command_array,
-                        init_phase=active_policy.phase if isinstance(active_policy, FootTrajectoryInit) else "",
-                        init_progress=active_policy.progress if isinstance(active_policy, FootTrajectoryInit) else 0.0,
+                        init_phase=active_controller.phase if isinstance(active_controller, FootTrajectoryInit) else "",
+                        init_progress=active_controller.progress if isinstance(active_controller, FootTrajectoryInit) else 0.0,
                     )
                     policy_steps += 1
 
                 # Init 在物理步上采样五次轨迹；RL 动作仍按策略周期保持。
-                if isinstance(active_policy, FootTrajectoryInit):
-                    if active_policy.timed_out:
+                if isinstance(active_controller, FootTrajectoryInit):
+                    if active_controller.timed_out:
                         termination_reason = "init_pd_timeout"
                         break
-                    action = active_policy()
+                    action = active_controller()
                 target, torque = apply_control()
                 mujoco.mj_step(self.model, self.data)
                 if plot is not None:
@@ -442,7 +417,7 @@ class Sim2SimRunner:
                         torque,
                         behavior_mode,
                         behavior_policy,
-                        policy_paths,
+                        policy_path,
                     )
                     active_viewer.sync()
                     if not active_viewer.is_running():
@@ -608,21 +583,6 @@ def _policy_path_text(policy: Policy | None, repository_root: Path) -> str:
         return str(path)
 
 
-def _policy_paths_overlay(
-    policy_paths: tuple[str, str, str], behavior_policy: str,
-) -> str:
-    """Three policy paths for the viewer's top-right corner."""
-
-    active_name = {
-        "default": "WALK", "locomotion": "WALK", "locomotion_fallback": "WALK",
-        "stand": "STAND", "init": "INIT", "init_pd": "INIT",
-    }.get(behavior_policy)
-    lines = ["Loaded policies (* = active):"]
-    for name, path in zip(("WALK", "STAND", "INIT"), policy_paths, strict=True):
-        lines.append(f"{'*' if name == active_name else ' '} {name}: {path}")
-    return "\n".join(lines)
-
-
 def _update_viewer_overlay(
     viewer: object,
     robot: BpxMujocoRobot,
@@ -631,7 +591,7 @@ def _update_viewer_overlay(
     torque: npt.NDArray[np.floating],
     behavior_mode: str,
     behavior_policy: str,
-    policy_paths: tuple[str, str, str],
+    policy_path: str,
 ) -> None:
     """更新 viewer 状态栏；旧版 MuJoCo 没有 set_texts 时静默跳过。
 
@@ -646,5 +606,5 @@ def _update_viewer_overlay(
     set_texts([
         (mujoco.mjtFont.mjFONT_BIG, mujoco.mjtGridPos.mjGRID_TOPLEFT, left, right),
         (mujoco.mjtFont.mjFONT_BIG, mujoco.mjtGridPos.mjGRID_TOPRIGHT,
-         _policy_paths_overlay(policy_paths, behavior_policy), ""),
+         f"Policy: {policy_path}\nController: {behavior_policy}", ""),
     ])

@@ -13,12 +13,13 @@ cp -n configs/sim2real/joint_calibration.template.toml configs/sim2real/local.ca
 ```
 
 在 `local.runtime.toml` 中将 `calibration_file` 设为 `local.calibration.toml`，
-核对 `[network]` 的机器人 IP、端口，以及 `[policy]` 的 Stand/Walk 模型路径。
+核对 `[network]` 的机器人 IP、端口，以及 `[policy].model` 的统一 ONNX 模型路径。
 模板不含任何机器人的实测标定值，保留源工程的默认 SDK 通道、sign=1、offset=0。
 本机配置受 `.gitignore` 排除。
 
 模型路径和标定路径相对于运行配置所在目录。
 默认历史接口为 45 维单帧、10 帧历史、450 输入和 12 输出，按 50 Hz 更新。
+站立、行走和减速共用一个模型实例和连续历史，站立指令为零；起身使用足端轨迹 + PD。
 SDK 仅在创建连接对象时导入；离线检查、分析和回放不创建 SDK 对象。
 
 ## 各入口的作用

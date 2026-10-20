@@ -12,7 +12,7 @@ from .safety import StateGuard
 from .sdk_robot import SDKSource
 
 
-def replay(config, input_path, output_path, command, *, policies=None):
+def replay(config, input_path, output_path, command, *, policy=None):
     metadata, samples = load_samples(input_path)
     first_complete = next((i for i, s in enumerate(samples)
                            if all(v is not None for v in (s.q, s.dq, s.quat_xyzw, s.omega))
@@ -21,7 +21,7 @@ def replay(config, input_path, output_path, command, *, policies=None):
         raise ValueError("录制没有完整 Actor 状态")
     samples = samples[first_complete:]
     guard = StateGuard(config)
-    controller = ActorController(config, policies=policies)
+    controller = ActorController(config, policy=policy)
     count = 0
     with JsonlWriter(output_path, {"mode": "replay", "input": str(input_path), "input_metadata": metadata,
                                  "config": str(config.path), "skipped_initial_samples": first_complete,
@@ -52,14 +52,14 @@ def wait_for_feedback(source, guard, timeout, *, clock=time.monotonic, sleep=tim
     raise TimeoutError("等待首个完整 Actor 反馈超时")
 
 
-def run_live(config, output_path, command, duration, *, armed=False, policies=None, source_factory=SDKSource,
+def run_live(config, output_path, command, duration, *, armed=False, policy=None, source_factory=SDKSource,
              clock=time.monotonic, sleep=time.sleep, command_source=None, init_request_source=None,
              status_callback=None):
     # armed 仅兼容旧调用；--live 已经明确选择实机执行。
     if duration is not None and (not np.isfinite(duration) or duration <= 0):
         raise ValueError("duration 必须为有限正数")
     command = vector(command, 3, "command")
-    controller = HardwareController(config, policies=policies)
+    controller = HardwareController(config, policy=policy)
     guard = StateGuard(config)
     cal = controller.calibration
     zeros = np.zeros(12)

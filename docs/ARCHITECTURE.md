@@ -35,6 +35,8 @@ tasks/、algorithms/    后续训练扩展；当前不参与部署运行
 
 ## 当前部署契约
 
+- 仅一个策略模型：默认 `policies/policy.onnx`，站立、行走和减速共用模型及连续历史。
+- 起身由足端轨迹 + PD 执行，等待起身时保持初始姿态，不使用独立策略权重。
 - 12 维动作；`q_target = q_default + 0.5 × action`。
 - 默认角按策略顺序为 roll=0、pitch=0.7、knee=-1.4。
 - 默认物理步长 0.005 s；策略每 4 步更新，即 50 Hz。
@@ -48,7 +50,9 @@ tasks/、algorithms/    后续训练扩展；当前不参与部署运行
 
 - 模型资源内的相对路径沿用源文件布局。
 - sim2sim TOML 的 `[paths]` 相对于工作区根目录。
+- sim2sim 仅通过 `[paths].policy` 或 `--policy` 选择策略；ONNX/TorchScript 共用此入口。
 - sim2real TOML 的模型、标定路径相对于 TOML 所在目录，便于复制实机配置。
+- sim2real 的 `[policy].model` 为唯一策略路径；旧本机配置需迁移至此键。
 - 命令行传入的配置、日志和策略覆盖路径相对于调用者当前目录。
 - 使用源码工作区或 `pip install -e .`；外部资源目前不制作独立 wheel 安装包。
 

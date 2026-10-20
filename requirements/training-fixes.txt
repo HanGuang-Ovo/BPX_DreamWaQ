@@ -1,0 +1,3 @@
+# Workspace-only overlay: R580 driver fix with the APIs expected by Isaac Sim 5.0.
+# Install with --no-deps --target .training-deps (see docs/TRAINING_ENV.md).
+warp-lang==1.8.1

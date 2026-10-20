@@ -10,8 +10,7 @@ state_rate_hz = 100
 connect_timeout_s = 5.0
 
 [policy]
-walk_model = "../../policies/walk/policy.onnx"
-stand_model = "../../policies/stand/policy.onnx"
+model = "../../policies/policy.onnx"
 history_length = 10
 include_base_lin_vel = false
 observation_dimension = 450

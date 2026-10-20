@@ -25,7 +25,7 @@ class MonitorWorker(threading.Thread):
         no_policy=False,
         output=None,
         source_factory=SDKSource,
-        policies=None,
+        policy=None,
         gamepad_device=None,
         gamepad_index=None,
         gamepad_factory=MonitorGamepad,
@@ -33,7 +33,7 @@ class MonitorWorker(threading.Thread):
         super().__init__(name="bpx-readonly-monitor", daemon=False)
         self.config, self.messages = config, messages
         self.demo, self.recording, self.no_policy = demo, recording, no_policy
-        self.output, self.source_factory, self.policies = output, source_factory, policies
+        self.output, self.source_factory, self.policy = output, source_factory, policy
         self.stop_event = threading.Event()
         self.gamepad_device, self.gamepad_index = gamepad_device, gamepad_index
         self.gamepad_factory = gamepad_factory
@@ -52,7 +52,7 @@ class MonitorWorker(threading.Thread):
     def run(self):
         try:
             self.publish("status", "正在加载策略；SDK 尚未连接…")
-            probe = PolicyPreview(self.config, policies=self.policies, enabled=not self.no_policy)
+            probe = PolicyPreview(self.config, policy=self.policy, enabled=not self.no_policy)
             with ExitStack() as stack:
                 writer = (
                     stack.enter_context(
@@ -133,7 +133,7 @@ class MonitorWorker(threading.Thread):
                     snapshot["source"] = (
                         "DEMO · 模拟反馈" if self.demo else "录制回放" if self.recording else "SDK · 只读反馈"
                     )
-                    snapshot["model_info"] = {m: str(self.config.model_path(m)) for m in ("stand", "walk")}
+                    snapshot["model_info"] = {"policy": str(self.config.model_path())}
                     self.publish("snapshot", snapshot)
                     if writer:
                         writer.write({

@@ -3,15 +3,8 @@
 [paths]
 mjcf = "assets/robots/bpx/mjcf/bpx.xml"
 
-# 推理后端显式选择；默认 Zero 后端不加载权重。Stand 路径可留空。
-locomotion_policy = "policies/walk/policy.onnx"
-
-stand_policy = ""
-# 可选 RL Init 权重未配置；当前默认使用足端轨迹 + PD。
-
-init_policy = ""
-# 保留 TorchScript 导出，供 --backend torchscript 和导出一致性检查使用。
-torchscript_policy = "policies/walk/policy.pt"
+# 统一策略路径；推理后端显式选择，默认 Zero 后端不加载权重。
+policy = "policies/policy.onnx"
 
 [simulation]
 # 沿用 BPX_test 的部署时序：200 Hz 物理仿真、50 Hz 策略。
@@ -111,18 +104,18 @@ stopping_timeout = 1.50
 # 低于高度阈值或超过倾角阈值即认为未站立；没有 Init 控制器时进入 DISABLED。
 fall_base_height = 0.20
 fall_tilt = 0.70
-# Init 只覆盖腹部朝地、机身接近水平的趴卧状态；侧翻和仰翻不进入该策略。
+# Init 只覆盖腹部朝地、机身接近水平的趴卧状态；侧翻和仰翻不进入起身控制。
 init_start_max_tilt = 0.35
-# 起身过程中超过该倾角立即停止 Init，防止失败策略持续驱动到完全翻倒。
+# 起身过程中超过该倾角立即停止 Init，防止失败控制器持续驱动到完全翻倒。
 init_abort_tilt = 0.55
 # Init 起身完成阈值必须比跌倒阈值更严格，并连续满足 init_confirm_time。
 init_base_height = 0.36
 init_tilt = 0.25
 init_confirm_time = 0.50
-# Init policy 的三个 command 槽位在训练和部署中都保持为零。
+# 等待和起身阶段的速度指令保持为零。
 init_command_slots = [0.0, 0.0, 0.0]
-# --- 底层策略切换 ---
-# 策略对象变化时，用 smoothstep 从上一帧实际 action 混合到新策略 action。
+# --- 起身控制器与统一策略切换 ---
+# 控制器变化时，从上一帧实际 action 混合到新输出；站立、行走共用策略，不重新混合。
 action_blend_duration = 0.30
 
 [robot]

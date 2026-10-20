@@ -1,4 +1,4 @@
-"""可回放的实机 Actor 管线：观测、历史、策略路由、接管与动作混合。"""
+"""可回放的实机 Actor 管线：观测、共享历史、统一策略、接管与动作混合。"""
 
 import numpy as np
 
@@ -11,32 +11,26 @@ from .calibration import Calibration
 
 
 class ActorController:
-    def __init__(self, config, *, policies=None):
+    def __init__(self, config, *, policy=None):
         self.config = config
         self.calibration = Calibration(config)
-        self.policies = policies or {
-            mode: OnnxPolicy(config.model_path(mode), config.policy["observation_dimension"], 12)
-            for mode in ("walk", "stand")
-        }
-        # 实机默认不隐式回退到缺少的站立策略。
-        if set(self.policies) != {"walk", "stand"}:
-            raise ValueError("必须同时提供 walk 与 stand 策略")
-        for mode, policy in self.policies.items():
-            session = getattr(policy, "session", None)
-            if session is not None:
-                inputs, outputs = session.get_inputs(), session.get_outputs()
-                if (
-                    len(inputs) != 1
-                    or len(outputs) != 1
-                    or inputs[0].shape != [1, config.policy["observation_dimension"]]
-                    or outputs[0].shape != [1, 12]
-                ):
-                    raise ValueError(f"{mode} 模型的输入输出尺寸不符合实机配置")
+        self.policy = policy if policy is not None else OnnxPolicy(
+            config.model_path(), config.policy["observation_dimension"], 12
+        )
+        session = getattr(self.policy, "session", None)
+        if session is not None:
+            inputs, outputs = session.get_inputs(), session.get_outputs()
+            if (
+                len(inputs) != 1
+                or len(outputs) != 1
+                or inputs[0].shape != [1, config.policy["observation_dimension"]]
+                or outputs[0].shape != [1, 12]
+            ):
+                raise ValueError("模型的输入输出尺寸不符合实机配置")
         settings = config.policy
-        self.walk_history = ObservationHistory(
+        self.history = ObservationHistory(
             settings["history_length"], include_base_lin_vel=settings["include_base_lin_vel"]
         )
-        self.stand_history = None
         self.router = PolicyRouter(config.control, config.period)
         self.blender = ActionBlender(12, config.control["action_blend_duration_s"])
         self.last_action = None
@@ -45,14 +39,8 @@ class ActorController:
         self.mode = "stand"
 
     def _route(self, command):
-        old_mode = self.mode
         filtered = self.router.step(command)
         self.mode = self.router.mode
-        if self.mode != old_mode:
-            if self.mode == "stand":
-                self.stand_history = None
-            if (old_mode == "stand") != (self.mode == "stand"):
-                self.blender.start(self.last_action)
         return filtered
 
     def step(self, sample, command, *, decision=None):
@@ -78,30 +66,13 @@ class ActorController:
                 raise ValueError("supervisor command 必须为三个有限值")
             # 外部 decision 也必须遵守 Actor 的最终 command 范围。
             filtered = np.clip(filtered, -command_limit, command_limit)
-            old_mode = self.mode
             self.mode = decision.mode.value
-            if self.mode != old_mode:
-                if self.mode == "stand":
-                    self.stand_history = None
-                if (old_mode == "stand") != (self.mode == "stand"):
-                    self.blender.start(self.last_action)
         linear = sample.velocity_body if self.config.policy["include_base_lin_vel"] else None
-        frame = actor_frame(angular, gravity, filtered, q, dq, self.last_action, cal.default, linear)
-        walk_input = self.walk_history.append(frame)
         if self.mode == "stand":
-            if self.stand_history is None:
-                self.stand_history = ObservationHistory(
-                    self.config.policy["history_length"], include_base_lin_vel=linear is not None
-                )
-            stand_frame = frame.copy()
-            command_start = 9 if linear is not None else 6
-            stand_frame[command_start : command_start + 3] = 0.0
-            observation = self.stand_history.append(stand_frame)
-            policy = self.policies["stand"]
-        else:
-            observation = walk_input
-            policy = self.policies["walk"]
-        output = np.asarray(policy(observation), dtype=np.float32)
+            filtered = np.zeros(3, dtype=np.float32)
+        frame = actor_frame(angular, gravity, filtered, q, dq, self.last_action, cal.default, linear)
+        observation = self.history.append(frame)
+        output = np.asarray(self.policy(observation), dtype=np.float32)
         if output.shape != (12,) or not np.isfinite(output).all():
             raise RuntimeError("Actor 输出无效")
         blended = self.blender.update(output, self.config.period)

@@ -22,7 +22,7 @@ BPX_DreamWaQ/
 │   │   ├── rewards.py         # 空：仅说明，无奖励实现
 │   │   └── curriculums.py     # 空：仅说明，无课程实现
 │   └── algorithms/            # 空：DreamWaQ 算法预留
-├── scripts/                   # 四个直接运行入口
+├── scripts/                   # 部署、检查与训练环境启动入口
 ├── tests/                     # 迁移后的离线回归与模型验证
 ├── policies/                  # 策略文件放置说明；不包含权重
 ├── outputs/                   # 新的仿真、录制和诊断输出
@@ -57,6 +57,26 @@ python scripts/check_project.py
 检查通过表示本阶段必需资源和配置完整。报告会同时列出尚未实现的训练算法、
 尚未提供的权重以及源工程缺失的 USD，不会将这些项目标记为已完成。
 
+## 训练环境
+
+本机工作区已配置为复用 Conda `isaaclab`：Python 3.11、Isaac Lab 2.2.1、
+Isaac Sim 5.0、`rsl-rl-lib==2.3.3`、PyTorch 2.7.0 + CUDA 12.8。
+工作区内的 Warp 1.8.1 兼容补丁通过 `.training-deps/` 提供，不修改共享 Conda 包。
+
+```bash
+# 激活当前终端；新建 VS Code 终端也会自动选择这套环境
+source scripts/activate_training.sh
+python scripts/check_training_env.py --require-gpu
+
+# 从任意 Conda 环境调用，也可直接使用项目包装入口
+bash scripts/training_python.sh scripts/check_training_env.py --smoke-test \
+    --report outputs/training/environment_report.json
+```
+
+`--smoke-test` 会启动无界面 Isaac Sim，创建立方体并执行十步 GPU 物理仿真。
+环境检查与 BPX 训练就绪状态分别报告；BPX 的 USD、训练环境、奖励和训练入口仍需实现。
+完整版本、验证结果、兼容问题和后续缺项见 [训练环境说明](docs/TRAINING_ENV.md)。
+
 ## sim2sim
 
 无需策略权重即可运行模型与 PD 框架检查：
@@ -72,7 +92,7 @@ python scripts/sim2sim.py --viewer --duration 20
 放入匹配的导出权重后，显式选择推理后端：
 
 ```bash
-python scripts/sim2sim.py --backend onnx --policy policies/walk/policy.onnx --viewer
+python scripts/sim2sim.py --backend onnx --policy policies/policy.onnx --viewer
 python scripts/sim2sim.py --config configs/sim2sim/bpx_terrain_history.toml \
     --backend onnx --supervisor --auto-init --viewer
 ```
@@ -86,7 +106,9 @@ python scripts/sim2sim.py --backend onnx --supervisor --gamepad --viewer \
 ```
 
 `--supervisor --gamepad` 时以趴姿等待 RB 起身。起身采用足端轨迹 + PD。
-站立策略可选；未配置时沿用行走策略的零速度指令回退。
+站立、行走和减速共用一个策略模型和观测历史，站立时输入零速度指令。
+模型路径统一配置为 sim2sim 的 `[paths].policy` 和实机的 `[policy].model`；
+不再加载独立的站立或起身模型。TorchScript 使用同一个 `--policy policies/policy.pt` 入口。
 
 | 配置 | 用途 | 策略输入 |
 | --- | --- | --- |
@@ -108,7 +130,7 @@ python scripts/sim2real.py run
 python scripts/monitor.py --demo --no-policy
 ```
 
-新工程不含权重，`check`/`run` 会列出缺少的 Stand/Walk 模型。
+新工程不含权重，`check`/`run` 会列出缺少的统一策略模型 `policies/policy.onnx`。
 监控窗口需要 Tkinter 和图形桌面；`--demo --no-policy` 不加载模型或 SDK。
 框架保留只读录制、离线回放和 `run --live` 显式控制入口，详见 [实机框架说明](docs/SIM2REAL.md)。
 

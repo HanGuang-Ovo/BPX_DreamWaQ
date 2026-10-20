@@ -122,7 +122,7 @@ class RuntimeTest(unittest.TestCase):
         source = Source(cfg, clock)
         with tempfile.TemporaryDirectory() as tmp:
             run_live(cfg, Path(tmp)/"log.jsonl", (0,0,0), .03,
-                     policies={"stand": Policy(0), "walk": Policy(0)},
+                     policy=Policy(0),
                      source_factory=lambda *a, **k: source, clock=clock.now, sleep=clock.sleep)
         self.assertTrue(source.commands)
 
@@ -178,7 +178,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_large_finite_policy_target_is_not_joint_clipped_or_rate_limited(self):
         cfg = config()
-        controller = ActorController(cfg, policies={"stand": Policy(100.), "walk": Policy(100.)})
+        controller = ActorController(cfg, policy=Policy(100.))
         result = None
         for tick in range(120):
             result = controller.step(sample(cfg, t=tick*.02), (0,0,0))
@@ -192,10 +192,10 @@ class RuntimeTest(unittest.TestCase):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
                 cfg, clock = config(), Clock()
                 source = Source(cfg, clock)
-                policies = {"stand": Policy(value), "walk": Policy(value)}
+                policy = Policy(value)
                 with self.assertRaisesRegex(RuntimeError, "Actor 输出无效"):
                     run_live(cfg, Path(tmp) / "log.jsonl", (0, 0, 0), .05,
-                             policies=policies, source_factory=lambda *a, **k: source,
+                             policy=policy, source_factory=lambda *a, **k: source,
                              clock=clock.now, sleep=clock.sleep)
                 self.assertEqual(source.commands, [])
                 self.assertTrue(source.exited)
@@ -203,7 +203,7 @@ class RuntimeTest(unittest.TestCase):
     def test_controller_first_command_holds_measured_pose(self):
         cfg = config()
         policy = Policy()
-        controller = ActorController(cfg, policies={"walk": policy, "stand": policy})
+        controller = ActorController(cfg, policy=policy)
         first = controller.step(sample(cfg), (0, 0, 0))
         np.testing.assert_allclose(first["target_model"], DEFAULT_JOINT_POSITION)
         self.assertEqual(len(first["observation"]), 450)
@@ -212,12 +212,32 @@ class RuntimeTest(unittest.TestCase):
     def test_history_receives_processed_action(self):
         cfg = config()
         policy = Policy()
-        controller = ActorController(cfg, policies={"walk": policy, "stand": policy})
+        controller = ActorController(cfg, policy=policy)
         controller.step(sample(cfg), (0, 0, 0))
         target = np.array(DEFAULT_JOINT_POSITION) + 0.03
         controller.commit_target(target)
         controller.step(sample(cfg, t=0.02, token=2), (0, 0, 0))
         np.testing.assert_allclose(policy.observations[-1][-12:], 0.06, atol=1e-7)
+
+    def test_one_history_carries_applied_actions_across_stand_walk_and_stopping(self):
+        cfg = config()
+        policy = Policy()
+        controller = ActorController(cfg, policy=policy)
+        modes = (BehaviorMode.STAND, BehaviorMode.WALK, BehaviorMode.STOPPING, BehaviorMode.STAND)
+        for tick, mode in enumerate(modes):
+            raw = np.array([.3, 0, 0])
+            decision = SupervisorDecision(mode, raw, True, "test")
+            result = controller.step(sample(cfg, t=tick * cfg.period, token=tick + 1), raw, decision=decision)
+            if tick:
+                history = policy.observations[-1][330:].reshape(10, 12)
+                expected = np.zeros((10, 12), dtype=np.float32)
+                for previous in range(tick):
+                    expected[-tick + previous] = .02 * (previous + 1)
+                np.testing.assert_allclose(history, expected, atol=1e-7)
+            expected_command = [0, 0, 0] if mode == BehaviorMode.STAND else raw
+            np.testing.assert_allclose(policy.observations[-1][87:90], expected_command)
+            controller.commit_target(np.asarray(DEFAULT_JOINT_POSITION) + .01 * (tick + 1))
+        self.assertEqual(len(policy.observations), len(modes))
 
     def test_actor_bounds_external_supervisor_command_before_observation(self):
         cfg = config()
@@ -225,7 +245,7 @@ class RuntimeTest(unittest.TestCase):
         for sign in (1., -1.):
             with self.subTest(sign=sign):
                 policy = Policy(0.)
-                controller = ActorController(cfg, policies={"walk": policy, "stand": policy})
+                controller = ActorController(cfg, policy=policy)
                 raw = sign * np.array([5., -2., 3.])
                 decision = SupervisorDecision(BehaviorMode.WALK, raw, True, "test")
                 result = controller.step(sample(cfg), raw, decision=decision)
@@ -239,7 +259,7 @@ class RuntimeTest(unittest.TestCase):
         for command in ([np.inf, 0., 0.], [np.nan, 0., 0.], [1., 2.]):
             with self.subTest(command=command):
                 policy = Policy(0.)
-                controller = ActorController(cfg, policies={"walk": policy, "stand": policy})
+                controller = ActorController(cfg, policy=policy)
                 decision = SupervisorDecision(BehaviorMode.WALK, np.asarray(command), True, "test")
                 with self.assertRaises(ValueError):
                     controller.step(sample(cfg), (0., 0., 0.), decision=decision)
@@ -262,7 +282,7 @@ class RuntimeTest(unittest.TestCase):
                     writer.write({"type": "sample", "sample": sample(cfg, t=i * 0.02, token=i + 1).to_dict()})
             policy = Policy()
             with patch("bpx_dreamwaq.sim2real.sdk_robot.SDKSource.__init__", side_effect=AssertionError("hardware")):
-                count = replay(cfg, path, output, (0, 0, 0), policies={"walk": policy, "stand": policy})
+                count = replay(cfg, path, output, (0, 0, 0), policy=policy)
             self.assertEqual(count, 5)
             self.assertTrue(output.is_file())
 
@@ -275,7 +295,7 @@ class RuntimeTest(unittest.TestCase):
                 for i in range(1, 4):
                     writer.write({"type": "sample", "sample": sample(cfg, t=i * 0.02, token=i).to_dict()})
             policy = Policy()
-            count = replay(cfg, path, output, (0, 0, 0), policies={"walk": policy, "stand": policy})
+            count = replay(cfg, path, output, (0, 0, 0), policy=policy)
             self.assertEqual(count, 3)
             self.assertEqual(json.loads(output.read_text().splitlines()[0])["skipped_initial_samples"], 1)
 
@@ -299,7 +319,7 @@ class RuntimeTest(unittest.TestCase):
                 (0, 0, 0),
                 0.1,
                 armed=True,
-                policies={"walk": policy, "stand": policy},
+                policy=policy,
                 source_factory=lambda *a, **k: source,
                 clock=clock.now,
                 sleep=clock.sleep,
@@ -320,7 +340,7 @@ class RuntimeTest(unittest.TestCase):
                 (0, 0, 0),
                 0.2,
                 armed=True,
-                policies={"walk": policy, "stand": policy},
+                policy=policy,
                 source_factory=lambda *a, **k: source,
                 clock=clock.now,
                 sleep=clock.sleep,
@@ -336,7 +356,7 @@ class RuntimeTest(unittest.TestCase):
             return np.zeros(12)
         with tempfile.TemporaryDirectory() as tmp:
             run_live(cfg, Path(tmp)/"log.jsonl", (0,0,0), .12,
-                     policies={"stand": slow, "walk": slow}, source_factory=lambda *a, **k: source,
+                     policy=slow, source_factory=lambda *a, **k: source,
                      clock=clock.now, sleep=clock.sleep)
         self.assertTrue(source.commands)
         self.assertTrue(source.exited)

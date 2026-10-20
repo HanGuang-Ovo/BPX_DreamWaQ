@@ -50,7 +50,7 @@ class InitControllerTest(unittest.TestCase):
             np.testing.assert_allclose(kin.inverse(actual), q, atol=1e-12)
 
     def test_invalid_targets_rejected(self):
-        controller = make_runner().behavior_policies.init
+        controller = make_runner().init_controller
         for depth in (1.0, .001, -.2):
             feet = controller.final_feet.copy()
             feet[:, 2] = -depth
@@ -77,7 +77,7 @@ class InitControllerTest(unittest.TestCase):
         runner = make_runner()
         robot, data = runner.robot, runner.data
         robot.reset()
-        controller = runner.behavior_policies.init
+        controller = runner.init_controller
         controller.start()
         np.testing.assert_allclose(robot.desired_joint_position(controller()), robot.joint_position(), atol=1e-7)
         data.time += .1
@@ -136,7 +136,7 @@ class InitControllerTest(unittest.TestCase):
                                     duration=delay + 4.65, realtime=False, print_interval=100)
             self.assertEqual(result.termination_reason, 'duration')
             self.assertEqual(runner.supervisor.mode, BehaviorMode.STAND)
-            self.assertTrue(runner.behavior_policies.init.complete)
+            self.assertTrue(runner.init_controller.complete)
             self.assertGreater(runner.robot.base_height(), .30)
             self.assertEqual(runner.robot.feet_in_contact(), 4)
             self.assertGreaterEqual(samples[0][0], delay)
@@ -160,13 +160,13 @@ class InitControllerTest(unittest.TestCase):
             result = runner.run((0, 0, 0), init_request_source=lambda: True, duration=5,
                                 realtime=False, print_interval=100)
         self.assertEqual(result.termination_reason, 'init_pd_timeout')
-        self.assertFalse(runner.behavior_policies.init.complete)
-        self.assertAlmostEqual(runner.behavior_policies.init.progress, 1.)
+        self.assertFalse(runner.init_controller.complete)
+        self.assertAlmostEqual(runner.init_controller.progress, 1.)
 
     def test_config_validation(self):
         source = CONFIG.read_text()
         for key, invalid in [('duration', '0.0'), ('support_duration', '4.0'),
-                             ('standing_depth', '0.1'), ('stiffness', 'nan'), ('mode', '"invalid"')]:
+                             ('standing_depth', '0.1'), ('stiffness', 'nan'), ('mode', '"policy"')]:
             section_start = source.index('[init_controller]')
             section_end = source.index('[initial_state]', section_start)
             lines = source[section_start:section_end].splitlines()

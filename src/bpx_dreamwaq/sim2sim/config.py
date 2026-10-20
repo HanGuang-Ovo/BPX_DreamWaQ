@@ -14,30 +14,10 @@ from bpx_dreamwaq.paths import PROJECT_ROOT
 
 @dataclass(frozen=True)
 class PathConfig:
-    """MuJoCo 模型和各底层策略的路径。
-
-    ``locomotion_policy`` 是 ONNX 主策略；``stand_policy`` 和
-    ``init_policy`` 是 Supervisor 可选加载的专家策略。TorchScript 路径继续保留，
-    用于旧后端和 ONNX/TorchScript 导出一致性验证。
-    """
+    """MuJoCo 模型和统一策略的路径；策略格式由推理后端决定。"""
 
     mjcf: Path
-    torchscript_policy: Path
-    locomotion_policy: Path
-    stand_policy: Path | None
-    init_policy: Path | None
-
-    @property
-    def onnx_policy(self) -> Path:
-        """兼容旧代码中的 ``config.paths.onnx_policy`` 名称。"""
-
-        return self.locomotion_policy
-
-    @property
-    def recovery_policy(self) -> Path | None:
-        """兼容策略改名以前的 ``config.paths.recovery_policy`` 属性。"""
-
-        return self.init_policy
+    policy: Path
 
 
 @dataclass(frozen=True)
@@ -137,14 +117,6 @@ def _resolve_path(repository_root: Path, value: object, name: str) -> Path:
     return path if path.is_absolute() else (repository_root / path).resolve()
 
 
-def _resolve_optional_path(repository_root: Path, value: object, name: str) -> Path | None:
-    """解析可选路径；省略配置项或使用空字符串时返回 ``None``。"""
-
-    if value is None or value == "":
-        return None
-    return _resolve_path(repository_root, value, name)
-
-
 def default_repository_root() -> Path:
     """根据本文件位置返回仓库根目录。"""
 
@@ -184,20 +156,7 @@ def load_config(path: str | Path, repository_root: str | Path | None = None) -> 
         repository_root=root,
         paths=PathConfig(
             mjcf=_resolve_path(root, paths["mjcf"], "paths.mjcf"),
-            torchscript_policy=_resolve_path(root, paths["torchscript_policy"], "paths.torchscript_policy"),
-            # ``onnx_policy`` 是旧配置键，保留回退读取以兼容用户已有的 TOML。
-            locomotion_policy=_resolve_path(
-                root,
-                paths.get("locomotion_policy", paths.get("onnx_policy")),
-                "paths.locomotion_policy",
-            ),
-            stand_policy=_resolve_optional_path(root, paths.get("stand_policy"), "paths.stand_policy"),
-            # ``recovery_policy`` 是改名为 Init 之前的旧配置键。
-            init_policy=_resolve_optional_path(
-                root,
-                paths.get("init_policy", paths.get("recovery_policy")),
-                "paths.init_policy",
-            ),
+            policy=_resolve_path(root, paths.get("policy"), "paths.policy"),
         ),
         simulation=SimulationConfig(
             timestep=float(simulation["timestep"]),
@@ -273,8 +232,8 @@ def load_config(path: str | Path, repository_root: str | Path | None = None) -> 
     )
 
     init = cfg.init_controller
-    if init.mode not in ("policy", "pd"):
-        raise ValueError("init_controller.mode 必须为 policy 或 pd")
+    if init.mode != "pd":
+        raise ValueError("init_controller.mode 必须为 pd；起身使用足端轨迹 + PD")
     for name in ("duration", "support_duration", "support_depth", "standing_depth", "stiffness",
                  "damping", "torque_limit", "joint_speed_limit", "tracking_error_limit", "timeout"):
         value = getattr(init, name)

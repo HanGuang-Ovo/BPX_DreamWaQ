@@ -1,0 +1,27 @@
+{
+  "python.defaultInterpreterPath": "/home/hanguang/miniconda3/envs/isaaclab/bin/python",
+  "python.envFile": "${workspaceFolder}/.vscode/training.env",
+  "python.terminal.activateEnvironment": false,
+  "python.analysis.extraPaths": [
+    "/home/hanguang/BPX_DreamWaQ/scripts/training_bootstrap",
+    "/home/hanguang/BPX_DreamWaQ/.training-deps",
+    "/home/hanguang/BPX_DreamWaQ/src",
+    "/home/hanguang/IsaacLab-2.2.1/source/isaaclab",
+    "/home/hanguang/IsaacLab-2.2.1/source/isaaclab_rl",
+    "/home/hanguang/IsaacLab-2.2.1/source/isaaclab_tasks",
+    "/home/hanguang/IsaacLab-2.2.1/source/isaaclab_assets",
+    "/home/hanguang/miniconda3/envs/isaaclab/lib/python3.11/site-packages",
+    "/home/hanguang/Isaac_Sim/exts/omni.isaac.ml_archive/pip_prebundle",
+    "/home/hanguang/Isaac_Sim/python_packages"
+  ],
+  "terminal.integrated.profiles.linux": {
+    "BPX training (Isaac Lab)": {
+      "path": "/bin/bash",
+      "args": [
+        "--init-file",
+        "${workspaceFolder}/scripts/activate_training.sh"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "BPX training (Isaac Lab)"
+}

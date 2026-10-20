@@ -1,0 +1,11 @@
+# Existing binary-install stack. These are expected runtime versions, not pip install requests.
+# Isaac Sim supplies torch/torchvision/numpy through setup_conda_env.sh.
+python = "3.11"
+isaaclab = "2.2.1"
+isaacsim = "5.0.0"
+rsl_rl = "2.3.3"
+torch = "2.7.0+cu128"
+torchvision = "0.22.0+cu128"
+numpy = "1.26.0"
+gymnasium = "1.2.0"
+warp = "1.8.1"

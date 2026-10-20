@@ -32,14 +32,12 @@ def write_json(path, data):
 
 
 def check(config):
-    models = {}
-    for mode in ("walk", "stand"):
-        p = config.model_path(mode)
-        models[mode] = {
-            "path": str(p),
-            "exists": p.is_file(),
-            "sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
-        }
+    p = config.model_path()
+    models = {"policy": {
+        "path": str(p),
+        "exists": p.is_file(),
+        "sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
+    }}
     dependencies = {name: importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime", "bpx_sdk")}
     return {
         "config": str(config.path),

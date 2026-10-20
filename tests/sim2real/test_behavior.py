@@ -59,19 +59,19 @@ class HardwareBehaviorTest(unittest.TestCase):
                 with self.subTest(dynamic=dynamic, sign=sign), tempfile.TemporaryDirectory() as tmp:
                     cfg, clock = config(True), Clock()
                     source = Source(cfg, clock)
-                    policies = {"walk": Policy(0.), "stand": Policy(0.)}
+                    policy = Policy(0.)
                     raw = sign * np.array([5., -2., 3.])
                     limits = np.asarray(cfg.control["command_limit"])
                     path = Path(tmp) / "live.jsonl"
                     run_live(cfg, path, (0., 0., 0.) if dynamic else raw, 2., armed=True,
-                             policies=policies, source_factory=lambda *a, **k: source,
+                             policy=policy, source_factory=lambda *a, **k: source,
                              clock=clock.now, sleep=clock.sleep,
                              command_source=(lambda: raw) if dynamic else None)
-                    self.assertTrue(policies["walk"].observations)
-                    for observation in policies["walk"].observations:
+                    self.assertTrue(policy.observations)
+                    for observation in policy.observations:
                         commands = observation[60:90].reshape(10, 3)
                         self.assertTrue(np.all(np.abs(commands) <= limits + 1e-7))
-                    np.testing.assert_allclose(policies["walk"].observations[-1][87:90],
+                    np.testing.assert_allclose(policy.observations[-1][87:90],
                                                np.clip(raw, -limits, limits), atol=1e-7)
                     rows = [row for line in path.read_text().splitlines()
                             if (row := json.loads(line)).get("type") == "command"]
@@ -83,22 +83,21 @@ class HardwareBehaviorTest(unittest.TestCase):
     def run_source(self, cfg, clock, source, duration, command_source=None, request=None):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "live.jsonl"
-            policies = {"walk": Policy(0.), "stand": Policy(0.)}
-            run_live(cfg, path, (0, 0, 0), duration, armed=True, policies=policies,
+            policy = Policy(0.)
+            run_live(cfg, path, (0, 0, 0), duration, armed=True, policy=policy,
                      source_factory=lambda *a, **k: source, clock=clock.now, sleep=clock.sleep,
                      command_source=command_source, init_request_source=request)
             return [row for line in path.read_text().splitlines()
-                    if (row := json.loads(line)).get("type") == "command"], policies
+                    if (row := json.loads(line)).get("type") == "command"], policy
 
     def test_prone_waiting_never_runs_stand_or_moves_for_stick_input(self):
         cfg, clock = config(True), Clock()
         source = SupportedSource(cfg, clock)
-        rows, policies = self.run_source(cfg, clock, source, .5, lambda: [1., .5, 1.])
+        rows, policy = self.run_source(cfg, clock, source, .5, lambda: [1., .5, 1.])
         self.assertEqual({r["mode"] for r in rows}, {"waiting_init"})
         for _, _, target, _ in source.commands:
             np.testing.assert_allclose(target, source.commands[0][2], atol=1e-12)
-        self.assertFalse(policies["stand"].observations)
-        self.assertFalse(policies["walk"].observations)
+        self.assertFalse(policy.observations)
 
     def test_rb_full_pipeline_to_stand_walk_stopping_and_stand(self):
         cfg, clock = config(True), Clock()
@@ -115,14 +114,13 @@ class HardwareBehaviorTest(unittest.TestCase):
         def command():
             return [.3, 0., 0.] if 5.5 <= clock.now() < 6.5 else [0., 0., 0.]
 
-        rows, policies = self.run_source(cfg, clock, source, 9., command, request)
+        rows, policy = self.run_source(cfg, clock, source, 9., command, request)
         modes = [r["mode"] for i, r in enumerate(rows) if i == 0 or r["mode"] != rows[i - 1]["mode"]]
         self.assertEqual(modes, ["waiting_init", "init", "stand", "walk", "stopping", "stand"])
         init = [r for r in rows if r["mode"] == "init"]
         self.assertGreaterEqual(init[0]["host_time"], .3)
         self.assertAlmostEqual(init[-1]["host_time"] - init[0]["host_time"], 3.99, places=2)
-        self.assertTrue(policies["stand"].observations)
-        self.assertTrue(policies["walk"].observations)
+        self.assertTrue(policy.observations)
         self.assertEqual(init[0]["kp_model"], cfg.control["kp"])
         self.assertAlmostEqual(max(r["kp_model"][0] for r in init), cfg.init_controller.stiffness)
 
@@ -135,9 +133,9 @@ class HardwareBehaviorTest(unittest.TestCase):
         # Feedback never follows the trajectory: there is no tracking-error gate.
         source.send=lambda kp,target,kd,velocity,ff: source.commands.append(
             (clock.now(),np.asarray(kp),np.asarray(target),np.asarray(kd)))
-        rows,policies=self.run_source(cfg, clock, source, 5., request=lambda: True)
+        rows,policy=self.run_source(cfg, clock, source, 5., request=lambda: True)
         self.assertIn("stand",[r["mode"] for r in rows])
-        self.assertTrue(policies["stand"].observations)
+        self.assertTrue(policy.observations)
 
 
 
@@ -145,7 +143,7 @@ class HardwareBehaviorTest(unittest.TestCase):
         cfg,clock=config(),Clock()
         source=SupportedSource(cfg,clock)
         source.q=Calibration(cfg).position_to_sdk([0.]*4+[1.2]*4+[-2.81]*4).tolist()
-        rows,policies=self.run_source(cfg,clock,source,5.,request=lambda:True)
+        rows,policy=self.run_source(cfg,clock,source,5.,request=lambda:True)
         self.assertTrue(source.commands)
         self.assertIn("stand",[r["mode"] for r in rows])
 

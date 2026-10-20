@@ -41,7 +41,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(sim.initial_state.default_joint_position, tuple(real.policy["default_joint_position"]))
         self.assertEqual(sim.control.action_scale, real.policy["action_scale"])
         self.assertEqual(sim.simulation.policy_dt, real.period)
-        self.assertEqual(sim.paths.locomotion_policy, real.model_path("walk"))
+        self.assertEqual(sim.paths.policy, real.model_path())
 
     def test_source_has_no_imports_from_the_reference_project(self):
         legacy = {"BPX_test", "bpx_runtime", "bpx_sim2sim", "bpx_sim2real"}
@@ -67,6 +67,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(Path(report["config"]), CONFIGS_DIR / "sim2real/runtime.toml")
+        self.assertEqual(set(report["models"]), {"policy"})
         for model in report["models"].values():
             self.assertTrue(Path(model["path"]).is_relative_to(PROJECT_ROOT / "policies"))
 

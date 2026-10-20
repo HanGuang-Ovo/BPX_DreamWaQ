@@ -86,8 +86,8 @@ class Config:
         p = Path(value).expanduser()
         return p.resolve() if p.is_absolute() else (self.path.parent / p).resolve()
 
-    def model_path(self, mode):
-        return self.resolve(self.policy[f"{mode}_model"])
+    def model_path(self):
+        return self.resolve(self.policy["model"])
 
     @property
     def alignment_verified(self):
@@ -96,8 +96,7 @@ class Config:
     def blockers(self, stage="deploy"):
         if stage == "observe":
             return []
-        return [f"policy.{mode}_model 不存在" for mode in ("walk", "stand")
-                if not self.model_path(mode).is_file()]
+        return [] if self.model_path().is_file() else ["policy.model 不存在"]
 
 
 def load_config(path):
@@ -132,6 +131,8 @@ def load_config(path):
         raise ValueError("network.state_rate_hz 要求 1..200")
     positive(net["connect_timeout_s"], "network.connect_timeout_s")
     policy = raw["policy"]
+    if not isinstance(policy.get("model"), str) or not policy["model"].strip():
+        raise ValueError("policy.model 必须是非空路径")
     if policy["history_length"] not in (1, 10) or not isinstance(policy["include_base_lin_vel"], bool):
         raise ValueError("支持 H=1/10 的 45/48 维单帧 Actor")
     dimension = (48 if policy["include_base_lin_vel"] else 45) * policy["history_length"]

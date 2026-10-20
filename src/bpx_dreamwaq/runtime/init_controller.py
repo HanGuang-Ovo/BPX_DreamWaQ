@@ -8,7 +8,7 @@ import numpy as np
 class InitControllerConfig:
     """足端轨迹起身；depth 为髋到 toe link 原点的竖直距离。"""
 
-    mode: str = "policy"
+    mode: str = "pd"
     duration: float = 4.0
     support_duration: float = 1.0
     support_depth: float = 0.19

@@ -41,10 +41,10 @@ class TestDiagnostics(unittest.TestCase):
         self.cfg = load_config(ROOT / "configs/sim2real/runtime.toml")
         self.sample = demo_sample(self.cfg, 0.0, 0.0, 1)
 
-    def policies(self):
-        stand, walk = Mock(return_value=np.full(12, 0.2)), Mock(return_value=np.full(12, -0.1))
-        stand.session = walk.session = None
-        return {"stand": stand, "walk": walk}
+    def policy(self):
+        policy = Mock(return_value=np.full(12, 0.2))
+        policy.session = None
+        return policy
 
     def test_official_defaults_do_not_require_alignment_or_motion_confirmation(self):
         self.assertEqual([j.sdk_index for j in self.cfg.joints],[0,3,6,9,1,4,7,10,2,5,8,11])
@@ -75,23 +75,23 @@ class TestDiagnostics(unittest.TestCase):
 
     def test_missing_invalid_feedback_is_not_fabricated_as_zero(self):
         bad = replace(self.sample, q=None, torque=None, quat_xyzw=[0] * 4)
-        snap = build_snapshot(self.cfg, bad, PolicyPreview(self.cfg, policies=self.policies()))
+        snap = build_snapshot(self.cfg, bad, PolicyPreview(self.cfg, policy=self.policy()))
         self.assertIsNone(snap["rows"][0]["q_model"])
         self.assertIsNone(snap["rows"][0]["torque_sdk"])
         self.assertIsNone(snap["attitude"])
         self.assertFalse(snap["policies"])
         self.assertTrue(snap["warnings"])
 
-    def test_only_automatically_selected_policy_runs_with_its_own_history(self):
-        policies = self.policies()
-        probe = PolicyPreview(self.cfg, policies=policies)
+    def test_single_policy_preserves_previous_action_across_modes(self):
+        policy = self.policy()
+        probe = PolicyPreview(self.cfg, policy=policy)
         snap = build_snapshot(self.cfg, self.sample, probe)
-        self.assertEqual(set(snap["policies"]), {"stand"})
-        self.assertAlmostEqual(snap["policies"]["stand"]["target_model"][4], 0.8)
+        self.assertEqual(set(snap["policies"]), {"policy"})
+        self.assertAlmostEqual(snap["policies"]["policy"]["target_model"][4], 0.8)
         build_snapshot(self.cfg, replace(self.sample, host_time=0.02, joint_token=2, imu_token=2), probe)
-        np.testing.assert_allclose(policies["stand"].call_args.args[0][-12:], 0.2)
-        policies["walk"].assert_not_called()
-        np.testing.assert_allclose(policies["stand"].call_args.args[0][60:90], 0.0)
+        np.testing.assert_allclose(policy.call_args.args[0][-12:], 0.2)
+        self.assertEqual(policy.call_count, 2)
+        np.testing.assert_allclose(policy.call_args.args[0][60:90], 0.0)
         for tick in range(10):
             sample = replace(
                 self.sample,
@@ -99,17 +99,19 @@ class TestDiagnostics(unittest.TestCase):
                 telemetry={**self.sample.telemetry, "remote_command": [0.3, 0.1, 0.2]},
             )
             snap = build_snapshot(self.cfg, sample, probe)
+            np.testing.assert_allclose(policy.call_args.args[0][-12:], 0.2)
         self.assertEqual(snap["control"]["mode"], "walk")
-        self.assertEqual(set(snap["policies"]), {"walk"})
-        self.assertAlmostEqual(snap["policies"]["walk"]["target_model"][4], 0.65)
-        np.testing.assert_allclose(policies["walk"].call_args.args[0][-12:], -0.1)
+        self.assertEqual(set(snap["policies"]), {"policy"})
+        self.assertAlmostEqual(snap["policies"]["policy"]["target_model"][4], 0.8)
+        np.testing.assert_allclose(policy.call_args.args[0][-12:], 0.2)
         # 模型使用状态机限变化率后的输入，不是原始手柄阶跃。
-        np.testing.assert_allclose(policies["walk"].call_args.args[0][87:90], snap["control"]["model_command"])
+        np.testing.assert_allclose(policy.call_args.args[0][87:90], snap["control"]["model_command"])
 
     def test_monitor_and_deployment_share_stand_walk_stopping_transitions(self):
-        policies = self.policies()
-        controller = ActorController(self.cfg, policies=policies)
-        probe = PolicyPreview(self.cfg, policies=self.policies())
+        policy = self.policy()
+        controller = ActorController(self.cfg, policy=policy)
+        preview_policy = self.policy()
+        probe = PolicyPreview(self.cfg, policy=preview_policy)
         modes = []
         commands = [[0, 0, 0]] * 5 + [[0.5, 0, 0]] * 40 + [[0, 0, 0]] * 110
         for tick, command in enumerate(commands):
@@ -123,9 +125,31 @@ class TestDiagnostics(unittest.TestCase):
             snap = build_snapshot(self.cfg, sample, probe)
             self.assertEqual(snap["control"]["mode"], deployed["mode"])
             np.testing.assert_allclose(snap["control"]["model_command"], deployed["command"])
+            if tick:
+                np.testing.assert_allclose(preview_policy.call_args.args[0][-12:], 0.2)
             modes.append(deployed["mode"])
         self.assertIn("stopping", modes)
         self.assertEqual(modes[-1], "stand")
+
+    def test_deployment_and_preview_each_load_only_one_model(self):
+        for factory, module in ((ActorController, "controller"), (PolicyPreview, "diagnostics")):
+            with self.subTest(controller=factory.__name__):
+                policy = self.policy()
+                policy.session = Mock()
+                policy.session.get_inputs.return_value = [Mock(shape=[1, 450])]
+                policy.session.get_outputs.return_value = [Mock(shape=[1, 12])]
+                with patch(f"bpx_dreamwaq.sim2real.{module}.OnnxPolicy", return_value=policy) as loader:
+                    instance = factory(self.cfg)
+                    for tick in range(20):
+                        sample = replace(self.sample, host_time=tick * self.cfg.period,
+                                         telemetry={**self.sample.telemetry, "remote_command": [.5, 0, 0]})
+                        if factory is ActorController:
+                            result = instance.step(sample, [.5, 0, 0])
+                            instance.commit_target(result["target_model"])
+                        else:
+                            instance.step(sample)
+                    loader.assert_called_once_with(self.cfg.model_path(), 450, 12)
+                    self.assertEqual(policy.call_count, 20)
 
     def test_no_input_unsupported_motion_and_stale_motion_never_fabricate_policy(self):
         for fields in (
@@ -139,16 +163,15 @@ class TestDiagnostics(unittest.TestCase):
             {"gait": 12},
         ):
             sample = replace(self.sample, telemetry={**self.sample.telemetry, **fields})
-            policies = self.policies()
-            snap = build_snapshot(self.cfg, sample, PolicyPreview(self.cfg, policies=policies))
+            policy = self.policy()
+            snap = build_snapshot(self.cfg, sample, PolicyPreview(self.cfg, policy=policy))
             self.assertFalse(snap["policies"], fields)
             self.assertIsNone(snap["control"]["policy"], fields)
-            policies["walk"].assert_not_called()
-            policies["stand"].assert_not_called()
+            policy.assert_not_called()
             self.assertTrue(snap["warnings"], fields)
 
     def test_stale_feedback_and_missing_tokens_do_not_add_a_preview_gate(self):
-        probe=PolicyPreview(self.cfg,policies=self.policies())
+        probe=PolicyPreview(self.cfg,policy=self.policy())
         for bad in (replace(self.sample,joint_age_s=100.),replace(self.sample,imu_token=None)):
             snap=build_snapshot(self.cfg,bad,probe)
             self.assertTrue(snap["policies"])
@@ -157,12 +180,12 @@ class TestDiagnostics(unittest.TestCase):
 
     def test_tilt_drawing_and_preview_do_not_use_a_tilt_stop(self):
         sample=replace(self.sample,quat_xyzw=[math.sqrt(.5),0,0,math.sqrt(.5)])
-        snap=build_snapshot(self.cfg,sample,PolicyPreview(self.cfg,policies=self.policies()))
+        snap=build_snapshot(self.cfg,sample,PolicyPreview(self.cfg,policy=self.policy()))
         self.assertTrue(snap["policies"])
         self.assertIsNotNone(snap["attitude"])
 
     def test_actual_onnx_contract_and_finite_preview(self):
-        if not all(self.cfg.model_path(m).exists() for m in ("stand", "walk")):
+        if not self.cfg.model_path().exists():
             self.skipTest("仓库未附带本地模型")
         try:
             import onnxruntime
@@ -171,7 +194,7 @@ class TestDiagnostics(unittest.TestCase):
         probe = PolicyPreview(self.cfg)
         self.assertFalse(probe.errors)
         snap = build_snapshot(self.cfg, self.sample, probe)
-        self.assertEqual(set(snap["policies"]), {"stand"})
+        self.assertEqual(set(snap["policies"]), {"policy"})
         for tick in range(10):
             moving = replace(
                 self.sample,
@@ -179,7 +202,7 @@ class TestDiagnostics(unittest.TestCase):
                 telemetry={**self.sample.telemetry, "remote_command": [0.3, 0, 0]},
             )
             snap = build_snapshot(self.cfg, moving, probe)
-        self.assertEqual(set(snap["policies"]), {"walk"})
+        self.assertEqual(set(snap["policies"]), {"policy"})
         for result in snap["policies"].values():
             self.assertEqual(len(result["action"]), 12)
             self.assertTrue(np.isfinite(result["target_sdk"]).all())
@@ -310,7 +333,7 @@ class TestDiagnostics(unittest.TestCase):
                 self.cfg,
                 queue.Queue(maxsize=8),
                 demo=True,
-                policies=self.policies(),
+                policy=self.policy(),
                 output=output,
                 source_factory=factory,
                 gamepad_factory=gamepad_factory,
@@ -355,7 +378,7 @@ class TestDiagnostics(unittest.TestCase):
                 self.cfg,
                 messages,
                 recording=recording,
-                policies=self.policies(),
+                policy=self.policy(),
                 source_factory=forbidden,
                 gamepad_factory=forbidden,
             )

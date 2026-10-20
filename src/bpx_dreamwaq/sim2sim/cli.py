@@ -12,7 +12,6 @@ import sys
 from bpx_dreamwaq.paths import CONFIGS_DIR
 
 from bpx_dreamwaq.sim2sim.config import load_config
-from bpx_dreamwaq.sim2sim.behaviors import BehaviorPolicies
 from bpx_dreamwaq.runtime.gamepad import (
     BTN_TL,
     BTN_TR,
@@ -21,7 +20,7 @@ from bpx_dreamwaq.runtime.gamepad import (
     enumerate_gamepads,
     select_gamepad,
 )
-from bpx_dreamwaq.runtime.policy import SingleFrameOnnxPolicy, StandOnnxPolicy, create_policy
+from bpx_dreamwaq.runtime.policy import create_policy
 from bpx_dreamwaq.sim2sim.runner import Sim2SimRunner
 from bpx_dreamwaq.runtime.supervisor import BehaviorSupervisor
 
@@ -31,7 +30,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=CONFIGS_DIR / "sim2sim" / "bpx_history.toml")
     parser.add_argument("--backend", choices=("torchscript", "onnx", "zero"), default="zero",
                         help="默认 zero，仅检查模型和控制框架；推理时显式选择 onnx/torchscript")
-    parser.add_argument("--policy", type=Path, help="覆盖所选 ONNX 或 TorchScript 主策略文件")
+    parser.add_argument("--policy", type=Path, help="覆盖所选 ONNX 或 TorchScript 策略文件")
     parser.add_argument("--device", default="cpu", help="TorchScript 设备，例如 cpu 或 cuda:0")
     parser.add_argument("--vx", type=float, default=None, help="机体 x 方向目标线速度，m/s")
     parser.add_argument("--vy", type=float, default=None, help="机体 y 方向目标线速度，m/s")
@@ -79,23 +78,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="无手柄时自动启用 Supervisor 并触发 Init（摔倒回到趴姿会再次自动起身）",
     )
-    parser.add_argument(
-        "--stand-policy",
-        type=Path,
-        help="覆盖 TOML 中的站立 ONNX 策略路径（同为 48 输入、12 输出）",
-    )
-    init_policy_group = parser.add_mutually_exclusive_group()
-    init_policy_group.add_argument(
-        "--init-policy",
-        type=Path,
-        help="切换回 RL Init，并覆盖起身 ONNX 路径（48 输入、12 输出）",
-    )
-    init_policy_group.add_argument(
-        "--recovery-policy",
-        dest="init_policy",
-        type=Path,
-        help=argparse.SUPPRESS,
-    )
     termination_group = parser.add_mutually_exclusive_group()
     termination_group.add_argument(
         "--terminate-on-fall",
@@ -113,33 +95,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_optional_policy(
-    name: str,
-    path: Path | None,
-    observation_dimension: int,
-    action_dimension: int,
-) -> SingleFrameOnnxPolicy | StandOnnxPolicy | None:
-    """加载 Supervisor 的可选 ONNX 策略，路径为空或文件缺失时安全回退。
-
-    locomotion 是主策略，缺少时无法继续运行；stand/init 则是增量加入的专家策略。
-    因此可选策略缺失只给出醒目的 warning，由 ``BehaviorPolicies`` 和 Supervisor 分别
-    采用 locomotion 站立回退或跌倒后 DISABLED 的既有行为。
-    """
-
-    if path is None:
-        print(f"[WARNING] TOML 中未配置 {name} policy；将继续使用现有可用策略。", file=sys.stderr)
-        return None
-    resolved_path = path.expanduser().resolve()
-    if not resolved_path.is_file():
-        print(
-            f"[WARNING] 未找到 {name} policy：{resolved_path}；将继续使用现有可用策略。",
-            file=sys.stderr,
-        )
-        return None
-    policy_type = StandOnnxPolicy if name == "stand" else SingleFrameOnnxPolicy
-    return policy_type(resolved_path, observation_dimension, action_dimension)
-
-
 def _run(args: argparse.Namespace) -> int:
     if args.list_gamepads:
         devices = enumerate_gamepads()
@@ -154,19 +109,12 @@ def _run(args: argparse.Namespace) -> int:
     if args.policy is not None:
         if args.backend == "zero":
             raise ValueError("--policy 需要显式选择 --backend onnx 或 torchscript")
-        key = "locomotion_policy" if args.backend == "onnx" else "torchscript_policy"
-        config = replace(config, paths=replace(config.paths, **{key: args.policy.expanduser().resolve()}))
-    # An explicit model override selects the legacy RL Init for comparisons.
-    if args.init_policy is not None:
-        config = replace(config, init_controller=replace(config.init_controller, mode="policy"))
-    for path_name, path in (
-        ("MJCF", config.paths.mjcf),
-        ("TorchScript", config.paths.torchscript_policy),
-        ("ONNX", config.paths.locomotion_policy),
-    ):
-        if path_name == "MJCF" or args.backend in path_name.lower():
-            if not path.is_file():
-                raise FileNotFoundError(f"{path_name} 文件不存在：{path}")
+        config = replace(config, paths=replace(config.paths, policy=args.policy.expanduser().resolve()))
+    if not config.paths.mjcf.is_file():
+        raise FileNotFoundError(f"MJCF 文件不存在：{config.paths.mjcf}")
+    if args.backend != "zero" and not config.paths.policy.is_file():
+        backend_name = "ONNX" if args.backend == "onnx" else "TorchScript"
+        raise FileNotFoundError(f"{backend_name} 文件不存在：{config.paths.policy}")
 
     command_defaults = config.command.as_tuple()
     command = (
@@ -177,52 +125,15 @@ def _run(args: argparse.Namespace) -> int:
     use_gamepad = args.gamepad or args.gamepad_device is not None or args.gamepad_index is not None
     policy = create_policy(
         backend=args.backend,
-        torchscript_path=config.paths.torchscript_policy,
-        onnx_path=config.paths.locomotion_policy,
+        path=config.paths.policy,
         observation_dimension=config.observation.dimension,
         action_dimension=config.observation.action_dimension,
         device=args.device,
     )
-    # 指定专家策略或使用已配置 Init 的手柄流程时隐式启用 Supervisor。
-    use_supervisor = (
-        args.supervisor
-        or args.auto_init
-        or args.stand_policy is not None
-        or args.init_policy is not None
-        or (use_gamepad and (config.paths.init_policy is not None or config.init_controller.mode == "pd"))
-    )
-    stand_policy = None
-    init_policy = None
+    use_supervisor = args.supervisor or args.auto_init or use_gamepad
+    supervisor = BehaviorSupervisor(config.supervisor) if use_supervisor else None
     if use_supervisor:
-        # 命令行参数只用于临时覆盖；通常直接使用 TOML 中记录的专家策略路径。
-        stand_path = args.stand_policy if args.stand_policy is not None else config.paths.stand_policy
-        init_path = args.init_policy if args.init_policy is not None else config.paths.init_policy
-        stand_policy = load_optional_policy(
-            "stand",
-            stand_path,
-            12 + 3 * len(config.joint_names),
-            config.observation.action_dimension,
-        )
-        if config.init_controller.mode == "policy":
-            init_policy = load_optional_policy(
-                "init", init_path, 12 + 3 * len(config.joint_names), config.observation.action_dimension,
-            )
-        else:
-            print(f"Init: 足端五次轨迹 + PD，标称时长 {config.init_controller.duration:.1f}s")
-    # Init 可由传统控制器或已加载的神经网络提供。
-    supervisor = (
-        BehaviorSupervisor(config.supervisor, init_available=init_policy is not None or config.init_controller.mode == "pd")
-        if use_supervisor
-        else None
-    )
-    behavior_policies = (
-        BehaviorPolicies(locomotion=policy, stand=stand_policy, init=init_policy)
-        if use_supervisor
-        else None
-    )
-    if use_supervisor and stand_policy is None:
-        # 这是有意的兼容回退，不代表 locomotion policy 已具备严格静止能力。
-        print("提示：未加载到 stand policy，STAND 暂时复用零 command 的 locomotion policy。")
+        print(f"Init: 足端五次轨迹 + PD，标称时长 {config.init_controller.duration:.1f}s")
     gamepad_context = nullcontext(None)
     if use_gamepad:
         try:
@@ -251,7 +162,6 @@ def _run(args: argparse.Namespace) -> int:
         config,
         policy,
         supervisor=supervisor,
-        behavior_policies=behavior_policies,
     )
     try:
         with gamepad_context as gamepad:

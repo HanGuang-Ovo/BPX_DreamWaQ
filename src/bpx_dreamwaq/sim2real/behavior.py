@@ -52,9 +52,9 @@ class HardwareFootTrajectory:
 
 
 class HardwareController:
-    def __init__(self, config, *, policies=None):
+    def __init__(self, config, *, policy=None):
         self.config = config
-        self.actor = ActorController(config, policies=policies)
+        self.actor = ActorController(config, policy=policy)
         self.calibration = self.actor.calibration
         self.trajectory = HardwareFootTrajectory(config.init_controller, list(config.policy["joint_names"]))
         self.mode = "waiting_init"
@@ -86,7 +86,6 @@ class HardwareController:
             if self.trajectory.complete and policy_due:
                 self.mode = "stand"
                 self.actor.started_at = None
-                self.actor.stand_history = None
                 self._gain_transition(now)
         if policy_due and self.mode in ("stand", "walk", "stopping"):
             self.result = self.actor.step(sample, command)
