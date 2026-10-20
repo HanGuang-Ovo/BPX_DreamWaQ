@@ -1,0 +1,18 @@
+# 官方 SDK 坐标适配。identity/alignment 仅作记录，不参与实机启动门槛。
+# 未覆盖关节采用官方 SDK 通道、sign=1、offset=0。
+
+[identity]
+# firmware_version 记录 SDK 运动主机版本，不代表电机/控制器固件。
+serial_number = ""
+robot_model = "BPX"
+firmware_version = ""
+
+[alignment]
+verified = false
+
+[imu]
+quaternion_frame = "body_to_world"
+sensor_to_body = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+gyro_bias = [0, 0, 0]
+
+# minimum/maximum 若填写，仅作窗口中的模型范围对照，不限制实机命令。

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bpx-dreamwaq"
+version = "0.1.0"
+description = "BPX robot assets and shared sim2sim / sim2real framework"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+sim = ["mujoco>=3.0"]
+inference = ["onnxruntime>=1.16"]
+torchscript = ["torch>=2.0"]
+deploy = ["mujoco>=3.0", "onnxruntime>=1.16"]
+
+[project.scripts]
+bpx-dreamwaq-sim = "bpx_dreamwaq.sim2sim.cli:main"
+bpx-dreamwaq-real = "bpx_dreamwaq.sim2real.cli:main"
+bpx-dreamwaq-monitor = "bpx_dreamwaq.sim2real.monitor:main"
+bpx-dreamwaq-check = "bpx_dreamwaq.validation:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

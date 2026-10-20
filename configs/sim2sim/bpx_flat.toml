@@ -1,0 +1,139 @@
+[paths]
+mjcf = "assets/robots/bpx/mjcf/bpx.xml"
+# 推理后端显式选择；默认 Zero 后端不加载权重。Stand 路径可留空。
+locomotion_policy = "policies/walk/policy.onnx"
+
+stand_policy = ""
+# 可选 RL Init 权重未配置；当前默认使用足端轨迹 + PD。
+
+init_policy = ""
+# 保留 TorchScript 导出，供 --backend torchscript 和导出一致性检查使用。
+torchscript_policy = "policies/walk/policy.pt"
+
+[simulation]
+# 沿用 BPX_test 的部署时序：200 Hz 物理仿真、50 Hz 策略。
+timestep = 0.005
+decimation = 4
+duration = 20.0
+realtime = true
+integrator = "euler"
+
+[control]
+# Isaac Lab JointPositionActionCfg 与 ImplicitActuatorCfg 的名义参数。
+mode = "explicit"
+action_scale = 0.5
+stiffness = 40.0
+damping = 1.0
+torque_limit = 30.0
+velocity_limit = 20.0
+
+# Init 专用参数；仅 MuJoCo 使用。4 秒为轨迹时长，站稳确认另计。
+[init_controller]
+mode = "pd"
+duration = 4.0
+support_duration = 1.0
+# 髋到 toe link 原点的竖直距离，不是机身离地高度。
+support_depth = 0.19
+standing_depth = 0.38
+stiffness = 80.0
+# 5 ms 显式 PD 下使用 2.0；3.0 在等待后起身时可能振荡。
+damping = 2.0
+torque_limit = 30.0
+joint_speed_limit = 2.0
+tracking_error_limit = 0.35
+timeout = 8.0
+
+[initial_state]
+base_position = [0.0, 0.0, 0.133]
+base_quaternion_wxyz = [1.0, 0.0, 0.0, 0.0]
+# MuJoCo 的物理复位姿态：腹部朝地、小腿自然贴地且足端朝前，等待 RB 后执行 Init。
+joint_position = [
+    0.0, 0.0, 0.0, 0.0,
+    0.98, 0.98, 0.98, 0.98,
+    -2.62, -2.62, -2.62, -2.62,
+]
+# 策略动作零点保持与训练一致，不能改成上面的趴姿。
+default_joint_position = [
+    0.0, 0.0, 0.0, 0.0,
+    0.7, 0.7, 0.7, 0.7,
+    -1.4, -1.4, -1.4, -1.4,
+]
+
+[observation]
+# [base_lin_vel(3), base_ang_vel(3), projected_gravity(3), command(3),
+#  joint_pos_rel(12), joint_vel_rel(12), last_action(12)]
+dimension = 48
+action_dimension = 12
+
+[command]
+linear_x = 0.2
+linear_y = 0.0
+angular_z = 0.0
+
+[termination]
+minimum_base_height = 0.15
+maximum_tilt = 1.0
+
+[supervisor]
+# --- command 归一化与平滑 ---
+# 状态机先计算 max(abs(command) / command_scale)，得到无量纲 command 活跃度。
+# scale 使用策略训练时的三轴满量程，变化率顺序同样固定为 vx、vy、wz。
+command_scale = [1.0, 0.5, 1.0]
+# 单位分别为 m/s²、m/s²、rad/s²；用于避免手柄阶跃直接送进策略。
+command_slew_rate = [1.5, 1.0, 2.0]
+
+# --- STAND/WALK 迟滞与防抖 ---
+# 进入 WALK 的阈值高于退出阈值，中间区域保持当前状态，防止边界来回切换。
+walk_enter_threshold = 0.12
+walk_exit_threshold = 0.05
+# 条件必须连续成立这么久才转换，不响应单帧摇杆噪声。
+walk_enter_delay = 0.15
+walk_exit_delay = 0.30
+# 进入 WALK 后的最短驻留时间，避免刚进入便因为 command 波动退出。
+minimum_walk_time = 0.30
+
+# --- STOPPING 完成条件 ---
+# 机体平面线速度和三轴角速度模长都低于阈值，才开始累计稳定时间。
+stop_linear_speed = 0.05
+stop_angular_speed = 0.10
+stand_confirm_time = 0.20
+# 即使速度一直不满足条件，也不能永久停留在 STOPPING。
+stopping_timeout = 1.50
+
+# --- 未站立检测与 Init 起身 ---
+# 低于高度阈值或超过倾角阈值即认为未站立；没有 Init 控制器时进入 DISABLED。
+fall_base_height = 0.20
+fall_tilt = 0.70
+# Init 只覆盖腹部朝地、机身接近水平的趴卧状态；侧翻和仰翻不进入该策略。
+init_start_max_tilt = 0.35
+# 起身过程中超过该倾角立即停止 Init，防止失败策略持续驱动到完全翻倒。
+init_abort_tilt = 0.55
+# Init 起身完成阈值必须比跌倒阈值更严格，并连续满足 init_confirm_time。
+init_base_height = 0.36
+init_tilt = 0.25
+init_confirm_time = 0.50
+# Init policy 的三个 command 槽位在训练和部署中都保持为零。
+init_command_slots = [0.0, 0.0, 0.0]
+# --- 底层策略切换 ---
+# 策略对象变化时，用 smoothstep 从上一帧实际 action 混合到新策略 action。
+action_blend_duration = 0.30
+
+[robot]
+base_body_name = "torso"
+base_joint_name = "base_freejoint"
+floor_geom_name = "floor"
+# 明确记录策略顺序，避免依赖 MuJoCo qpos 或 actuator 的隐含排列。
+joint_names = [
+    "fl_hip_roll_joint",
+    "fr_hip_roll_joint",
+    "hl_hip_roll_joint",
+    "hr_hip_roll_joint",
+    "fl_hip_pitch_joint",
+    "fr_hip_pitch_joint",
+    "hl_hip_pitch_joint",
+    "hr_hip_pitch_joint",
+    "fl_knee_joint",
+    "fr_knee_joint",
+    "hl_knee_joint",
+    "hr_knee_joint",
+]

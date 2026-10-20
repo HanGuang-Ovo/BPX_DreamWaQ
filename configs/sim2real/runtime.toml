@@ -1,0 +1,52 @@
+# 只保留有限数/四元数检查及退出阻尼；相对路径相对于本文件。
+calibration_file = "joint_calibration.template.toml"
+
+[network]
+robot_ip = "10.21.20.1"
+state_port = 9873
+joint_state_port = 7895
+tcp_local_port = 0
+state_rate_hz = 100
+connect_timeout_s = 5.0
+
+[policy]
+walk_model = "../../policies/walk/policy.onnx"
+stand_model = "../../policies/stand/policy.onnx"
+history_length = 10
+include_base_lin_vel = false
+observation_dimension = 450
+action_scale = 0.5
+default_joint_position = [0, 0, 0, 0, 0.7, 0.7, 0.7, 0.7, -1.4, -1.4, -1.4, -1.4]
+joint_names = ["fl_hip_roll_joint", "fr_hip_roll_joint", "hl_hip_roll_joint", "hr_hip_roll_joint", "fl_hip_pitch_joint", "fr_hip_pitch_joint", "hl_hip_pitch_joint", "hr_hip_pitch_joint", "fl_knee_joint", "fr_knee_joint", "hl_knee_joint", "hr_knee_joint"]
+
+[control]
+# command_limit/command_slew_rate 定义手柄速度与 Stand/Walk 路由，不限制关节运动目标。
+policy_rate_hz = 50
+send_rate_hz = 100
+kp = [40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+kd = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+takeover_duration_s = 2.0
+action_blend_duration_s = 0.3
+command_limit = [0.7, 0.4, 0.7]
+command_slew_rate = [1.5, 1.0, 2.0]
+walk_enter_threshold = 0.12
+walk_exit_threshold = 0.05
+walk_enter_delay_s = 0.15
+walk_exit_delay_s = 0.3
+minimum_walk_time_s = 0.3
+stopping_duration_s = 1.5
+
+[init_controller]
+# 足端轨迹按时间完成；不增加接地、高度、跟踪误差或关节范围门槛。
+mode = "pd"
+duration = 4.0
+support_duration = 1.0
+support_depth = 0.19
+standing_depth = 0.38
+stiffness = 80.0
+damping = 2.0
+
+[monitor]
+font_size = 32
+# 仅控制只读窗口的旧值提示，不影响实机运动。
+display_stale_after_s = 0.10
