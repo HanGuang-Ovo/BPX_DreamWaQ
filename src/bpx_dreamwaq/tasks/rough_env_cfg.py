@@ -365,7 +365,7 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Isaac Lab 速度跟踪基线，补充机身高度、净空与二阶动作平滑项。"""
+    """Isaac Lab 速度跟踪基线，补充高度、净空、足距与动作平滑项。"""
 
     # -- 任务
     ''' 速度跟踪奖励 '''
@@ -430,6 +430,19 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("height_scanner"),
             "target_height": 0.10,
             "max_ray_distance": 0.15,
+        },
+    )
+    # 只约束前、后两组左右足的最小横向间距，达到下限后不再鼓励张腿。
+    feet_lateral_distance = RewTerm(
+        func=bpx_rewards.feet_lateral_distance,
+        weight=-0.1,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"],
+                preserve_order=True,
+            ),
+            "minimum_distance": 0.26,
         },
     )
     '''脚离地时间奖励'''

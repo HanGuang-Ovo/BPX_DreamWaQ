@@ -93,6 +93,38 @@ def feet_clearance(
     return torch.where(nearest_distance_sq <= max_ray_distance**2, penalty, 0.0).sum(dim=1)
 
 
+def feet_lateral_distance(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+    minimum_distance: float = 0.26,
+) -> torch.Tensor:
+    """惩罚前、后左右足的横向间距不足，返回归一化缺口的平方和。
+
+    ``asset_cfg`` 必须按 FL、FR、HL、HR 顺序选择四个 toe_link（配置需
+    ``preserve_order=True``）。间距是仅消除机身 yaw 后的有符号 y 差；
+    不使用前后距离或高度差，交叉腿也持续受罚。达到下限后代价为零，
+    不鼓励无限张腿。站立、摆腿和转向均计算，不依赖触地或速度门限。
+    RewardManager 统一乘权重与 dt，此处只返回非负代价。
+    """
+    if not math.isfinite(minimum_distance) or minimum_distance <= 0:
+        raise ValueError("minimum_distance 必须为有限正数")
+    asset = env.scene[asset_cfg.name]
+    foot_pos = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+    if foot_pos.shape[1] != 4:
+        raise ValueError("feet_lateral_distance 需要按 FL、FR、HL、HR 顺序选择四个足端")
+
+    # Isaac Lab 根姿态为 wxyz；提取 yaw，忽略 roll/pitch，避免将高度差混入间距。
+    w, x, y, z = asset.data.root_quat_w.unbind(dim=-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+    pair_delta = foot_pos[:, [0, 2], :2] - foot_pos[:, [1, 3], :2]
+    lateral_distance = (
+        -yaw.sin().unsqueeze(1) * pair_delta[:, :, 0]
+        + yaw.cos().unsqueeze(1) * pair_delta[:, :, 1]
+    )
+    deficit = torch.clamp(1.0 - lateral_distance / minimum_distance, min=0.0)
+    return deficit.square().sum(dim=1)
+
+
 class action_smoothness_l2(ManagerTermBase):
     """惩罚原始策略动作的二阶差分 ``sum((a_t - 2*a_{t-1} + a_{t-2})**2)``。
 

@@ -1,6 +1,7 @@
-"""离线验证新增奖励的地形参考、无效射线和异步回合重置行为。"""
+"""离线验证奖励的地形参考、足距、无效射线和异步回合重置行为。"""
 
 import importlib.util
+import math
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -171,6 +172,64 @@ class TestFeetClearance(unittest.TestCase):
             sensor_cfg=SimpleNamespace(name="height_scanner"),
         )
         torch.testing.assert_close(result, torch.tensor([0.01]))
+
+
+class TestFeetLateralDistance(unittest.TestCase):
+    def penalty(self, positions, quaternions=None, body_ids=slice(None), **kwargs):
+        if quaternions is None:
+            quaternions = [[1., 0., 0., 0.]] * len(positions)
+        env = SimpleNamespace(scene=_Scene(robot=SimpleNamespace(data=SimpleNamespace(
+            body_link_pos_w=torch.tensor(positions, dtype=torch.float32),
+            root_quat_w=torch.tensor(quaternions, dtype=torch.float32),
+        ))))
+        return rewards.feet_lateral_distance(
+            env, asset_cfg=SimpleNamespace(name="robot", body_ids=body_ids), **kwargs,
+        )
+
+    def feet(self, front_width, hind_width):
+        return [[.24, front_width / 2, 0], [.24, -front_width / 2, 0],
+                [-.24, hind_width / 2, 0], [-.24, -hind_width / 2, 0]]
+
+    def test_nominal_threshold_and_wider_stances_have_zero_cost(self):
+        result = self.penalty([self.feet(.34244, .34244), self.feet(.26, .26), self.feet(.5, .5)])
+        torch.testing.assert_close(result, torch.zeros(3))
+
+    def test_each_pair_counts_and_crossed_feet_cannot_escape(self):
+        result = self.penalty([self.feet(.13, .26), self.feet(.13, .13),
+                               self.feet(0., 0.), self.feet(-.13, .26)])
+        torch.testing.assert_close(result, torch.tensor([.25, .5, 2., 2.25]))
+
+    def test_fore_aft_offsets_and_raised_feet_do_not_hide_narrow_stance(self):
+        feet = self.feet(.13, .13)
+        feet[0][0], feet[0][2] = 1., .4
+        feet[3][0], feet[3][2] = -1., .8
+        torch.testing.assert_close(self.penalty([feet]), torch.tensor([.5]))
+
+    def test_world_translation_yaw_and_root_tilt(self):
+        positions, quaternions = [], []
+        for yaw in (0., math.pi / 2, -math.pi / 2, 2.3):
+            c, s = math.cos(yaw), math.sin(yaw)
+            positions.append([[c*x - s*y + 10, s*x + c*y - 5, z + 2]
+                              for x, y, z in self.feet(.13, .13)])
+            # q = yaw * pitch * roll；足端高度变化不应混入横向距离。
+            cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+            cp, sp = math.cos(.2), math.sin(.2)
+            cr, sr = math.cos(.3), math.sin(.3)
+            quaternions.append([cy*cp*cr + sy*sp*sr, cy*cp*sr - sy*sp*cr,
+                                cy*sp*cr + sy*cp*sr, sy*cp*cr - cy*sp*sr])
+        torch.testing.assert_close(self.penalty(positions, quaternions), torch.full((4,), .5))
+
+    def test_explicit_body_selection_restores_pair_order(self):
+        fl, fr, hl, hr = self.feet(.13, .26)
+        positions = [[[0, 0, 10], hr, fr, hl, fl]]
+        torch.testing.assert_close(self.penalty(positions, body_ids=[4, 2, 3, 1]), torch.tensor([.25]))
+
+    def test_invalid_distance_or_foot_count_is_rejected(self):
+        for distance in (0., -1., float("nan"), float("inf")):
+            with self.subTest(distance=distance), self.assertRaises(ValueError):
+                self.penalty([self.feet(.26, .26)], minimum_distance=distance)
+        with self.assertRaises(ValueError):
+            self.penalty([[[0, 0, 0]] * 3])
 
 
 class TestActionSmoothness(unittest.TestCase):
