@@ -4,7 +4,7 @@
 
 - ``rewards``: 任务奖励（复用 Isaac Lab 内置实现，需 Isaac Sim 运行时）。
 - ``terminations``: 补充终止条件（需 Isaac Sim 运行时）。
-- ``curriculums``: 游戏式地形难度课程（仅依赖 torch，可离线测试）。
+- ``curriculums``: 整回合表现与空间覆盖地形课程（仅依赖 torch，可离线测试）。
 - ``command_grid``: Grid-Adaptive 指令课程核心调度器（仅依赖 torch）。
 - ``commands``: Grid-Adaptive 指令的 CommandTerm 封装（需 Isaac Sim 运行时）。
 

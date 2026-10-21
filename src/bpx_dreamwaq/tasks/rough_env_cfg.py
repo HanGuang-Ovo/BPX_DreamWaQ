@@ -17,7 +17,7 @@
 
 课程开关（模块 A / 模块 B，可独立启停）：
 
-- ``enable_terrain_curriculum``: 游戏式地形难度课程（默认开）。
+- ``enable_terrain_curriculum``: 整回合表现与空间覆盖地形课程（默认开）。
 - ``enable_grid_adaptive_command_curriculum``: Grid-Adaptive 指令课程
   （默认开；可通过配置或 ``--disable_command_curriculum`` 关闭）。
 
@@ -357,25 +357,74 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """奖励项：Isaac Lab 速度跟踪模板的标准组合（新配置，非迁移）。"""
+    """Isaac Lab 速度跟踪基线，补充机身高度、净空与二阶动作平滑项。"""
 
     # -- 任务
+    ''' 速度跟踪奖励 '''
     track_lin_vel_xy_exp = RewTerm(
         func=lab_mdp.track_lin_vel_xy_exp,
         weight=1.5,
         params={"command_name": "base_velocity", "std": 0.5},
     )
+    '''角速度跟踪奖励'''
     track_ang_vel_z_exp = RewTerm(
         func=lab_mdp.track_ang_vel_z_exp,
         weight=0.75,
         params={"command_name": "base_velocity", "std": 0.5},
     )
     # -- 正则
-    lin_vel_z_l2 = RewTerm(func=lab_mdp.lin_vel_z_l2, weight=-2.0)
-    ang_vel_xy_l2 = RewTerm(func=lab_mdp.ang_vel_xy_l2, weight=-0.05)
-    dof_torques_l2 = RewTerm(func=lab_mdp.joint_torques_l2, weight=-1.0e-4)
-    dof_acc_l2 = RewTerm(func=lab_mdp.joint_acc_l2, weight=-2.5e-7)
-    action_rate_l2 = RewTerm(func=lab_mdp.action_rate_l2, weight=-0.01)
+    '''z轴抖动惩罚'''
+    lin_vel_z_l2 = RewTerm(
+        func=lab_mdp.lin_vel_z_l2,
+        weight=-2.0
+    )
+    '''roll/pitch 抖动惩罚'''
+    ang_vel_xy_l2 = RewTerm(
+        func=lab_mdp.ang_vel_xy_l2,
+        weight=-0.05
+    )
+    # 相对有效高度扫描点的平均地面高度；目标先沿用初始化高度。
+    base_height_l2 = RewTerm(
+        func=bpx_rewards.base_height_l2,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "target_height": 0.42,
+        },
+    )
+    '''关节力矩惩罚'''
+    dof_torques_l2 = RewTerm(
+        func=lab_mdp.joint_torques_l2,
+        weight=-1.0e-4
+    )
+    '''关节加速度惩罚'''
+    dof_acc_l2 = RewTerm(
+        func=lab_mdp.joint_acc_l2,
+        weight=-2.5e-7
+    )
+    '''动作变化率惩罚'''
+    action_rate_l2 = RewTerm(
+        func=lab_mdp.action_rate_l2,
+        weight=-0.01
+    )
+    '''二阶动作差分；与一阶项一样使用未乘 scale 的策略动作。'''
+    action_smoothness_l2 = RewTerm(
+        func=bpx_rewards.action_smoothness_l2,
+        weight=-0.01
+    )
+    '''toe_link 原点相对脚下局部地形的目标高度，按足端水平速度加权。'''
+    feet_clearance = RewTerm(
+        func=bpx_rewards.feet_clearance,
+        weight=-0.01,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*toe_link"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "target_height": 0.10,
+            "max_ray_distance": 0.15,
+        },
+    )
+    '''脚离地时间奖励'''
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
         weight=0.05,
@@ -385,18 +434,27 @@ class RewardsCfg:
             "threshold": 0.5,
         },
     )
+    '''不希望的接触惩罚'''
     undesired_contacts = RewTerm(
         func=lab_mdp.undesired_contacts,
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso"), "threshold": 1.0},
     )
-    flat_orientation_l2 = RewTerm(func=lab_mdp.flat_orientation_l2, weight=0.0)
-    joint_pos_limits = RewTerm(func=lab_mdp.joint_pos_limits, weight=0.0)
+    '''姿态水平惩罚（惩罚 roll/pitch 偏离水平，基于投影重力）'''
+    flat_orientation_l2 = RewTerm(
+        func=lab_mdp.flat_orientation_l2,
+        weight=-0.2
+    )
+    '''关节位置越界惩罚'''
+    joint_pos_limits = RewTerm(
+        func=lab_mdp.joint_pos_limits,
+        weight=0.0
+    )
 
 
 @configclass
 class TerminationsCfg:
-    """终止条件：超时、机身接触、过倾（1.0 rad）、过低（0.15 m）。"""
+    """终止条件：超时、机身接触、过倾（1.0 rad）。"""
 
     time_out = DoneTerm(func=lab_mdp.time_out, time_out=True)
     base_contact = DoneTerm(
@@ -404,7 +462,6 @@ class TerminationsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso"), "threshold": 1.0},
     )
     base_tilt = DoneTerm(func=bpx_terminations.base_tilt_above_maximum, params={"maximum_tilt_rad": 1.0})
-    base_height = DoneTerm(func=bpx_terminations.base_height_below_minimum, params={"minimum_height": 0.15})
 
 
 @configclass
@@ -432,6 +489,21 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     """地形课程模式：``standard``（升级+降级）或 ``upgrade_only``（只升不降）。"""
     terrain_curriculum_debug: bool = False
     """记录额外的地形课程调试信息。"""
+    terrain_curriculum_min_command_speed: float = 0.1
+    """平移指令超过此速度才参与地形评价（m/s），零速和原地旋转保持等级。"""
+    terrain_curriculum_min_command_distance: float = 1.0
+    """评价跟踪质量至少需要的累计指令路程（m），不使用最后一条指令外推。"""
+    terrain_curriculum_min_tracking_duration_s: float = 2.0
+    """升级或判定持续跟踪失败所需的最小平移指令时长（s）。"""
+    terrain_curriculum_min_moving_fraction: float = 0.5
+    """降级所需的平移指令时间占比；明确移动任务中摔倒不受最小路程限制。"""
+    terrain_curriculum_lin_vel_tolerance: float = 0.1
+    terrain_curriculum_yaw_tolerance: float = 0.5
+    """仅用于降级和日志：平面误差 ≤ 0.1 m/s 且偏航误差 ≤ 0.5 rad/s 算跟踪良好。"""
+    terrain_curriculum_failure_ratio: float = 0.5
+    """未满足升级条件时，至少 50% 的平移采样跟踪不良才视为持续跟踪失败。"""
+    terrain_curriculum_coverage_ratio: float = 0.25
+    """升级时轴向最大距离须达到地形边长的此比例；分别相对出生点和地形中心。"""
     enable_grid_adaptive_command_curriculum: bool = True
     """是否启用 Grid-Adaptive 指令课程。关闭时恢复均匀指令采样。"""
 
@@ -472,9 +544,17 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
         if self.enable_terrain_curriculum:
             self.scene.terrain.max_init_terrain_level = 0
             self.scene.terrain.terrain_generator.curriculum = True
-            curriculum_params = {"debug": self.terrain_curriculum_debug}
-            if self.terrain_curriculum_mode == "upgrade_only":
-                curriculum_params["down_distance_ratio"] = 0.0
+            if self.terrain_curriculum_mode not in ("standard", "upgrade_only"):
+                raise ValueError(f"未知地形课程模式: {self.terrain_curriculum_mode}")
+            curriculum_params = {
+                "debug": self.terrain_curriculum_debug,
+                "coverage_ratio": self.terrain_curriculum_coverage_ratio,
+                "min_command_distance": self.terrain_curriculum_min_command_distance,
+                "min_tracking_duration_s": self.terrain_curriculum_min_tracking_duration_s,
+                "min_moving_fraction": self.terrain_curriculum_min_moving_fraction,
+                "failure_ratio": self.terrain_curriculum_failure_ratio,
+                "allow_demotion": self.terrain_curriculum_mode != "upgrade_only",
+            }
             self.curriculum.terrain_levels = CurrTerm(
                 func=bpx_curriculums.terrain_levels_vel, params=curriculum_params
             )
@@ -498,6 +578,22 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
                 initial_yaw_range=tuple(self.command_curriculum_initial_yaw_range),
                 max_vx_range=tuple(self.command_lin_vel_x_range),
                 max_yaw_range=tuple(self.command_ang_vel_z_range),
+            )
+        else:
+            # __post_init__ 可被命令行覆盖后再次调用，需要完整恢复均匀指令配置。
+            self.commands.base_velocity = lab_mdp.UniformVelocityCommandCfg(
+                class_type=bpx_commands.TerrainAwareUniformVelocityCommand,
+                asset_name="robot",
+                resampling_time_range=(10.0, 10.0),
+                rel_standing_envs=0.02,
+                rel_heading_envs=1.0,
+                heading_command=False,
+                debug_vis=False,
+                ranges=lab_mdp.UniformVelocityCommandCfg.Ranges(
+                    lin_vel_x=tuple(self.command_lin_vel_x_range),
+                    lin_vel_y=tuple(self.command_lin_vel_y_range),
+                    ang_vel_z=tuple(self.command_ang_vel_z_range),
+                ),
             )
 
 

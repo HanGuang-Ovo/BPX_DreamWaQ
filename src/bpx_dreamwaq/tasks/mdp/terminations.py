@@ -1,8 +1,7 @@
 """BPX 任务的补充终止条件。
 
-机身过倾/过低终止与部署端 supervisor 的跌倒判定保持一致，作为机身
-非法接触终止之外的姿态保护。高度终止使用相对本环境地形原点的高度，
-适配粗糙地形（世界系高度在地形网格上无统一参考面）。
+机身过倾终止是本项目在机身非法接触终止之外补充的姿态保护。
+训练不再按相对地形原点的高度终止，避免下坡、下台阶时提前重置。
 """
 
 from __future__ import annotations
@@ -27,14 +26,3 @@ def base_tilt_above_maximum(
     projected_gravity = asset.data.projected_gravity_b
     tilt = torch.acos(torch.clamp(-projected_gravity[:, 2], -1.0, 1.0))
     return tilt > maximum_tilt_rad
-
-
-def base_height_below_minimum(
-    env,
-    minimum_height: float = 0.15,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """机身相对本环境地形原点的高度低于阈值时终止。"""
-    asset: Articulation = env.scene[asset_cfg.name]
-    relative_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
-    return relative_height < minimum_height

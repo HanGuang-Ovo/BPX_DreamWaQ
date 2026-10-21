@@ -1,21 +1,8 @@
-"""游戏式地形难度课程（模块 A）。
+"""按整回合指令执行质量和空间覆盖评价地形难度（仅依赖 torch）。
 
-按 DreamWaQ 采用的游戏式课程规则，在每个 episode 结束（机器人重置）时，
-依据机器人在本回合的实际移动表现更新其地形难度：
-
-- 升级：机器人移动距离超过当前地形块长度的一半（``move_up_ratio`` 可配）。
-- 降级：移动距离低于指令所要求的预期移动距离的一半（``move_down_ratio`` 可配），
-  且该回合速度指令足够大、足以判定跟踪表现（``min_command_speed`` 保护）。
-- 升级与降级互斥；等级限制在合法范围；到达最高等级后由
-  ``TerrainImporter.update_env_origins`` 随机分配等级以保留多难度训练经验
-  （Isaac Lab 内置行为，与本任务要求一致）。
-- 低速/零速指令的回合不参与降级判定，避免静止指令环境被持续降级。
-
-地形课程统计挂在环境对象的 ``env.terrain_curriculum_stats`` 属性上，由训练
-Runner 按迭代写入 TensorBoard；函数返回值经 CurriculumManager 记录为
-``Curriculum/terrain_levels/*`` 标量。
-
-本文件不导入 isaaclab（仅 torch），核心判定逻辑可离线单元测试。
+指令模块逐步累计移动任务及跟踪表现，课程判定前补采终止步：完成回合、
+移动量和空间覆盖达标就升级；跟踪误差只用于未升级回合的降级判定。
+零速、原地旋转和正常但覆盖不足的移动回合保持等级。
 """
 
 from __future__ import annotations
@@ -23,62 +10,152 @@ from __future__ import annotations
 import torch
 from collections.abc import Sequence
 
-# 说明：本模块保持仅依赖 torch，以便离线单元测试；isaaclab 类型仅在函数内
-# 延迟导入（作为默认参数构造）。
+
+class TerrainEpisodeMetrics:
+    """各环境独立的回合统计；指令重采样不清零，episode reset 才清零。
+
+    同一 episode 步号只采样一次。正常步由 CommandTerm 在重采样前采集，
+    终止步由课程在机器人 reset 前采集，避免漏步、重计和跨回合瞬移。
+    """
+
+    def __init__(
+        self, num_envs: int, device: str, min_command_speed: float = 0.1,
+        lin_vel_tolerance: float = 0.25, yaw_tolerance: float = 0.5,
+    ):
+        if min_command_speed < 0 or lin_vel_tolerance <= 0 or yaw_tolerance <= 0:
+            raise ValueError("指令速度下限必须非负，跟踪误差容限必须为正")
+        self.min_command_speed = min_command_speed
+        self.lin_vel_tolerance = lin_vel_tolerance
+        self.yaw_tolerance = yaw_tolerance
+        self._env_ids = torch.arange(num_envs, device=device)
+        self.start_xy = torch.zeros(num_envs, 2, device=device)
+        self.last_sample_step = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.command_distance = torch.zeros(num_envs, device=device)
+        self.moving_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.good_tracking_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._step_dt = 0.0
+        self.lin_error_integral = torch.zeros(num_envs, device=device)
+        self.yaw_error_integral = torch.zeros(num_envs, device=device)
+        self.max_excursion = torch.zeros(num_envs, device=device)
+        self.max_terrain_distance = torch.zeros(num_envs, device=device)
+
+    def reset(self, position_xy: torch.Tensor, env_ids=None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        self.start_xy[ids] = position_xy[ids]
+        self.last_sample_step[ids] = 0
+        for value in (
+            self.command_distance, self.moving_steps, self.good_tracking_steps,
+            self.lin_error_integral, self.yaw_error_integral,
+            self.max_excursion, self.max_terrain_distance,
+        ):
+            value[ids] = 0.0
+
+    def update(
+        self, position_xy: torch.Tensor, terrain_origin_xy: torch.Tensor,
+        lin_vel_xy: torch.Tensor, yaw_vel: torch.Tensor, command: torch.Tensor,
+        episode_steps: torch.Tensor, dt: float, env_ids=None,
+    ) -> None:
+        self._step_dt = dt
+        ids = self._env_ids if env_ids is None else self._env_ids[env_ids]
+        fresh = episode_steps[ids] > self.last_sample_step[ids]
+        cmd = command[ids]
+        speed = torch.linalg.vector_norm(cmd[:, :2], dim=1)
+        moving = fresh & torch.isfinite(cmd).all(dim=1) & (speed > self.min_command_speed)
+        lin_error = torch.linalg.vector_norm(cmd[:, :2] - lin_vel_xy[ids], dim=1)
+        yaw_error = torch.abs(cmd[:, 2] - yaw_vel[ids])
+        good = moving & (lin_error <= self.lin_vel_tolerance) & (yaw_error <= self.yaw_tolerance)
+        self.command_distance[ids] += torch.where(moving, speed * dt, 0.0)
+        self.moving_steps[ids] += moving.long()
+        self.good_tracking_steps[ids] += good.long()
+        self.lin_error_integral[ids] += torch.where(
+            moving, torch.nan_to_num(lin_error, nan=1e6, posinf=1e6) * dt, 0.0
+        )
+        self.yaw_error_integral[ids] += torch.where(
+            moving, torch.nan_to_num(yaw_error, nan=1e6, posinf=1e6) * dt, 0.0
+        )
+        # 方形地形使用轴向最大距离，避免在中央方形平台的对角线内绕圈也被算作覆盖。
+        valid_position = moving & torch.isfinite(position_xy[ids]).all(dim=1)
+        excursion = (position_xy[ids] - self.start_xy[ids]).abs().amax(dim=1)
+        terrain_distance = (position_xy[ids] - terrain_origin_xy[ids]).abs().amax(dim=1)
+        self.max_excursion[ids] = torch.maximum(
+            self.max_excursion[ids], torch.where(valid_position, excursion, 0.0)
+        )
+        self.max_terrain_distance[ids] = torch.maximum(
+            self.max_terrain_distance[ids], torch.where(valid_position, terrain_distance, 0.0)
+        )
+        self.last_sample_step[ids] = episode_steps[ids]
+
+    @property
+    def moving_time(self) -> torch.Tensor:
+        return self.moving_steps.float() * self._step_dt
+
+    @property
+    def good_tracking_fraction(self) -> torch.Tensor:
+        return self.good_tracking_steps.float() / self.moving_steps.clamp_min(1)
 
 
 def compute_terrain_level_moves(
-    distance: torch.Tensor,
-    command_xy: torch.Tensor,
+    command_distance: torch.Tensor,
+    moving_time: torch.Tensor,
+    episode_time: torch.Tensor,
+    good_tracking_fraction: torch.Tensor,
+    max_excursion: torch.Tensor,
+    max_terrain_distance: torch.Tensor,
+    completed: torch.Tensor,
+    failed: torch.Tensor,
     terrain_length: float,
-    episode_length_s: float,
-    up_distance_ratio: float = 0.5,
-    down_distance_ratio: float = 0.5,
-    min_command_speed: float = 0.1,
+    coverage_ratio: float = 0.25,
+    min_command_distance: float = 1.0,
+    min_tracking_duration_s: float = 2.0,
+    min_moving_fraction: float = 0.5,
+    failure_ratio: float = 0.5,
+    allow_demotion: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """纯逻辑：根据移动距离判定每个环境的升级/降级。
+    """升级只要求完成、足够移动任务和实际空间覆盖，不检查跟踪误差。
 
-    Args:
-        distance: (N,) 机器人相对本回合环境原点的移动距离（世界系平面距离）。
-        command_xy: (N, 2) 本回合速度指令（机体系 vx、vy）。
-        terrain_length: 地形块边长（米），读取自实际地形配置。
-        episode_length_s: 最大回合时长（秒）。
-        up_distance_ratio: 升级距离 = 地形块长度 × 该比例。
-        down_distance_ratio: 降级距离 = 预期指令距离 × 该比例。
-        min_command_speed: 指令平面速度低于该值时不判定降级。
-
-    Returns:
-        (move_up, move_down): 两个 (N,) 布尔张量，互斥。
+    明确移动任务定义为：已执行的回合中至少 ``min_moving_fraction`` 的时间
+    有平移指令。此时摔倒可以立即降级（不必等走满 1 m）；持续跟踪失败则还
+    要有足够的指令路程和采样时长。升级优先于跟踪失败降级，避免误差容限
+    间接成为升级门槛；失败终止仍禁止升级。未到评价门槛的正常回合保持等级。
     """
-    if up_distance_ratio <= 0:
-        raise ValueError("up_distance_ratio 必须为正")
-    if not 0.0 <= down_distance_ratio <= 1.0:
-        raise ValueError("down_distance_ratio 必须在 [0, 1] 内（0 表示只升不降）")
-    command_speed = torch.norm(command_xy, dim=-1)
-    # 升级：走过了半块地形。
-    move_up = distance > terrain_length * up_distance_ratio
-    # 降级：连预期指令距离的一半都没走到；静止或极低速指令不判定。
-    expected_distance = command_speed * episode_length_s
-    move_down = distance < expected_distance * down_distance_ratio
-    move_down = move_down & (command_speed > min_command_speed)
-    # 互斥：一次更新中不允许同时升级和降级。
-    move_down = move_down & ~move_up
+    if terrain_length <= 0 or coverage_ratio <= 0:
+        raise ValueError("地形尺寸和覆盖比例必须为正")
+    if min_command_distance <= 0 or min_tracking_duration_s <= 0:
+        raise ValueError("最小指令路程和跟踪时长必须为正")
+    if not 0 < min_moving_fraction <= 1:
+        raise ValueError("移动时间占比必须在 (0, 1] 内")
+    if not 0 < failure_ratio <= 1:
+        raise ValueError("失败占比必须在 (0, 1] 内")
+    lived = episode_time > 0
+    moving_task = lived & (moving_time > 0) & (moving_time >= episode_time * min_moving_fraction)
+    # 路程为浮点积分，容纳长回合累加的舍入误差；时间和跟踪占比由整数步数计算。
+    enough_motion = (
+        (command_distance >= min_command_distance * (1.0 - 1e-5))
+        & (moving_time >= min_tracking_duration_s)
+    )
+    coverage_distance = terrain_length * coverage_ratio
+    covered = (max_excursion >= coverage_distance) & (max_terrain_distance >= coverage_distance)
+    move_up = lived & enough_motion & completed & ~failed & covered
+    sustained_failure = enough_motion & (good_tracking_fraction <= 1.0 - failure_ratio)
+    move_down = moving_task & (failed | sustained_failure) & allow_demotion & ~move_up
     return move_up, move_down
 
 
 def terrain_levels_vel(
     env,
     env_ids: Sequence[int],
-    asset_cfg=None,
     command_name: str = "base_velocity",
-    up_distance_ratio: float = 0.5,
-    down_distance_ratio: float = 0.5,
-    min_command_speed: float = 0.1,
+    coverage_ratio: float = 0.25,
+    min_command_distance: float = 1.0,
+    min_tracking_duration_s: float = 2.0,
+    min_moving_fraction: float = 0.5,
+    failure_ratio: float = 0.5,
+    allow_demotion: bool = True,
     debug: bool = False,
 ) -> dict[str, float]:
     """地形课程项（CurriculumTermCfg.func）。
 
-    依据本回合实际移动距离更新 ``env_ids`` 中每个环境的地形等级，并维护
+    依据本回合指令执行质量与覆盖更新 ``env_ids`` 中每个环境的地形等级，并维护
     逐等级的回合奖励/长度统计（读取 RewardManager 尚未清零的回合累计值，
     该课程在奖励管理器 reset 之前执行）。
 
@@ -86,31 +163,35 @@ def terrain_levels_vel(
         课程状态字典，由 CurriculumManager 记录为
         ``Curriculum/terrain_levels/<key>`` 标量。
     """
-    if asset_cfg is None:
-        from isaaclab.managers import SceneEntityCfg
-
-        asset_cfg = SceneEntityCfg("robot")
-    asset = env.scene[asset_cfg.name]
     terrain = env.scene.terrain
     if terrain.cfg.terrain_generator is None:
         raise ValueError("地形课程仅在 terrain_type='generator' 时可用")
     if isinstance(env_ids, slice):
         env_ids = torch.arange(env.num_envs, device=terrain.device)[env_ids]
     else:
-        env_ids = torch.as_tensor(env_ids, device=terrain.device)
+        env_ids = torch.as_tensor(env_ids, device=terrain.device, dtype=torch.long)
 
-    # 使用每个环境自己的机器人位置与本回合环境原点，避免全局偏移被误计为移动距离。
-    distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
-    command = env.command_manager.get_command(command_name)
-
+    command_term = env.command_manager.get_term(command_name)
+    metrics = command_term.terrain_metrics
+    # ManagerBasedRLEnv 的 terminal step 在 CommandTerm.compute 前 reset，必须在这里补采。
+    command_term.update_terrain_metrics(env_ids)
+    episode_time = env.episode_length_buf[env_ids].float() * env.step_dt
     move_up, move_down = compute_terrain_level_moves(
-        distance=distance,
-        command_xy=command[env_ids, :2],
+        command_distance=metrics.command_distance[env_ids],
+        moving_time=metrics.moving_time[env_ids],
+        episode_time=episode_time,
+        good_tracking_fraction=metrics.good_tracking_fraction[env_ids],
+        max_excursion=metrics.max_excursion[env_ids],
+        max_terrain_distance=metrics.max_terrain_distance[env_ids],
+        completed=env.termination_manager.time_outs[env_ids],
+        failed=env.termination_manager.terminated[env_ids],
         terrain_length=float(terrain.cfg.terrain_generator.size[0]),
-        episode_length_s=env.max_episode_length_s,
-        up_distance_ratio=up_distance_ratio,
-        down_distance_ratio=down_distance_ratio,
-        min_command_speed=min_command_speed,
+        coverage_ratio=coverage_ratio,
+        min_command_distance=min_command_distance,
+        min_tracking_duration_s=min_tracking_duration_s,
+        min_moving_fraction=min_moving_fraction,
+        failure_ratio=failure_ratio,
+        allow_demotion=allow_demotion,
     )
     # 首次内部 reset（环境构建期间）时机器人尚未经历任何仿真步，root 位置
     # 仍是默认值，距离无意义——跳过这些环境的课程更新。
@@ -119,6 +200,8 @@ def terrain_levels_vel(
     move_down = move_down & lived
     # 回合发生在更新前的等级上：先记录再更新等级。
     levels_before = terrain.terrain_levels[env_ids].clone()
+    # 等级 0 的降级请求不计入实际降级次数。
+    move_down &= levels_before > 0
     # 更新地形等级（含边界裁剪与最高等级随机化，由 TerrainImporter 处理）。
     terrain.update_env_origins(env_ids, move_up, move_down)
     num_levels = int(terrain.max_terrain_level)
@@ -128,6 +211,7 @@ def terrain_levels_vel(
             "num_levels": num_levels,
             "move_up_count": 0,
             "move_down_count": 0,
+            "hold_count": 0,
             "reward_sum": torch.zeros(num_levels, device=terrain.device),
             "length_sum": torch.zeros(num_levels, device=terrain.device),
             "count": torch.zeros(num_levels, device=terrain.device),
@@ -135,28 +219,41 @@ def terrain_levels_vel(
         env.terrain_curriculum_stats = stats
     stats["move_up_count"] += int(move_up.sum().item())
     stats["move_down_count"] += int(move_down.sum().item())
+    hold = lived & ~(move_up | move_down)
+    stats["hold_count"] += int(hold.sum().item())
     # 逐等级回合统计：课程先于奖励管理器 reset 执行，回合累计值仍然有效。
     episode_sums = getattr(env.reward_manager, "_episode_sums", None)
     if episode_sums is not None:
-        episode_reward = torch.zeros_like(distance)
+        episode_reward = torch.zeros_like(episode_time)
         for value in episode_sums.values():
             episode_reward += value[env_ids]
-        stats["reward_sum"].index_add_(0, levels_before.long(), episode_reward)
-        stats["length_sum"].index_add_(0, levels_before.long(), env.episode_length_buf[env_ids].float())
-        stats["count"].index_add_(0, levels_before.long(), torch.ones_like(distance))
+        stats["reward_sum"].index_add_(0, levels_before[lived].long(), episode_reward[lived])
+        stats["length_sum"].index_add_(
+            0, levels_before[lived].long(), env.episode_length_buf[env_ids][lived].float()
+        )
+        stats["count"].index_add_(0, levels_before[lived].long(), torch.ones_like(episode_time[lived]))
 
     result = {
         "mean_level": terrain.terrain_levels.float().mean().item(),
         "num_move_up": int(move_up.sum().item()),
         "num_move_down": int(move_down.sum().item()),
+        "num_hold": int(hold.sum().item()),
         "num_reset_envs": int(env_ids.numel()),
     }
     if debug:
-        # 逐等级环境计数与本次重置批次的移动距离统计。
+        # 逐等级环境计数与本次重置批次的回合统计。
         levels_now = terrain.terrain_levels
         max_level = int(terrain.max_terrain_level)
         for level in range(max_level):
             result[f"level_{level:02d}_envs"] = int((levels_now == level).sum().item())
-        result["batch_mean_distance"] = float(distance.mean().item())
-        result["batch_max_distance"] = float(distance.max().item())
+        for name in ("command_distance", "moving_time", "max_excursion", "max_terrain_distance"):
+            result[f"batch_mean_{name}"] = float(getattr(metrics, name)[env_ids].mean().item())
+        result["batch_mean_tracking_fraction"] = float(metrics.good_tracking_fraction[env_ids].mean().item())
+        moving_time = metrics.moving_time[env_ids].clamp_min(1e-6)
+        result["batch_mean_lin_vel_error"] = float(
+            (metrics.lin_error_integral[env_ids] / moving_time).mean().item()
+        )
+        result["batch_mean_yaw_error"] = float(
+            (metrics.yaw_error_integral[env_ids] / moving_time).mean().item()
+        )
     return result

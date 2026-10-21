@@ -17,13 +17,57 @@ from collections.abc import Sequence
 
 import torch
 
+from isaaclab.envs.mdp.commands import UniformVelocityCommand
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
 from .command_grid import GridAdaptiveCommandScheduler
+from .curriculums import TerrainEpisodeMetrics
 
 
-class GridAdaptiveVelocityCommand(CommandTerm):
+class _TerrainMetricsMixin:
+    """在指令重采样前统计移动表现，reset 后从真实出生点重新开始。"""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.terrain_metrics = None
+        if env.cfg.enable_terrain_curriculum:
+            self.terrain_metrics = TerrainEpisodeMetrics(
+                self.num_envs, self.device,
+                min_command_speed=env.cfg.terrain_curriculum_min_command_speed,
+                lin_vel_tolerance=env.cfg.terrain_curriculum_lin_vel_tolerance,
+                yaw_tolerance=env.cfg.terrain_curriculum_yaw_tolerance,
+            )
+
+    def reset(self, env_ids=None):
+        extras = super().reset(env_ids)
+        if self.terrain_metrics is not None:
+            self.terrain_metrics.reset(self.robot.data.root_pos_w[:, :2], env_ids)
+        return extras
+
+    def update_terrain_metrics(self, env_ids=None):
+        if self.terrain_metrics is not None:
+            self.terrain_metrics.update(
+                position_xy=self.robot.data.root_pos_w[:, :2],
+                terrain_origin_xy=self._env.scene.env_origins[:, :2],
+                lin_vel_xy=self.robot.data.root_lin_vel_b[:, :2],
+                yaw_vel=self.robot.data.root_ang_vel_b[:, 2],
+                command=self.command,
+                episode_steps=self._env.episode_length_buf,
+                dt=self._env.step_dt,
+                env_ids=env_ids,
+            )
+
+
+class TerrainAwareUniformVelocityCommand(_TerrainMetricsMixin, UniformVelocityCommand):
+    """保留 Isaac Lab 均匀采样行为，并为地形课程累计整回合统计。"""
+
+    def _update_metrics(self):
+        super()._update_metrics()
+        self.update_terrain_metrics()
+
+
+class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
     """vx-wz 联合网格课程 + vy 均匀采样的速度指令生成器。"""
 
     cfg: GridAdaptiveVelocityCommandCfg
@@ -65,6 +109,7 @@ class GridAdaptiveVelocityCommand(CommandTerm):
         return self.vel_command_b
 
     def _update_metrics(self):
+        self.update_terrain_metrics()
         err_vx = torch.abs(self.vel_command_b[:, 0] - self.robot.data.root_lin_vel_b[:, 0])
         err_yaw = torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 2])
         # 与 UniformVelocityCommand 一致：按区间时长归一化的累计误差。

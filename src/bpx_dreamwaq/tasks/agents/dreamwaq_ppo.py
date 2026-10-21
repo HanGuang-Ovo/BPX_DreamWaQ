@@ -697,6 +697,7 @@ class DreamWaQRunner(OnPolicyRunner):
             if stats is not None:
                 self.writer.add_scalar("curriculum/terrain/move_up_total", float(stats["move_up_count"]), it)
                 self.writer.add_scalar("curriculum/terrain/move_down_total", float(stats["move_down_count"]), it)
+                self.writer.add_scalar("curriculum/terrain/hold_total", float(stats["hold_count"]), it)
                 for level in range(stats["num_levels"]):
                     if stats["count"][level] > 0:
                         self.writer.add_scalar(

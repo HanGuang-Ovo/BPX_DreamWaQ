@@ -23,7 +23,7 @@ BPX_DreamWaQ/
 │   │   ├── rough_env_cfg.py   # Manager-Based 崎岖地形速度跟踪环境 + 课程开关
 │   │   ├── mdp/
 │   │   │   ├── rewards.py         # 复用 Isaac Lab 内置奖励
-│   │   │   ├── terminations.py    # 过倾/过低终止
+│   │   │   ├── terminations.py    # 过倾终止
 │   │   │   ├── curriculums.py     # 模块 A：游戏式地形难度课程
 │   │   │   ├── command_grid.py    # 模块 B：Grid-Adaptive 指令课程核心（纯 torch）
 │   │   │   └── commands.py        # GridAdaptiveVelocityCommand（CommandTerm）
@@ -182,7 +182,15 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
    enable_terrain_curriculum = True        # 地形课程总开关
    num_terrain_levels = 10                 # 难度等级数（地形网格行数）
    terrain_curriculum_mode = "standard"    # "standard" 升降级 / "upgrade_only" 只升不降
-   terrain_curriculum_debug = False        # 逐等级环境数、批次距离等调试日志
+   terrain_curriculum_debug = False        # 逐等级环境数、整回合统计等调试日志
+   terrain_curriculum_min_command_speed = 0.1       # 平移指令评价下限 (m/s)
+   terrain_curriculum_min_command_distance = 1.0    # 最小累计指令路程 (m)
+   terrain_curriculum_min_tracking_duration_s = 2.0 # 最小移动评价时长 (s)
+   terrain_curriculum_min_moving_fraction = 0.5     # 明确移动任务：移动时间占比 ≥ 50%
+   terrain_curriculum_lin_vel_tolerance = 0.1       # 仅降级/日志使用：平面误差容限 (m/s)
+   terrain_curriculum_yaw_tolerance = 0.5           # 仅降级/日志使用：偏航误差容限 (rad/s)
+   terrain_curriculum_failure_ratio = 0.5          # 持续失败：≥ 50% 移动采样跟踪不良
+   terrain_curriculum_coverage_ratio = 0.25        # 轴向空间覆盖门槛 = 地形边长 × 0.25
 
    enable_grid_adaptive_command_curriculum = True    # 指令课程总开关
    command_grid_resolution_vx = 0.5        # vx 网格分辨率 (m/s)
@@ -219,18 +227,35 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
 
 | 开关 | 位置 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enable_terrain_curriculum` | `BPXRoughEnvCfg` / `--disable_terrain_curriculum` | 开 | 游戏式地形难度课程 |
+| `enable_terrain_curriculum` | `BPXRoughEnvCfg` / `--disable_terrain_curriculum` | 开 | 整回合表现与空间覆盖地形课程 |
 | `num_terrain_levels` | 同上 / `--num_terrain_levels` | 10 | 地形难度等级数（地形网格行数） |
 | `terrain_curriculum_mode` | 同上 | `standard` | `standard` 升降级 / `upgrade_only` 只升不降 |
 | `terrain_curriculum_debug` | 同上 | 关 | 额外课程调试日志 |
 | `enable_grid_adaptive_command_curriculum` | 同上 / `--enable_command_curriculum` / `--disable_command_curriculum` | 开 | Grid-Adaptive 指令课程 |
 
 **模块 A：地形课程**（`tasks/mdp/curriculums.py`）。每个 episode 结束时按
-环境独立判定：移动距离 > 地形块边长/2 → 升级；移动距离 < 指令预期距离/2
-（且指令速度 > 0.1 m/s，静止指令不判定）→ 降级；二者互斥，等级裁剪在
-[0, max]，达到最高级后随机分配等级（Isaac Lab `TerrainImporter` 内置）。
-逐等级回合奖励/长度、升降级计数写入 TensorBoard（`curriculum/terrain/*`、
-`Curriculum/terrain_levels/*`）。关闭课程时等级随机初始化且不再变化。
+环境独立判定，整回合数据由指令模块逐步累计，不在 10 s 指令重采样时清零：
+
+- 升级：正常超时完成回合、无失败终止，累计平移指令路程 ≥ 1 m、移动时长
+  ≥ 2 s，且满足实际空间覆盖条件。不检查速度跟踪达标比例或误差容限。
+- 降级：未满足升级条件，本回合至少 50% 的时间有明确平移指令（平面指令速度 > 0.1 m/s），
+  并发生失败终止，或在满足 1 m / 2 s 评价门槛后至少 50% 的移动采样跟踪不良。
+  明确移动任务中提前摔倒可直接降级，不必等走满 1 m；等级 0 不再下降。
+- 保持：零速、原地旋转、评价数据不足，或正常低速/转弯且跟踪良好但覆盖不足。
+
+降级统计中的跟踪良好定义为同一步平面速度误差 ≤ 0.1 m/s 且偏航误差 ≤ 0.5 rad/s。
+误差容限仅用于降级和日志；满足升级条件时优先升级，避免跟踪降级间接阻止升级。
+空间覆盖采用整回合的轴向最大距离：相对真实出生点、相对地形中心均须达到
+地形边长 × 0.25（8 m 地形为 2 m），避免往返被净位移误判，也避免只在中央
+方形平台绕小圈或沿对角线移动就升级。这是空间覆盖代理指标，并非精确障碍接触判定。
+`upgrade_only` 保留上述升级条件并禁用降级。
+
+终止步在机器人 reset 前补采，回合 reset 后重新记录出生点，各环境独立清零；
+指令课程开关关闭时，均匀指令采样也使用同一套地形统计。
+升降级互斥，达到最高级后随机分配等级（Isaac Lab `TerrainImporter` 内置）。
+逐等级回合奖励/长度、实际升降级次数、保持次数写入 TensorBoard
+（`curriculum/terrain/*`、`Curriculum/terrain_levels/*`）；开启 debug 可查看
+指令路程、移动时间、空间覆盖和跟踪达标占比。关闭课程时等级随机初始化且不再变化。
 
 **模块 B：Grid-Adaptive 指令课程**（`tasks/mdp/command_grid.py` + `commands.py`）。
 在 (vx, wz) 联合网格（默认 0.5 m/s × 0.5 rad/s 分辨率，中心在零速）上维护
@@ -244,17 +269,72 @@ vx 与 wz 从同一单元联合采样，不独立组合；vy 保持原均匀采�
 PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
 `curriculum_<iter>.npz`，可用任意工具绘制热力图。
 
-### TensorBoard 重点指标
+### TensorBoard 训练曲线阅读方法
 
-- `cenet/velocity_mse`、`cenet/velocity_error_x/y/z`：速度估计精度（判断 CENet
-  是否训练成功的首要指标，不能只看 PPO 奖励）。
-- `cenet/prediction_loss`、`cenet/kl_loss`、`cenet/total_auxiliary_loss`：VAE 辅助损失。
-- `cenet/adaboot_p_boot`、`cenet/adaboot_est_fraction`：AdaBoot 概率与估计速度占比。
-- `policy/mean_reward`、`policy/episode_length`（与 `Train/*` 同源）。
-- `curriculum/terrain/mean_level`、`level_XX_frac`、`level_XX_mean_reward/length`、
-  `move_up/down_total`：地形课程进度与各难度表现。
-- `curriculum/command/activated_cells`、`vx_range`、`yaw_range`、`expansions`、
-  误差均值：指令课程扩张进度。
+查看：`tensorboard --logdir outputs/training/bpx_dreamwaq`。全部曲线按迭代
+（约每 24×N 步）记录一次；下面括号里的数值是本机 256 环境 × 250 迭代
+实测训练的参考形态（完整记录见 [docs/VALIDATION.md](docs/VALIDATION.md)）。
+
+**① 策略学习进度——`policy/*`、`Episode Reward/*`、`Episode Termination/*`**
+
+| 曲线 | 含义 | 健康形态（实测） |
+| --- | --- | --- |
+| `policy/mean_reward` | 最近 100 个回合的平均总奖励，最核心的学习指标 | 持续上升（−1.24→−0.40） |
+| `policy/episode_length` | 平均回合步数（满 20 s = 1000 步） | 先跌后回升（20→9→25） |
+| `Episode Reward/track_*` | 速度跟踪奖励分项 | 随总奖励上升 |
+| `Episode Reward/*_l2` | 力矩/加速度/动作变化率等罚项 | 负值、量级小；暴涨=动作抖动加剧 |
+| `Episode Termination/*` | 终止原因占比 | `base_contact/base_tilt` 下降、`time_out` 上升（机器人撑满回合） |
+
+`Train/mean_reward` 与 `policy/mean_reward` 同源，看一个即可。回合长度长期
+个位数 = 机器人秒倒；`time_out` 占比是最直接的"站稳了吗"指标。
+
+**② CENet 状态估计质量——`cenet/*`（任务 1 的验收指标）**
+
+| 曲线 | 含义 | 健康形态（实测） |
+| --- | --- | --- |
+| `cenet/velocity_mse` | 速度估计 MSE（估计 vs 仿真真值）。**判断 CENet 成败的首要指标，不能只看 PPO 奖励** | 单调下降后趋平（0.091→0.017） |
+| `cenet/velocity_error_x/y/z` | 三轴平均绝对误差（m/s） | 0.18/0.17/0.33 → 0.09/0.08/0.11；`velocity_mae` < 0.1 m/s 即相当准 |
+| `cenet/prediction_loss` | VAE Decoder 预测下一时刻观测的 MSE，反映隐变量信息量 | 缓慢下降（22.9→10.5） |
+| `cenet/kl_loss` | VAE KL 散度 | 不发散即可（峰值 140 回落 55，β=1e-3 下加权贡献仅 ~0.05） |
+| `cenet/total_auxiliary_loss` | 三项辅助损失加权和 | 平稳有限 |
+| `cenet/adaboot_p_boot` / `adaboot_est_fraction` | AdaBoot 概率 / rollout 实际用估计速度的占比 | 两者联动（reward_cv 模式约 0.5–0.65） |
+
+警告信号：`velocity_mse` 居高不下（检查历史观测输入）、NaN（学习率过大）、
+`kl_loss` 无界增长（调大 `beta_kl`）。
+
+**③ 地形课程进展——`curriculum/terrain/*`（模块 A）**
+
+- `mean_level`：平均地形难度（0–9），**步态稳定后阶梯式爬升**；早期恒 0 属
+  预期（走不完半块地形不升级）。
+- `level_XX_frac`：各难度环境比例，健康时整体向高等级迁移。
+- `move_up_total` / `move_down_total`：累计升降级次数，早期 down 为主、
+  中后期 up 反超。
+- `level_XX_mean_reward/length`：各难度回合表现——**爬级后先回落再恢复是
+  课程起作用的正常表现**。
+
+**④ 指令课程进展——`curriculum/command/*`（模块 B）**
+
+- `activated_cells`：激活指令单元数（初始 9=3×3），策略掌握当前区域后增加。
+- `vx_range` / `yaw_range`：激活区域覆盖范围（初始 0.75）。
+- `expansions`：累计激活数，单调不减，增长快=当前区域学得好。
+- `Metrics/base_velocity/error_vel_xy、error_vel_yaw`：指令跟踪误差（课程
+  扩张的判定依据，也直接反映跟踪质量）。
+
+**⑤ PPO 内部状态——`Loss/*`、`Policy/mean_noise_std`**
+
+- `Loss/surrogate`：clipped 代理损失，**不需要单调下降**，0 附近波动正常。
+- `Loss/value_function`：Critic 回归损失，下降趋稳；持续很大=特权观测未生效。
+- `Loss/entropy` / `Policy/mean_noise_std`：动作熵与噪声，中后期缓慢下降；
+  接近 0 会失去探索。
+- `Loss/learning_rate`：自适应学习率，锯齿波动正常。
+
+**⑥ 性能——`Perf/*`**：`total_fps`（实测 ≈2900 @256 env）、
+`collection time` / `learning time` 占比，用于判断瓶颈在仿真还是网络。
+
+**快速看板（按优先级）**：① `policy/mean_reward` ↑ 且 `time_out` 终止占比 ↑
+→ 策略在学；② `cenet/velocity_mse` ↓ → 估计器在学；③ `curriculum/*` 阶梯
+上升 → 课程在推进（收敛训练阶段）；④ 无 NaN、`value_function` 收敛、熵缓降
+→ 训练稳定。
 
 ### 训练超参数（`tasks/agents/rsl_rl_ppo_cfg.py`）
 
@@ -264,6 +344,29 @@ PPO：lr 1e-3（自适应 KL 0.01）、γ 0.99、λ 0.95、clip 0.2、熵系数 
 每迭代 24 步 × 5 epoch × 4 minibatch。辅助损失权重 λ_vel=1.0、λ_pred=1.0、
 β_KL=1e-3（论文未给数值，工程默认）。梯度连接 `ppo_grad_to_cenet=False`、
 隐变量模式 `latent_actor_mode="mean"`。AdaBoot 默认值见上文配置方式一节。
+
+奖励项（`tasks/rough_env_cfg.py` 的 `RewardsCfg`，权重均可在该处调整）：
+速度/角速度跟踪（1.5 / 0.75）、垂直速度与 roll/pitch 角速度正则、力矩/
+加速度/动作变化率正则、足端迈步奖励和机身接触惩罚。补充奖励项：
+
+- `base_height_l2`（权重 −1.0）：`(机身根坐标高度 - 平均地面高度 - 0.42)**2`。
+  目标高度先沿用训练初始化高度 0.42 m，可在 cfg 的 `target_height` 中调整。
+  复用高度扫描，仅对有效命中点取地面高度均值；全无效时跳过该环境的此项。
+  扫描均值是局部支撑面的近似，跨台阶时仍存在地形估计误差。
+
+- `feet_clearance`（权重 −0.01）：各足端相对脚下地形的高度误差平方，乘以
+  足端世界系水平速度后求和；`target_height=0.10 m` 指 toe_link 原点高度，
+  不是鞋底净空，也不是论文给定值。复用现有高度扫描，每只脚取最近有效
+  命中点；超过 `max_ray_distance=0.15 m` 或没有有效点时跳过该脚。
+  扫描分辨率为 0.1 m，台阶边缘的地形高度仅是近似值。
+- `action_smoothness_l2`（权重 −0.01）：`sum((a_t - 2*a_{t-1} + a_{t-2})**2)`，
+  使用原始策略动作，与现有一阶动作变化项一致；每个环境回合重置时独立
+  清空历史，首步历史补零。以上各项均由 RewardManager 统一乘策略时间步。
+
+姿态水平惩罚权重为 −0.2，关节越界惩罚权重为 0。`base_height_l2` 是相对扫描
+区域平均地面的连续高度惩罚。训练终止条件为 20 s 超时、torso 接触力超过
+1 N、机身倾角超过 1.0 rad；已移除相对地形原点低于 0.15 m 的高度终止，
+避免下坡或下台阶时提前重置。
 
 ### 训练测试
 
