@@ -48,6 +48,7 @@ from isaaclab.utils import configclass
 import isaaclab.envs.mdp as lab_mdp
 
 from .. import assets as bpx_assets
+from ..runtime.joints import POLICY_JOINT_NAMES
 from .mdp import commands as bpx_commands
 from .mdp import curriculums as bpx_curriculums
 from .mdp import rewards as bpx_rewards
@@ -236,7 +237,8 @@ class ActionsCfg:
     """关节位置目标动作：q = q_default + 0.5 × a（与部署一致）。"""
 
     joint_pos = lab_mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=[".*"], scale=0.5, use_default_offset=True
+        asset_name="robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True,
+        scale=0.5, use_default_offset=True,
     )
 
 
@@ -251,8 +253,10 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=lab_mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=lab_mdp.projected_gravity)
         velocity_commands = ObsTerm(func=lab_mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel)
+        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
+        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
         actions = ObsTerm(func=lab_mdp.last_action)
 
         def __post_init__(self):
@@ -269,8 +273,10 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=lab_mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=lab_mdp.projected_gravity)
         velocity_commands = ObsTerm(func=lab_mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel)
+        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
+        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
         actions = ObsTerm(func=lab_mdp.last_action)
 
         def __post_init__(self):
@@ -286,8 +292,10 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=lab_mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=lab_mdp.projected_gravity)
         velocity_commands = ObsTerm(func=lab_mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel)
+        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
+        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
         actions = ObsTerm(func=lab_mdp.last_action)
         height_scan = ObsTerm(
             func=lab_mdp.height_scan,
@@ -432,6 +440,24 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
             "threshold": 0.5,
+        },
+    )
+    # 着地瞬间奖励无法约束“始终不落脚”；连续悬空和长期触地失衡单独约束。
+    feet_air_time_excess = RewTerm(
+        func=bpx_rewards.feet_air_time_excess,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
+            "maximum_air_time": 0.6,
+            "penalty_cap": 1.0,
+        },
+    )
+    feet_contact_balance = RewTerm(
+        func=bpx_rewards.feet_contact_balance,
+        weight=-0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
+            "time_constant": 1.0,
         },
     )
     '''不希望的接触惩罚'''

@@ -1,12 +1,13 @@
-"""Deterministic three-level test course; no terrain information enters the policy."""
+"""Seeded rough ground and graded box stairs; terrain never enters policy input."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
 
-from .config import Sim2SimConfig
+from .config import Sim2SimConfig, TerrainConfig
 
 # One continuous heightfield includes flat shoulders, avoiding internal collider seams.
 X_MIN, X_MAX = -3.0, 11.0
@@ -46,7 +47,41 @@ def course_heights(seed: int) -> np.ndarray:
     return amplitude * roughness
 
 
-def region_at(x: float, y: float) -> str:
+@dataclass(frozen=True)
+class StairLane:
+    level: int
+    y: float
+    step_height: float
+    # Adjacent, non-overlapping boxes: (x_start, x_end, top_z).
+    segments: tuple[tuple[float, float, float], ...]
+
+
+def stair_lanes(config: TerrainConfig) -> tuple[StairLane, ...]:
+    lanes = []
+    for level, height in enumerate(config.step_heights, start=1):
+        y = -3.5 - config.stair_width / 2 - (level - 1) * (config.stair_width + 1.0)
+        x = 2.0
+        segments = []
+        for step in (*range(1, config.step_count), config.step_count,
+                     *range(config.step_count - 1, 0, -1)):
+            width = config.platform_width if step == config.step_count else config.step_width
+            segments.append((x, x + width, step * height))
+            x += width
+        lanes.append(StairLane(level, y, height, tuple(segments)))
+    return tuple(lanes)
+
+
+def region_at(x: float, y: float, config: TerrainConfig | None = None) -> str:
+    if config is not None:
+        if config.kind in ("stairs", "mixed"):
+            for lane in stair_lanes(config):
+                if abs(y - lane.y) <= config.stair_width / 2:
+                    start, end = lane.segments[0][0], lane.segments[-1][1]
+                    if start <= x <= end:
+                        return f"STAIRS {lane.level} / {lane.step_height * 100:g} cm"
+                    return f"STAIRS {lane.level} / APPROACH" if x < start else "FLAT / RETURN PATH"
+        if config.kind in ("flat", "stairs"):
+            return "FLAT"
     if not (-2 <= x <= 10 and abs(y) <= 2):
         return "FLAT / RETURN PATH"
     if x <= 2:
@@ -68,10 +103,42 @@ def load_model(config: Sim2SimConfig) -> mujoco.MjModel:
     for key in ("meshdir", "texturedir"):
         compiler.set(key, str((config.paths.mjcf.parent / compiler.get(key, ".")).resolve()))
     asset = root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(root, "asset")
     world = root.find("worldbody")
+    if world is None:
+        raise ValueError("MJCF requires a worldbody")
     floor = world.find(f"geom[@name='{config.floor_geom_name}']")
     if floor is None or floor.get("type") != "plane":
-        raise ValueError("Three-level course requires a named world plane in the source MJCF")
+        raise ValueError("Test course requires a named world plane in the source MJCF")
+    ground_attributes = {key: floor.get(key) for key in
+                         ("friction", "condim", "solref", "solimp", "material") if floor.get(key) is not None}
+    heights = normalized = None
+    if config.terrain.kind in ("three_level", "mixed"):
+        heights, normalized = _add_rough_course(asset, world, floor, config, ground_attributes)
+    else:
+        # MuJoCo rays respect the finite plane size even though plane contacts
+        # extend further. Cover stair approaches and the return area as well.
+        floor.set("size", "50 50 0.1")
+    if config.terrain.kind in ("stairs", "mixed"):
+        _add_stairs(world, config.terrain, ground_attributes)
+    model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    # Bound rendering independently of the large flat return area.
+    lanes = stair_lanes(config.terrain) if config.terrain.kind in ("stairs", "mixed") else ()
+    y_min = lanes[-1].y - config.terrain.stair_width / 2 if lanes else -3.0
+    x_max = max(11.0, lanes[0].segments[-1][1] + 2) if lanes else 11.0
+    model.stat.center[:] = ((x_max - 3) / 2, (y_min + 3) / 2, 0.0)
+    model.stat.extent = max(x_max + 3, 3 - y_min)
+    model.vis.map.shadowclip = 0.75
+    model.vis.map.znear = 0.001
+    if heights is not None:
+        hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "three_level_course")
+        address = model.hfield_adr[hid]
+        model.hfield_data[address:address + heights.size] = normalized.ravel()
+    return model
+
+
+def _add_rough_course(asset, world, floor, config, ground_attributes):
     heights = course_heights(config.terrain.seed)
     # Encode metres into [0, 1] without clipping peaks or filling valleys.
     elevation_scale = 2.0 * MODERATE_AMPLITUDE
@@ -82,8 +149,6 @@ def load_model(config: Sim2SimConfig) -> mujoco.MjModel:
     ET.SubElement(asset, "hfield", name="three_level_course", nrow=str(heights.shape[0]),
                   ncol=str(heights.shape[1]), size=f"7 3 {elevation_scale} 0.1")
     # Replace the plane, rather than leaving a plane that would fill the negative valleys.
-    ground_attributes = {key: floor.get(key) for key in
-                         ("friction", "condim", "solref", "solimp", "material") if floor.get(key) is not None}
     floor.attrib.clear()
     floor.attrib.update(name=config.floor_geom_name, type="hfield", hfield="three_level_course",
                         pos=f"4 0 {elevation_offset}", group="5", **ground_attributes)
@@ -101,19 +166,21 @@ def load_model(config: Sim2SimConfig) -> mujoco.MjModel:
         for y_edge in (-2.05, 2.05):
             ET.SubElement(world, "geom", type="box", pos=f"{center} {y_edge} 0.003",
                           size="1.98 0.025 0.002", rgba=color, contype="0", conaffinity="0", group="1")
-    model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
-    # The 100 m surrounding ground inflates auto extent to ~166 m. Directional
-    # shadow coverage and camera clipping scale with extent, producing blocky
-    # robot shadows and clipping close-up views. Bound rendering to the course;
-    # these statistics do not change collision geometry or physics parameters.
-    model.stat.center[:] = (4.0, 0.0, 0.0)
-    model.stat.extent = 14.0
-    model.vis.map.shadowclip = 0.75  # 10.5 m radius covers the course and shoulders.
-    model.vis.map.znear = 0.001  # 1.4 cm camera near plane for robot close-ups.
-    hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "three_level_course")
-    address = model.hfield_adr[hid]
-    model.hfield_data[address:address + heights.size] = normalized.ravel()
-    return model
+    return heights, normalized
+
+
+def _add_stairs(world, config, ground_attributes):
+    attributes = {key: value for key, value in ground_attributes.items() if key != "material"}
+    colors = ("0.30 0.62 0.42 1", "0.30 0.48 0.72 1", "0.80 0.46 0.22 1")
+    for lane in stair_lanes(config):
+        for index, (start, end, height) in enumerate(lane.segments):
+            # Box faces preserve vertical risers, unlike heightfield interpolation.
+            ET.SubElement(
+                world, "geom", name=f"{GROUND_PREFIX}stairs_{lane.level}_{index}", type="box",
+                pos=f"{(start + end) / 2} {lane.y} {height / 2}",
+                size=f"{(end - start) / 2} {config.stair_width / 2} {height / 2}",
+                group="5", rgba=colors[(lane.level - 1) % len(colors)], **attributes,
+            )
 
 
 def add_course_labels(viewer, config: Sim2SimConfig) -> None:
@@ -121,20 +188,28 @@ def add_course_labels(viewer, config: Sim2SimConfig) -> None:
     with viewer.lock():
         # MuJoCo hides visual groups 3–5 by default; group 5 contains queryable ground.
         viewer.opt.geomgroup[5] = 1
-        if config.terrain.kind != "three_level":
+        if config.terrain.kind == "flat":
             return
-        viewer.cam.lookat[:] = (4.0, 0.0, 0.0)
-        viewer.cam.distance = 15.0
+        viewer.cam.lookat[:] = (*config.initial_state.base_position[:2], 0.2)
+        viewer.cam.distance = 8.0
         viewer.cam.azimuth = 90.0
         viewer.cam.elevation = -55.0
         scene = viewer.user_scn
-        for x, text in ((0, "LEVEL 0 | FLAT"), (4, f"LEVEL 1 | MILD | +/-{100 * MILD_AMPLITUDE:g} cm"),
-                        (8, f"LEVEL 2 | MODERATE | +/-{100 * MODERATE_AMPLITUDE:g} cm")):
+        labels = []
+        if config.terrain.kind in ("three_level", "mixed"):
+            labels.extend(((0, 2.3, "LEVEL 0 | FLAT"),
+                           (4, 2.3, f"LEVEL 1 | MILD | +/-{100 * MILD_AMPLITUDE:g} cm"),
+                           (8, 2.3, f"LEVEL 2 | MODERATE | +/-{100 * MODERATE_AMPLITUDE:g} cm")))
+        if config.terrain.kind in ("stairs", "mixed"):
+            for lane in stair_lanes(config.terrain):
+                labels.append((2.5, lane.y - config.terrain.stair_width / 2 - 0.25,
+                               f"STAIRS {lane.level} | {lane.step_height * 100:g} cm | UP / DOWN"))
+        for x, y, text in labels:
             if scene.ngeom >= scene.maxgeom:
                 raise RuntimeError("Viewer has insufficient capacity for course labels")
             geom = scene.geoms[scene.ngeom]
             mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_LABEL, np.zeros(3),
-                               np.array([x, 2.3, 0.45]), np.eye(3).ravel(),
+                               np.array([x, y, 0.45]), np.eye(3).ravel(),
                                np.array([1., 1., 1., 1.], dtype=np.float32))
             geom.label = text
             scene.ngeom += 1

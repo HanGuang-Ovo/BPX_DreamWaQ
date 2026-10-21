@@ -5,7 +5,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bpx_dreamwaq.runtime.policy import ZeroPolicy
 from bpx_dreamwaq.sim2sim.cli import main, parse_args
@@ -49,6 +49,45 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(result, 0)
                 loader.assert_called_once()
                 self.assertEqual(loader.call_args.args[:3], (path, 450, 12))
+
+    def test_default_runs_pd_init_before_policy(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            log = Path(tmp) / "run.csv"
+            result = main(["--duration", "0.04", "--no-realtime", "--log", str(log)])
+            self.assertIn(",init,init_pd,", log.read_text())
+        self.assertEqual(result, 0)
+
+    def test_gamepad_wires_rb_and_custom_terrain_start(self):
+        gamepad = Mock()
+        gamepad.__enter__ = Mock(return_value=gamepad)
+        gamepad.__exit__ = Mock()
+        with patch("bpx_dreamwaq.sim2sim.cli.select_gamepad", return_value=Mock()), \
+             patch("bpx_dreamwaq.sim2sim.cli.GamepadCommandSource", return_value=gamepad) as factory, \
+             patch("bpx_dreamwaq.sim2sim.cli.Sim2SimRunner") as runner, redirect_stdout(io.StringIO()):
+            runner.return_value.run.return_value.termination_reason = "duration"
+            runner.return_value.run.return_value.simulated_seconds = 1.
+            result = main(["--gamepad", "--terrain", "stairs", "--stair-level", "2",
+                           "--step-heights", "0.04", "0.1", "--terrain-seed", "42"])
+        self.assertEqual(result, 0)
+        cfg = runner.call_args.args[0]
+        self.assertEqual(cfg.terrain.kind, "stairs")
+        self.assertEqual(cfg.terrain.step_heights, (.04, .1))
+        self.assertEqual(cfg.terrain.seed, 42)
+        self.assertEqual(cfg.initial_state.base_position, (0., -7.5, .13))
+        self.assertEqual(factory.call_args.kwargs["init_button"], 311)
+        self.assertEqual(runner.return_value.run.call_args.kwargs["command_source"], gamepad.read)
+        self.assertEqual(runner.return_value.run.call_args.kwargs["init_request_source"], gamepad.consume_init_request)
+
+    def test_invalid_terrain_and_workflow_arguments_have_clear_errors(self):
+        for arguments in (["--terrain", "stairs", "--stair-level", "4"],
+                          ["--stair-level", "1"], ["--terrain-seed", "-1"],
+                          ["--step-heights", "0.1", "0.03"],
+                          ["--direct-policy", "--gamepad"], ["--direct-policy", "--auto-init"]):
+            stderr = io.StringIO()
+            with self.subTest(arguments=arguments), redirect_stderr(stderr):
+                self.assertEqual(main(arguments), 2)
+                self.assertIn("ERROR:", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

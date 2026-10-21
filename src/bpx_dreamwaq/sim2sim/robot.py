@@ -234,7 +234,7 @@ class BpxMujocoRobot:
         if self.config.terrain.kind == "flat":
             return "FLAT"
         from .terrain import region_at
-        return region_at(*self.data.xpos[self.base_body_id, :2])
+        return region_at(*self.data.xpos[self.base_body_id, :2], self.config.terrain)
 
     def tilt_angle(self) -> float:
         projected_gravity = self.projected_gravity()

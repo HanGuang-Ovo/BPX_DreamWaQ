@@ -31,6 +31,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backend", choices=("torchscript", "onnx", "zero"), default="zero",
                         help="默认 zero，仅检查模型和控制框架；推理时显式选择 onnx/torchscript")
     parser.add_argument("--policy", type=Path, help="覆盖所选 ONNX 或 TorchScript 策略文件")
+    parser.add_argument("--terrain", choices=("flat", "three_level", "stairs", "mixed"),
+                        help="覆盖地形：平地、分级崎岖、分级楼梯、崎岖+楼梯综合场地")
+    parser.add_argument("--terrain-seed", type=int, help="崎岖地形随机种子（固定种子可复现）")
+    parser.add_argument("--step-heights", type=float, nargs="+", metavar="METRES",
+                        help="楼梯各等级单级高度，递增排列，例如 0.03 0.08 0.15")
+    parser.add_argument("--stair-level", type=int, metavar="N",
+                        help="在第 N 级楼梯前方的平地趴卧出生（从 1 开始；需要 stairs/mixed）")
     parser.add_argument("--device", default="cpu", help="TorchScript 设备，例如 cpu 或 cuda:0")
     parser.add_argument("--vx", type=float, default=None, help="机体 x 方向目标线速度，m/s")
     parser.add_argument("--vy", type=float, default=None, help="机体 y 方向目标线速度，m/s")
@@ -68,15 +75,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=f"仅按住 LB（Linux 按钮码 {BTN_TL}）时接受非零指令",
     )
-    parser.add_argument(
+    supervision = parser.add_mutually_exclusive_group()
+    supervision.add_argument(
         "--supervisor",
         action="store_true",
-        help="启用 WAITING_INIT/INIT/STAND/WALK/STOPPING/DISABLED 上层状态机",
+        help="启用起身/行走状态机（默认已启用，保留旧命令兼容）",
     )
+    supervision.add_argument("--direct-policy", action="store_true",
+                             help="跳过 Init，直接执行策略；仅用于部署接口对拍")
     parser.add_argument(
         "--auto-init",
         action="store_true",
-        help="无手柄时自动启用 Supervisor 并触发 Init（摔倒回到趴姿会再次自动起身）",
+        help="自动触发 Init（无手柄时默认自动；手柄模式下可跳过 RB 等待）",
     )
     termination_group = parser.add_mutually_exclusive_group()
     termination_group.add_argument(
@@ -106,6 +116,22 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     config = load_config(args.config)
+    terrain_overrides = {}
+    for argument, field in ((args.terrain, "kind"), (args.terrain_seed, "seed"),
+                            (args.step_heights, "step_heights")):
+        if argument is not None:
+            terrain_overrides[field] = argument
+    if terrain_overrides:
+        config = replace(config, terrain=replace(config.terrain, **terrain_overrides))
+    if args.stair_level is not None:
+        if (config.terrain.kind not in ("stairs", "mixed")
+                or not 1 <= args.stair_level <= len(config.terrain.step_heights)):
+            raise ValueError("--stair-level 需要 stairs/mixed 地形，且等级必须在 step_heights 范围内")
+        from .terrain import stair_lanes
+        lane = stair_lanes(config.terrain)[args.stair_level - 1]
+        config = replace(config, initial_state=replace(
+            config.initial_state, base_position=(0.0, lane.y, config.initial_state.base_position[2]),
+        ))
     if args.policy is not None:
         if args.backend == "zero":
             raise ValueError("--policy 需要显式选择 --backend onnx 或 torchscript")
@@ -123,6 +149,8 @@ def _run(args: argparse.Namespace) -> int:
         command_defaults[2] if args.wz is None else args.wz,
     )
     use_gamepad = args.gamepad or args.gamepad_device is not None or args.gamepad_index is not None
+    if args.direct_policy and (use_gamepad or args.auto_init):
+        raise ValueError("--direct-policy 不能与手柄或 --auto-init 同用")
     policy = create_policy(
         backend=args.backend,
         path=config.paths.policy,
@@ -130,7 +158,7 @@ def _run(args: argparse.Namespace) -> int:
         action_dimension=config.observation.action_dimension,
         device=args.device,
     )
-    use_supervisor = args.supervisor or args.auto_init or use_gamepad
+    use_supervisor = not args.direct_policy
     supervisor = BehaviorSupervisor(config.supervisor) if use_supervisor else None
     if use_supervisor:
         print(f"Init: 足端五次轨迹 + PD，标称时长 {config.init_controller.duration:.1f}s")
@@ -169,18 +197,22 @@ def _run(args: argparse.Namespace) -> int:
             print(
                 f"BPX sim2sim: backend={args.backend}, source={source_label}, "
                 f"command=[{command[0]}, {command[1]}, {command[2]}], "
-                f"supervisor={'on' if use_supervisor else 'off'}, "
+                f"terrain={config.terrain.kind}, supervisor={'on' if use_supervisor else 'off'}, "
                 f"physics={1.0 / config.simulation.timestep:.1f}Hz, "
                 f"policy={1.0 / config.simulation.policy_dt:.1f}Hz"
             )
-            if gamepad is not None and use_supervisor:
+            if args.backend == "zero":
+                print("Zero 后端只验证 PD 和控制流程；移动需要导出的 ONNX/TorchScript 策略。")
+            if gamepad is not None and not args.auto_init:
                 print(f"控制流程：机器人以趴姿等待；按下 RB（Linux 按钮码 {BTN_TR}）启动 Init。")
+            if gamepad is not None:
+                print("左摇杆：前后/横移；右摇杆水平：转向；松开摇杆：减速站立。")
             result = runner.run(
                 command=command,
                 command_source=gamepad.read if gamepad is not None else None,
                 init_request_source=(
-                    gamepad.consume_init_request if gamepad is not None and use_supervisor
-                    else (lambda: True) if args.auto_init and use_supervisor
+                    (lambda: True) if use_supervisor and (args.auto_init or gamepad is None)
+                    else gamepad.consume_init_request if gamepad is not None
                     else None
                 ),
                 duration=args.duration,

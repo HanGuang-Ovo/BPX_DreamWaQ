@@ -9,6 +9,7 @@ import tomllib
 
 from bpx_dreamwaq.runtime.supervisor import SupervisorConfig
 from bpx_dreamwaq.runtime.init_controller import InitControllerConfig
+from bpx_dreamwaq.runtime.joints import POLICY_JOINT_NAMES
 from bpx_dreamwaq.paths import PROJECT_ROOT
 
 
@@ -83,6 +84,32 @@ class TerminationConfig:
 class TerrainConfig:
     kind: str = "flat"
     seed: int = 20260918
+    step_heights: tuple[float, ...] = (0.03, 0.08, 0.15)
+    step_count: int = 5
+    step_width: float = 0.30
+    stair_width: float = 2.0
+    platform_width: float = 1.20
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("flat", "three_level", "stairs", "mixed"):
+            raise ValueError("terrain.kind must be flat, three_level, stairs or mixed")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("terrain.seed must be a nonnegative integer")
+        if type(self.step_count) is not int or not 1 <= self.step_count <= 50:
+            raise ValueError("terrain.step_count 必须是 1..50 的整数")
+        heights = tuple(float(value) for value in self.step_heights)
+        if not 1 <= len(heights) <= 10 or any(not math.isfinite(h) or h <= 0 for h in heights):
+            raise ValueError("terrain.step_heights 必须包含 1..10 个有限正数（米）")
+        if any(a >= b for a, b in zip(heights, heights[1:])):
+            raise ValueError("terrain.step_heights 必须按难度递增")
+        object.__setattr__(self, "step_heights", heights)
+        for name in ("step_width", "stair_width", "platform_width"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"terrain.{name} 必须是有限正数（米）")
+        if (2 * (self.step_count - 1) * self.step_width + self.platform_width > 40
+                or 3.5 + len(heights) * (self.stair_width + 1) > 45):
+            raise ValueError("楼梯尺寸超出测试场地的 50 m 边界")
 
 
 @dataclass(frozen=True)
@@ -142,6 +169,8 @@ def load_config(path: str | Path, repository_root: str | Path | None = None) -> 
     robot = raw["robot"]
 
     joint_names = tuple(str(name) for name in robot["joint_names"])
+    if joint_names != POLICY_JOINT_NAMES:
+        raise ValueError("robot.joint_names 必须与 BPX 策略关节顺序一致：" + ", ".join(POLICY_JOINT_NAMES))
     default_joint_position = _tuple_of_floats(
         initial["default_joint_position"], len(joint_names), "initial_state.default_joint_position"
     )
@@ -246,10 +275,6 @@ def load_config(path: str | Path, repository_root: str | Path | None = None) -> 
     if init.mode == "pd" and cfg.control.mode != "explicit":
         raise ValueError("足端轨迹 Init 需要 control.mode = explicit")
 
-    if cfg.terrain.kind not in ("flat", "three_level"):
-        raise ValueError("terrain.kind must be flat or three_level")
-    if not isinstance(cfg.terrain.seed, int) or cfg.terrain.seed < 0:
-        raise ValueError("terrain.seed must be a nonnegative integer")
     if cfg.simulation.timestep <= 0.0 or cfg.simulation.decimation <= 0:
         raise ValueError("仿真步长和 decimation 必须大于零")
     if cfg.simulation.integrator not in ("euler", "implicit", "implicitfast", "rk4"):

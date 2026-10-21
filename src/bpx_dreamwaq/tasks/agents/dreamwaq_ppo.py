@@ -658,6 +658,7 @@ class DreamWaQRunner(OnPolicyRunner):
                     self.writer.add_scalar("policy/episode_length", statistics.mean(lenbuffer), it)
                 # 课程指标。
                 self._log_curriculum(it)
+                self._log_gait(it)
                 # 标准日志（Loss/*、Train/*、Perf/*、Episode/*）。
                 self.log(locals())
                 if it % self.save_interval == 0:
@@ -675,6 +676,27 @@ class DreamWaQRunner(OnPolicyRunner):
     """
     课程学习日志
     """
+
+    def _log_gait(self, it: int):
+        """逐脚记录触地占空比和长时间悬空比例，避免平均奖励掩盖跛行。"""
+        if self.writer is None:
+            return
+        env = self.env.unwrapped
+        if "feet_contact_balance" not in env.reward_manager.active_terms:
+            return
+        term = env.reward_manager.get_term_cfg("feet_contact_balance").func
+        maximum_air_time = env.reward_manager.get_term_cfg("feet_air_time_excess").params["maximum_air_time"]
+        for index, leg in enumerate(term.foot_names):
+            self.writer.add_scalar(
+                f"gait/{leg}/contact_fraction", term.contact_fraction[:, index].mean().item(), it,
+            )
+            self.writer.add_scalar(
+                f"gait/{leg}/air_time_max_s", term.air_time[:, index].max().item(), it,
+            )
+            self.writer.add_scalar(
+                f"gait/{leg}/long_air_fraction",
+                (term.air_time[:, index] > maximum_air_time).float().mean().item(), it,
+            )
 
     def _log_curriculum(self, it: int):
         if self.writer is None:

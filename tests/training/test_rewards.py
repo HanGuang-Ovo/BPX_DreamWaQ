@@ -214,5 +214,92 @@ class TestActionSmoothness(unittest.TestCase):
         torch.testing.assert_close(self.step([[1]*3, [1]*3]), torch.tensor([3.0, 3.0]))
 
 
+class TestPersistentAirTime(unittest.TestCase):
+    def penalty(self, times, **kwargs):
+        env = SimpleNamespace(scene=_Scene(contact_forces=SimpleNamespace(data=SimpleNamespace(
+            current_air_time=torch.tensor(times, dtype=torch.float32),
+        ))))
+        return rewards.feet_air_time_excess(
+            env, sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=slice(None)), **kwargs,
+        )
+
+    def test_normal_swing_is_allowed_and_stationary_raised_leg_has_cost(self):
+        # No command/foot-velocity gate: an immobile raised foot still incurs cost.
+        result = self.penalty([[0., .2, .4, .6], [0., 0., 5., 0.]])
+        torch.testing.assert_close(result, torch.tensor([0., 1.]))
+
+    def test_growth_is_bounded_and_each_foot_counts(self):
+        result = self.penalty([[.7, .8, 1., 1.2], [100., 100., 100., 100.]])
+        torch.testing.assert_close(result, torch.tensor([1.3, 4.]))
+
+    def test_contact_and_sensor_reset_clear_only_affected_feet(self):
+        result = self.penalty([[0., 0., 0., 0.], [0., 0., .9, 0.]])
+        torch.testing.assert_close(result, torch.tensor([0., .3]))
+
+    def test_invalid_time_settings_are_rejected(self):
+        for kwargs in ({"maximum_air_time": 0.}, {"maximum_air_time": float("nan")},
+                       {"penalty_cap": -1.}, {"penalty_cap": float("inf")}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.penalty([[0., 0., 0., 0.]], **kwargs)
+
+
+class TestContactBalance(unittest.TestCase):
+    def make_term(self, num_envs=2, dt=.02):
+        sensor = SimpleNamespace(
+            body_names=[f"{leg}_toe_link" for leg in ("fl", "fr", "hl", "hr")],
+            data=SimpleNamespace(current_contact_time=torch.zeros(num_envs, 4),
+                                 current_air_time=torch.zeros(num_envs, 4)),
+        )
+        env = SimpleNamespace(scene=_Scene(contact_forces=sensor), step_dt=dt)
+        sensor_cfg = SimpleNamespace(name="contact_forces", body_ids=slice(None))
+        term = rewards.feet_contact_balance(SimpleNamespace(params={"sensor_cfg": sensor_cfg}), env)
+        return term, env, sensor, sensor_cfg
+
+    def test_standing_and_alternating_trot_are_better_than_permanent_three_feet(self):
+        term, env, sensor, cfg = self.make_term(3)
+        costs = []
+        for step in range(500):
+            sensor.data.current_contact_time[0] = 1.
+            # Equal contact occupancy, different diagonal phase every 0.2 seconds.
+            sensor.data.current_contact_time[1] = torch.tensor(
+                [1., 0., 0., 1.] if (step // 10) % 2 else [0., 1., 1., 0.],
+            )
+            sensor.data.current_contact_time[2] = torch.tensor([1., 1., 0., 1.])
+            penalty = term(env, cfg)
+            if step > 300:
+                costs.append(penalty)
+        mean_cost = torch.stack(costs).mean(0)
+        self.assertEqual(mean_cost[0], 0.)
+        self.assertLess(mean_cost[1], .02)
+        self.assertGreater(mean_cost[2], .7)
+        self.assertLess(term.contact_fraction[2, 2], .001)
+        self.assertEqual(term.foot_names, ["fl", "fr", "hl", "hr"])
+
+    def test_asynchronous_reset_preserves_other_environment(self):
+        term, env, sensor, cfg = self.make_term()
+        sensor.data.current_contact_time[:] = torch.tensor([1., 1., 0., 1.])
+        sensor.data.current_air_time[:, 2] = 2.
+        for _ in range(100):
+            term(env, cfg)
+        previous = term.contact_fraction[1].clone()
+        term.reset(torch.tensor([0]))
+        torch.testing.assert_close(term.contact_fraction[0], torch.full((4,), .5))
+        torch.testing.assert_close(term.contact_fraction[1], previous)
+        torch.testing.assert_close(term.air_time[:, 2], torch.tensor([0., 2.]))
+        term.reset()
+        torch.testing.assert_close(term.contact_fraction, torch.full((2, 4), .5))
+        torch.testing.assert_close(term.air_time, torch.zeros(2, 4))
+
+    def test_time_constant_does_not_depend_on_policy_frequency(self):
+        results = []
+        for dt, steps in ((.02, 100), (.01, 200)):
+            term, env, sensor, cfg = self.make_term(1, dt)
+            sensor.data.current_contact_time[:] = torch.tensor([1., 1., 0., 1.])
+            for _ in range(steps):
+                term(env, cfg)
+            results.append(term.contact_fraction)
+        torch.testing.assert_close(*results)
+
+
 if __name__ == "__main__":
     unittest.main()

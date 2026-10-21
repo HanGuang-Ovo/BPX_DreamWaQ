@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
@@ -135,3 +137,64 @@ def feet_air_time(
     # 零指令时不奖励迈步。
     reward *= torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
     return reward
+
+
+def feet_air_time_excess(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    maximum_air_time: float = 0.6,
+    penalty_cap: float = 1.0,
+) -> torch.Tensor:
+    """持续惩罚超时悬空，防止三足支撑策略通过始终不落脚逃避着地项。
+
+    每只脚允许 0.6 s 正常摆动；超过后按秒线性计费，每脚最多 1。
+    不依赖足端速度，不因零速/转向而关闭，也不要求四脚同时着地。
+    滞空计时与异步 reset 由 ContactSensor 管理；RewardManager 统一乘 dt。
+    """
+    if not math.isfinite(maximum_air_time) or maximum_air_time <= 0:
+        raise ValueError("maximum_air_time 必须为有限正数")
+    if not math.isfinite(penalty_cap) or penalty_cap <= 0:
+        raise ValueError("penalty_cap 必须为有限正数")
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    air_time = sensor.data.current_air_time[:, sensor_cfg.body_ids]
+    return torch.clamp(air_time - maximum_air_time, min=0.0, max=penalty_cap).sum(dim=1)
+
+
+class feet_contact_balance(ManagerTermBase):
+    """惩罚四脚触地占空比的差异，允许正常交替摆腿。
+
+    使用 1 s 时间常数的指数滑动平均，而非瞬时接触数或固定步态相位。
+    这样短时的对角两脚腾空不会被当作三足跛行；长期不用某脚则持续有代价。
+    每环境独立 reset 为中性占空比 0.5，避免继承上一回合。
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        sensor_cfg = cfg.params["sensor_cfg"]
+        sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+        selected = sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+        if selected.shape[1] != 4:
+            raise ValueError("feet_contact_balance 需要恰好四个足端")
+        self.contact_fraction = torch.full_like(selected, 0.5)
+        self.air_time = torch.zeros_like(selected)
+        indices = (range(len(sensor.body_names))[sensor_cfg.body_ids]
+                   if isinstance(sensor_cfg.body_ids, slice) else sensor_cfg.body_ids)
+        self.foot_names = [sensor.body_names[index].removesuffix("_toe_link") for index in indices]
+
+    def reset(self, env_ids=None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        self.contact_fraction[ids] = 0.5
+        self.air_time[ids] = 0.0
+
+    def __call__(
+        self, env: "ManagerBasedRLEnv", sensor_cfg: SceneEntityCfg, time_constant: float = 1.0,
+    ) -> torch.Tensor:
+        if not math.isfinite(time_constant) or time_constant <= 0:
+            raise ValueError("time_constant 必须为有限正数")
+        sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+        contact = (sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0).to(self.contact_fraction.dtype)
+        alpha = -math.expm1(-env.step_dt / time_constant)
+        self.contact_fraction.add_(alpha * (contact - self.contact_fraction))
+        self.air_time.copy_(sensor.data.current_air_time[:, sensor_cfg.body_ids])
+        centered = self.contact_fraction - self.contact_fraction.mean(dim=1, keepdim=True)
+        return torch.square(centered).sum(dim=1)

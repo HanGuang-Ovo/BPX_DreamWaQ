@@ -362,6 +362,13 @@ PPO：lr 1e-3（自适应 KL 0.01）、γ 0.99、λ 0.95、clip 0.2、熵系数 
 - `action_smoothness_l2`（权重 −0.01）：`sum((a_t - 2*a_{t-1} + a_{t-2})**2)`，
   使用原始策略动作，与现有一阶动作变化项一致；每个环境回合重置时独立
   清空历史，首步历史补零。以上各项均由 RewardManager 统一乘策略时间步。
+- `feet_air_time_excess`（权重 −1.0）：每脚连续悬空超过 0.6 s 后持续惩罚，
+  每脚惩罚上限为 1。对静止抬腿和零速也生效，补足只在落脚瞬间计算的滞空奖励。
+- `feet_contact_balance`（权重 −0.5）：惩罚四脚触地占空比的差异，采用 1 s
+  时间常数的滑动平均，允许交替摆腿，不要求四脚同时落地。每回合独立重置。
+  逐脚指标见 TensorBoard `gait/{fl,fr,hl,hr}/contact_fraction`、
+  `air_time_max_s`、`long_air_fraction`。左后腿长期抬起问题的复现与修正见
+  [步态诊断](docs/GAIT_DIAGNOSIS.md)。奖励修改需重新训练才会改变已导出的策略。
 
 姿态水平惩罚权重为 −0.2，关节越界惩罚权重为 0。`base_height_l2` 是相对扫描
 区域平均地面的连续高度惩罚。训练终止条件为 20 s 超时、torso 接触力超过
@@ -421,20 +428,29 @@ python scripts/sim2sim.py --viewer --duration 20
 
 ```bash
 python scripts/sim2sim.py --backend onnx --policy policies/policy.onnx --viewer
-python scripts/sim2sim.py --config configs/sim2sim/bpx_terrain_history.toml \
-    --backend onnx --supervisor --auto-init --viewer
-python scripts/sim2sim.py --backend onnx --supervisor --gamepad --viewer \
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --backend onnx --gamepad --viewer \
     --velocity-plot --torque-plot --log outputs/sim2sim/run.csv
+
+# 在第 2 档（8 cm）楼梯前的平地趴卧出生
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --backend onnx --gamepad --viewer --stair-level 2
 ```
 
-`--supervisor --gamepad` 时以趴姿等待 RB 起身；起身采用足端轨迹 + PD，
-站立、行走和减速共用一个策略模型，站立时输入零速度指令。
+默认启用起身状态机：手柄模式以趴姿等待 RB 起身；无手柄时自动 Init。
+起身采用足端五次轨迹 + PD，确认站稳后平滑接入策略。左摇杆控制前后/横移，
+右摇杆水平控制转向，松杆后减速站立。`--direct-policy` 可跳过 Init 做接口对拍。
+
+`--terrain flat|three_level|stairs|mixed` 可覆盖地形；综合场地包含 ±2/±4 cm
+崎岖路面和 3/8/15 cm 三档上下楼梯。楼梯采用 box 碰撞体，踏面深 30 cm，
+每侧 5 级高差，含顶部平台。详见 [sim2sim 操作与验证](docs/SIM2SIM.md)。
 
 | 配置 | 用途 | 策略输入 |
 | --- | --- | --- |
 | `bpx_history.toml` | 默认平地，保留历史观测接口 | 450 |
 | `bpx_flat.toml` | 旧单帧接口参考，包含机体线速度 | 48 |
 | `bpx_terrain_history.toml` | 固定三段测试地形，趴姿起步 | 450 |
+| `bpx_mixed.toml` | 崎岖 + 分级上下楼梯，趴姿起步，300 秒手柄测试 | 450 |
 | `bpx_terrain_standing.toml` | 旧单帧接口参考，固定测试地形、站姿起步 | 48 |
 
 ## sim2real
