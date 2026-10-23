@@ -193,16 +193,25 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
    terrain_curriculum_coverage_ratio = 0.25        # 轴向空间覆盖门槛 = 地形边长 × 0.25
 
    enable_grid_adaptive_command_curriculum = True    # 指令课程总开关
+   command_rel_standing_envs = 0.1        # 10% 精确全零站立指令
    command_grid_resolution_vx = 0.5        # vx 网格分辨率 (m/s)
    command_grid_resolution_yaw = 0.5       # wz 网格分辨率 (rad/s)
    command_curriculum_initial_vx_range = (-0.5, 0.5)  # 初始激活范围
    command_curriculum_initial_yaw_range = (-0.5, 0.5)
+   command_grid_continuous_sampling = True          # 选格后在格内连续采样
+   command_low_speed_sampling_prob = 0.3            # 30% 额外低速样本
+   command_low_speed_vx_range = (-0.25, 0.25)        # m/s
+   command_low_speed_vy_range = (-0.1, 0.1)          # m/s
+   command_low_speed_yaw_range = (-0.25, 0.25)       # rad/s
    # 最大扩展范围从 command_lin_vel_x_range / command_ang_vel_z_range（±1.0）读取
    ```
 
-   更细的门控参数（成功阈值、min_samples、EMA 系数、探索下限、指令抖动）
+   更细的门控参数（成功阈值、min_samples、EMA 系数、探索下限）
    在 `tasks/mdp/commands.py` 的 `GridAdaptiveVelocityCommandCfg`，
    由 `command_grid.py` 的 `GridAdaptiveCommandScheduler` 使用。
+   连续模式按各轴半格宽与任务量程的交集均匀采样，边界格直接在截断区间
+   采样，避免先越界再裁剪造成端点堆积。旧式 `command_jitter` 仅在关闭
+   连续模式时生效；同时将低速比例设为 0 可恢复原中心点采样。
 
 2. 算法侧（AdaBoot 与损失权重）——`tasks/agents/rsl_rl_ppo_cfg.py` 的
    `DreamWaQPpoAlgorithmCfg`：
@@ -262,9 +271,18 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
 每个指令组合的采样概率与跟踪统计；初始激活 [-0.5, 0.5]²，最大扩展到任务
 指令量程（[-1, 1] × [-1, 1]，读取自环境配置）。单元在「区间平均 |Δvx| <
 0.25 m/s 且 |Δwz| < 0.5 rad/s」的 EMA 成功率达标且采样 ≥ min_samples 后
-激活 4 邻域；分布 = 90% 激活单元均匀 + 10% 全合法单元均匀（探索下限）。
-vx 与 wz 从同一单元联合采样，不独立组合；vy 保持原均匀采样。统计按指令
-执行区间（episode 内 10 s 重采样周期）结算，不混入整个 episode。
+激活 4 邻域。非站立样本中，默认 70% 指令使用原分布（90% 激活单元均匀 + 10% 全合法单元
+均匀探索），另外 30% 从已激活格与零速附近区域的交集采样；低速区尚未激活时
+退回原分布。低速分布按格与低速区域的交叠面积加权，不绕过课程激活门控。
+vx 与 wz 先联合选同一单元，再在格内连续采样；两端格截断到任务量程。
+常规分支 vy 均匀采样于任务量程，低速分支同步收窄到 ±0.1 m/s（并与任务量程
+取交集），因此额外低速样本的 vx、vy、wz 都接近零。每次重采样独立以 10%
+概率发送精确全零站立指令（`command_rel_standing_envs`，均匀采样回退也使用此值），
+不参与课程成功统计。因此默认最终采样比例约为 10% 精确零速、27% 近零连续运动、
+63% 常规网格课程与探索；比例指重采样次数，实际步数占比受回合提前结束影响。
+连续低速样本仍归实际所在单元；导出的概率
+包含额外低速分支，`vx_range`/`yaw_range` 记录裁到任务量程后的实际覆盖。
+统计按指令执行区间（episode 内 10 s 重采样周期）结算，不混入整个 episode。
 关闭时恢复 `UniformVelocityCommand` 均匀采样；两套课程同时关闭即为原始
 PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
 `curriculum_<iter>.npz`，可用任意工具绘制热力图。
@@ -440,9 +458,11 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 默认启用起身状态机：手柄模式以趴姿等待 RB 起身；无手柄时自动 Init。
 起身采用足端五次轨迹 + PD，确认站稳后平滑接入策略。左摇杆控制前后/横移，
 右摇杆水平控制转向，松杆后减速站立。`--direct-policy` 可跳过 Init 做接口对拍。
+MuJoCo 不再因高度、倾角、躯干触地或 Init 超时自动退出，策略接管后持续执行；
+运行到设定时长、关闭窗口或 Ctrl+C 时结束。
 
 `--terrain flat|three_level|stairs|mixed` 可覆盖地形；综合场地包含 ±2/±4 cm
-崎岖路面和 3/8/15 cm 三档上下楼梯。楼梯采用 box 碰撞体，踏面深 30 cm，
+崎岖路面和 3/8/10/15 cm 四档上下楼梯。楼梯采用 box 碰撞体，踏面深 20 cm，
 每侧 5 级高差，含顶部平台。详见 [sim2sim 操作与验证](docs/SIM2SIM.md)。
 
 | 配置 | 用途 | 策略输入 |

@@ -1,10 +1,10 @@
-# DreamWaQ 450 维历史观测；崎岖路面 + 分级上下楼梯，平地趴卧起身。
+# DreamWaQ 450 维历史观测；崎岖路面 + 20 cm 踏面的分级上下楼梯，平地趴卧起身。
 # Term-major, oldest-to-newest; first frame fills history; updated at 50 Hz.
 [paths]
 mjcf = "assets/robots/bpx/mjcf/bpx.xml"
 
 # 统一策略路径；推理后端显式选择，默认 Zero 后端不加载权重。
-policy = "policies/policy.onnx"
+policy = "policies/policy_20261023_iter2250_stable.onnx"
 
 [simulation]
 # 沿用 BPX_test 的部署时序：200 Hz 物理仿真、50 Hz 策略。
@@ -71,6 +71,7 @@ linear_y = 0.0
 angular_z = 0.0
 
 [termination]
+# 兼容旧配置字段；MuJoCo 不再据此自动退出。
 minimum_base_height = 0.15
 maximum_tilt = 1.0
 
@@ -101,12 +102,11 @@ stand_confirm_time = 0.20
 stopping_timeout = 1.50
 
 # --- 未站立检测与 Init 起身 ---
-# 低于高度阈值或超过倾角阈值即认为未站立；没有 Init 控制器时进入 DISABLED。
+# 共享状态机参数；MuJoCo 已关闭姿态停机，起步时仍用于判断是否需要 Init。
 fall_base_height = 0.20
 fall_tilt = 0.70
-# Init 只覆盖腹部朝地、机身接近水平的趴卧状态；侧翻和仰翻不进入起身控制。
+# 起身姿态/中止阈值保留共享配置接口，MuJoCo 不据此自动退出。
 init_start_max_tilt = 0.35
-# 起身过程中超过该倾角立即停止 Init，防止失败控制器持续驱动到完全翻倒。
 init_abort_tilt = 0.55
 # Init 起身完成阈值必须比跌倒阈值更严格，并连续满足 init_confirm_time。
 init_base_height = 0.36
@@ -142,9 +142,10 @@ joint_names = [
 kind = "mixed"
 seed = 20260918
 
-# 各等级单级高度（米），每条路线为上楼 → 顶部平台 → 下楼。
-step_heights = [0.03, 0.08, 0.15]
+# --stair-level 1/2/3/4 对应单级高 3/8/10/15 cm。
+# 每条路线为上楼 → 顶部平台 → 下楼，踏面沿前进方向深 20 cm。
+step_heights = [0.03, 0.08, 0.10, 0.15]
 step_count = 5
-step_width = 0.30
+step_width = 0.20
 stair_width = 2.0
 platform_width = 1.20

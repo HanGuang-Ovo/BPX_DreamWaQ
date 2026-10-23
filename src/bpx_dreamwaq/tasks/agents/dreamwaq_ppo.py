@@ -22,6 +22,7 @@ AdaBoot（论文公式 p = 1 - tanh(CV(R))，CV 为回合奖励变异系数）�
 
 from __future__ import annotations
 
+import math
 import os
 import statistics
 import time
@@ -37,6 +38,26 @@ from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 
 from .dreamwaq_actor_critic import DreamWaQActorCritic
+
+
+def _compute_reward_cv(rewards) -> float | None:
+    """有限回合奖励的 std/|mean|；样本不足、非有限或均值近零时不可用。
+
+    先缩放再求标准差，避免极大但有限的回合奖励导致中间结果溢出。
+    不过滤坏样本，以免把无效统计误认为可信的 AdaBoot 输入。
+    """
+    values = [float(value) for value in rewards]
+    if len(values) < 2 or not all(math.isfinite(value) for value in values):
+        return None
+    mean = statistics.mean(values)
+    if abs(mean) <= 1e-6:
+        return None
+    scale = max(abs(value) for value in values)
+    scaled_mean = abs(mean) / scale
+    if scaled_mean == 0.0:
+        return None
+    cv = statistics.pstdev(value / scale for value in values) / scaled_mean
+    return cv if math.isfinite(cv) else None
 
 
 class DreamWaQRolloutStorage(RolloutStorage):
@@ -279,7 +300,9 @@ class DreamWaQPPO(PPO):
 
     def set_reward_cv(self, reward_cv: float | None):
         """由 Runner 提供：最近回合奖励的变异系数 std/|mean|（reward_cv 模式用）。"""
-        self._reward_cv = reward_cv
+        self._reward_cv = (
+            reward_cv if reward_cv is not None and math.isfinite(reward_cv) and reward_cv >= 0.0 else None
+        )
 
     def _update_adaboot(self):
         if not self.adaboot_enabled:
@@ -577,6 +600,30 @@ class DreamWaQRunner(OnPolicyRunner):
         infos["train_cfg"] = self.cfg
         super().save(path, infos=infos)
 
+    def _check_rollout_finite(self, iteration: int, **tensors):
+        """在写入 rollout 前拒绝非有限数据，保留出错环境与奖励项线索。"""
+        invalid = {
+            name: ~torch.isfinite(value).reshape(self.env.num_envs, -1).all(dim=1)
+            for name, value in tensors.items()
+        }
+        if not torch.stack(list(invalid.values())).any().item():
+            return
+        details = []
+        for name, mask in invalid.items():
+            ids = mask.nonzero(as_tuple=False).flatten().tolist()
+            if ids:
+                details.append(f"{name}: env_ids={ids[:16]}, count={len(ids)}")
+        # RewardManager 的逐项贡献仍保留当前步，可直接定位 Inf/NaN 来源。
+        manager = getattr(getattr(self.env, "unwrapped", None), "reward_manager", None)
+        contributions = getattr(manager, "_step_reward", None)
+        if contributions is not None:
+            bad_terms = (~torch.isfinite(contributions)).any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+            details.append(f"reward_terms={[manager.active_terms[index] for index in bad_terms]}")
+        raise FloatingPointError(
+            f"PPO iteration {iteration}: rollout 出现 NaN/Inf，已在写入训练存储前停止；"
+            + "; ".join(details)
+        )
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         if self.log_dir is not None and self.writer is None:
             from torch.utils.tensorboard import SummaryWriter
@@ -597,7 +644,8 @@ class DreamWaQRunner(OnPolicyRunner):
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        # 回合累计采用 float64，避免逐步有限的 float32 奖励在求和时溢出。
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float64, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         start_iter = self.current_learning_iteration
@@ -616,6 +664,9 @@ class DreamWaQRunner(OnPolicyRunner):
                     history_obs = infos["observations"]["prop_history"].to(self.device)
                     if self.privileged_obs_type is not None:
                         privileged_obs = infos["observations"][self.privileged_obs_type].to(self.device)
+                    self._check_rollout_finite(
+                        it, rewards=rewards, obs=obs, history_obs=history_obs, privileged_obs=privileged_obs,
+                    )
                     self.alg.process_env_step(rewards, dones, infos, next_obs=next_obs)
 
                     if self.log_dir is not None:
@@ -638,10 +689,8 @@ class DreamWaQRunner(OnPolicyRunner):
 
             # AdaBoot reward_cv 模式：提供回合奖励变异系数。
             if isinstance(self.alg, DreamWaQPPO) and self.alg.adaboot_enabled and self.alg.adaboot_mode == "reward_cv":
-                if len(rewbuffer) >= 2:
-                    mean_reward = statistics.mean(rewbuffer)
-                    if abs(mean_reward) > 1e-6:
-                        self.alg.set_reward_cv(statistics.pstdev(rewbuffer) / abs(mean_reward))
+                # 不可用时显式清除旧 CV，回退到 p_min，避免沿用过时统计。
+                self.alg.set_reward_cv(_compute_reward_cv(rewbuffer))
 
             loss_dict = self.alg.update()
 

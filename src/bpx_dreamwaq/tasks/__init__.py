@@ -16,7 +16,7 @@ import gymnasium as gym
 
 gym.register(
     id="BPX-Velocity-Rough-DreamWaQ-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point="bpx_dreamwaq.tasks.rough_env:BPXManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": "bpx_dreamwaq.tasks.rough_env_cfg:BPXRoughEnvCfg",
@@ -26,7 +26,7 @@ gym.register(
 
 gym.register(
     id="BPX-Velocity-Rough-DreamWaQ-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point="bpx_dreamwaq.tasks.rough_env:BPXManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": "bpx_dreamwaq.tasks.rough_env_cfg:BPXRoughEnvCfg_PLAY",

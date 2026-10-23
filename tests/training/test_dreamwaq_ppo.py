@@ -4,15 +4,21 @@
 执行 PPO + CENet 联合更新并检查参数确实被更新、指标有限、无 NaN。
 """
 
+import math
+import statistics
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 import torch
 
 sys.path.insert(0, "src")
 
 from bpx_dreamwaq.tasks.agents.dreamwaq_actor_critic import DreamWaQActorCritic
-from bpx_dreamwaq.tasks.agents.dreamwaq_ppo import DreamWaQPPO, DreamWaQRolloutStorage
+from bpx_dreamwaq.tasks.agents.dreamwaq_ppo import (
+    DreamWaQPPO, DreamWaQRolloutStorage, DreamWaQRunner, _compute_reward_cv,
+)
 from bpx_dreamwaq.tasks.obs_contract import (
     ACTION_DIM,
     DEFAULT_HISTORY_LENGTH,
@@ -173,6 +179,19 @@ class TestDreamWaQPPO(unittest.TestCase):
         self.alg.update()
         self.assertEqual(self.alg.cenet_metrics["cenet/adaboot_est_fraction"], 1.0)
 
+    def test_invalid_reward_cv_clears_stale_adaboot_state(self):
+        alg = make_alg(self.policy, adaboot_enabled=True, adaboot_mode="reward_cv")
+        alg.set_reward_cv(.5)
+        alg._update_adaboot()
+        self.assertAlmostEqual(alg.adaboot_p, 1.0 - math.tanh(.5), places=6)
+        for invalid in (None, float("inf"), float("-inf"), float("nan"), -1.):
+            with self.subTest(invalid=invalid):
+                alg.set_reward_cv(.5)
+                alg.set_reward_cv(invalid)
+                alg._update_adaboot()
+                self.assertIsNone(alg._reward_cv)
+                self.assertEqual(alg.adaboot_p, alg.adaboot_p_min)
+
     def test_rollover_features_consistency(self):
         # rollout 保存的 cenet_features 与 AdaBoot 混合结果一致（无 AdaBoot 时
         # 应等于 CENet 估计特征）。
@@ -181,6 +200,72 @@ class TestDreamWaQPPO(unittest.TestCase):
         with torch.inference_mode():
             features = self.policy.encode_cenet(storage.history_observations[0])
         self.assertTrue(torch.allclose(storage.cenet_features[0], features, atol=1e-6))
+
+
+class TestRewardStatistics(unittest.TestCase):
+    def test_finite_rewards_match_population_cv(self):
+        for values in ([1., 2., 4.], [-1., -2., -4.], [2., 2.], [-3., 1., 1.]):
+            with self.subTest(values=values):
+                expected = statistics.pstdev(values) / abs(statistics.mean(values))
+                self.assertAlmostEqual(_compute_reward_cv(values), expected)
+
+    def test_nonfinite_rewards_and_insufficient_samples_are_unavailable(self):
+        for values in ([], [1.], [0., 0.], [-1., 1.], [1e-8, 2e-8],
+                       [1., float("inf")], [float("-inf"), 2.], [float("nan"), 2.]):
+            with self.subTest(values=values):
+                self.assertIsNone(_compute_reward_cv(values))
+
+    def test_extreme_finite_rewards_do_not_overflow(self):
+        self.assertAlmostEqual(_compute_reward_cv([1e308, 1e308, -1e308]), math.sqrt(8.))
+
+
+class TestRunnerFiniteGuard(unittest.TestCase):
+    def make_runner(self):
+        runner = DreamWaQRunner.__new__(DreamWaQRunner)
+        manager = SimpleNamespace(active_terms=["track", "dof_acc_l2"],
+                                  _step_reward=torch.zeros(2, 2))
+        runner.env = SimpleNamespace(num_envs=2, unwrapped=SimpleNamespace(reward_manager=manager))
+        return runner
+
+    def test_finite_data_passes(self):
+        runner = self.make_runner()
+        runner._check_rollout_finite(700, rewards=torch.tensor([1., -1.]), obs=torch.zeros(2, 45))
+
+    def test_bad_reward_reports_environment_and_term(self):
+        runner = self.make_runner()
+        runner.env.unwrapped.reward_manager._step_reward[1, 1] = float("-inf")
+        with self.assertRaisesRegex(FloatingPointError, r"iteration 718.*rewards: env_ids=\[1\].*dof_acc_l2"):
+            runner._check_rollout_finite(718, rewards=torch.tensor([1., float("-inf")]))
+
+    def test_bad_observations_are_also_rejected(self):
+        runner = self.make_runner()
+        obs = torch.zeros(2, 45)
+        obs[0, 3] = float("nan")
+        with self.assertRaisesRegex(FloatingPointError, r"obs: env_ids=\[0\]"):
+            runner._check_rollout_finite(718, rewards=torch.ones(2), obs=obs)
+
+    def test_runner_stops_before_invalid_rewards_enter_ppo(self):
+        runner = self.make_runner()
+        runner.log_dir = None
+        runner.device = "cpu"
+        runner.env.device = "cpu"
+        runner.num_steps_per_env = 1
+        runner.current_learning_iteration = 718
+        runner.privileged_obs_type = "critic"
+        runner.true_vel_slice = (0, 3)
+        runner.train_mode = Mock()
+        obs = torch.zeros(2, 45)
+        extras = {"observations": {"prop_history": torch.zeros(2, 450), "critic": torch.zeros(2, 8)}}
+        runner.env.get_observations = Mock(return_value=(obs, extras))
+        runner.env.step = Mock(return_value=(obs, torch.tensor([1., float("-inf")]),
+                                             torch.tensor([0, 1]), extras))
+        runner.alg = Mock()
+        runner.alg.act.return_value = torch.zeros(2, 12)
+        with self.assertRaisesRegex(FloatingPointError, "iteration 718"):
+            runner.learn(1)
+        runner.alg.process_env_step.assert_not_called()
+        runner.alg.compute_returns.assert_not_called()
+        runner.alg.update.assert_not_called()
 
 
 if __name__ == "__main__":

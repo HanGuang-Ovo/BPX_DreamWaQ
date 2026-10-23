@@ -160,6 +160,68 @@ class TestTerrainCommandIntegration(unittest.TestCase):
             term.compute(env.step_dt)
             term.reset(torch.tensor([0]))
 
+    def test_low_speed_branch_limits_all_axes_and_preserves_interval_ownership(self):
+        env = make_env(enabled=False)
+        cfg = commands.GridAdaptiveVelocityCommandCfg(
+            asset_name="robot", resampling_time_range=(.1, .1), rel_standing_envs=0.,
+            low_speed_sampling_prob=1.,
+        )
+        term = commands.GridAdaptiveVelocityCommand(cfg, env)
+        samples = []
+        for _ in range(100):
+            term.reset()
+            samples.append(term.command.clone())
+            self.assertTrue((term.cell_idx == 12).all())
+            self.assertTrue((term.command[:, 0].abs() <= .25).all())
+            self.assertTrue((term.command[:, 1].abs() <= .1).all())
+            self.assertTrue((term.command[:, 2].abs() <= .25).all())
+        samples = torch.cat(samples)
+        self.assertTrue((samples[:, 0] > .15).any())
+        self.assertTrue((samples[:, 0] < -.15).any())
+        # 指令区间结束后，连续低速的表现归中心格；不错误记入相邻边缘格。
+        term.interval_steps[:] = 5
+        term.interval_err_vx[:] = .1
+        term.interval_err_yaw[:] = .2
+        term.reset(torch.tensor([0]))
+        self.assertEqual(term.grid.samples[12].item(), 1)
+        self.assertEqual(term.grid.samples.sum().item(), 1)
+        self.assertEqual(term.interval_steps[1].item(), 5)
+
+    def test_regular_branch_keeps_lateral_range_and_standing_stays_exactly_zero(self):
+        env = make_env(enabled=False)
+        cfg = commands.GridAdaptiveVelocityCommandCfg(
+            asset_name="robot", resampling_time_range=(.1, .1), rel_standing_envs=0.,
+            low_speed_sampling_prob=0., low_speed_vy_range=(.6, .7),
+        )
+        term = commands.GridAdaptiveVelocityCommand(cfg, env)
+        samples = []
+        for _ in range(100):
+            term.reset()
+            samples.append(term.command.clone())
+        vy = torch.cat(samples)[:, 1]
+        self.assertTrue((vy.abs() > .25).any())
+        self.assertTrue((vy.abs() <= .5).all())
+        cfg.rel_standing_envs = 1.
+        term.reset()
+        term._update_command()
+        torch.testing.assert_close(term.command, torch.zeros(2, 3))
+        term._update_metrics()
+        self.assertTrue((term.interval_steps == 0).all())
+
+    def test_low_speed_lateral_range_is_intersected_with_task_limits(self):
+        env = make_env(enabled=False)
+        cfg = commands.GridAdaptiveVelocityCommandCfg(
+            asset_name="robot", resampling_time_range=(.1, .1), rel_standing_envs=0.,
+            low_speed_sampling_prob=1., lin_vel_y_range=(-.03, .04),
+        )
+        term = commands.GridAdaptiveVelocityCommand(cfg, env)
+        for _ in range(30):
+            term.reset()
+            self.assertTrue(((term.command[:, 1] >= -.03) & (term.command[:, 1] <= .04)).all())
+        cfg.lin_vel_y_range = (.2, .5)
+        with self.assertRaises(ValueError):
+            commands.GridAdaptiveVelocityCommand(cfg, env)
+
 
 class TestEnvironmentConfiguration(unittest.TestCase):
     def setUp(self):
@@ -192,9 +254,11 @@ class TestEnvironmentConfiguration(unittest.TestCase):
     def test_default_grid_and_uniform_fallback_both_support_terrain_metrics(self):
         self.configure(self.cfg)
         self.assertIs(self.cfg.commands.base_velocity.class_type, commands.GridAdaptiveVelocityCommand)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .1)
         self.cfg.enable_grid_adaptive_command_curriculum = False
         self.configure(self.cfg)
         self.assertIs(self.cfg.commands.base_velocity.class_type, commands.TerrainAwareUniformVelocityCommand)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .1)
         self.assertIs(self.cfg.curriculum.terrain_levels.func, curriculums.terrain_levels_vel)
         self.assertNotIn("success_ratio", self.cfg.curriculum.terrain_levels.params)
 
@@ -205,6 +269,33 @@ class TestEnvironmentConfiguration(unittest.TestCase):
         self.cfg.enable_terrain_curriculum = False
         self.configure(self.cfg)
         self.assertIsNone(self.cfg.curriculum.terrain_levels)
+
+    def test_continuous_low_speed_defaults_and_overrides_reach_command_term(self):
+        self.configure(self.cfg)
+        command = self.cfg.commands.base_velocity
+        self.assertTrue(command.continuous_sampling)
+        self.assertEqual(command.rel_standing_envs, .1)
+        self.assertEqual(command.low_speed_sampling_prob, .3)
+        self.assertEqual(command.low_speed_vx_range, (-.25, .25))
+        self.assertEqual(command.low_speed_vy_range, (-.1, .1))
+        self.assertEqual(command.low_speed_yaw_range, (-.25, .25))
+        self.cfg.command_grid_continuous_sampling = False
+        self.cfg.command_rel_standing_envs = .2
+        self.cfg.command_low_speed_sampling_prob = .15
+        self.cfg.command_low_speed_vx_range = (-.2, .2)
+        self.cfg.command_low_speed_vy_range = (-.05, .05)
+        self.cfg.command_low_speed_yaw_range = (-.1, .1)
+        self.configure(self.cfg)
+        command = self.cfg.commands.base_velocity
+        self.assertFalse(command.continuous_sampling)
+        self.assertEqual(command.rel_standing_envs, .2)
+        self.assertEqual(command.low_speed_sampling_prob, .15)
+        self.assertEqual(command.low_speed_vx_range, (-.2, .2))
+        self.assertEqual(command.low_speed_vy_range, (-.05, .05))
+        self.assertEqual(command.low_speed_yaw_range, (-.1, .1))
+        self.cfg.enable_grid_adaptive_command_curriculum = False
+        self.configure(self.cfg)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .2)
 
 
 if __name__ == "__main__":

@@ -72,8 +72,8 @@ class StairTerrainTest(unittest.TestCase):
 
         viewer = Viewer()
         add_course_labels(viewer, cfg)
-        self.assertEqual(viewer.user_scn.ngeom, 6)
-        for index, height in enumerate((3, 8, 15), start=3):
+        self.assertEqual(viewer.user_scn.ngeom, 7)
+        for index, height in enumerate((3, 8, 10, 15), start=3):
             self.assertIn(f"{height} cm", viewer.user_scn.geoms[index].label)
         self.assertEqual(viewer.opt.geomgroup[5], 1)
 

@@ -152,16 +152,52 @@ class InitControllerTest(unittest.TestCase):
                 if dt > 1e-8:
                     self.assertLessEqual(np.max(abs(current[1] - previous[1])) / dt, 2.001)
 
-    def test_timeout_when_support_never_established(self):
+    def test_timeout_does_not_exit_when_support_never_established(self):
         cfg = load_config(CONFIG)
         cfg = replace(cfg, init_controller=replace(cfg.init_controller, timeout=4.2))
         runner = make_runner(cfg)
         with patch.object(runner.robot, 'feet_in_contact', return_value=0), redirect_stdout(io.StringIO()):
             result = runner.run((0, 0, 0), init_request_source=lambda: True, duration=5,
                                 realtime=False, print_interval=100)
-        self.assertEqual(result.termination_reason, 'init_pd_timeout')
+        self.assertEqual(result.termination_reason, 'duration')
+        self.assertGreaterEqual(result.simulated_seconds, 5.)
         self.assertFalse(runner.init_controller.complete)
         self.assertAlmostEqual(runner.init_controller.progress, 1.)
+
+    def test_policy_continues_after_low_height_tilt_and_torso_contact(self):
+        runner = make_runner()
+        actual_height = runner.robot.base_height
+        actual_tilt = runner.robot.tilt_angle
+        calls = []
+        runner.policy = lambda observation: calls.append(float(runner.data.time)) or np.zeros(12)
+        with patch.object(runner.robot, 'base_height', side_effect=lambda: (
+                actual_height() if runner.data.time < 5. else .10)), \
+             patch.object(runner.robot, 'tilt_angle', side_effect=lambda: (
+                actual_tilt() if runner.data.time < 5. else 1.2)), \
+             patch.object(runner.robot, 'torso_touches_floor', return_value=True), \
+             redirect_stdout(io.StringIO()):
+            result = runner.run((.4, 0, 0), init_request_source=lambda: True, duration=6,
+                                realtime=False, print_interval=100, terminate_on_fall=True)
+        self.assertEqual(result.termination_reason, 'duration')
+        self.assertGreaterEqual(result.simulated_seconds, 6.)
+        self.assertGreater(max(calls), 5.9)
+        self.assertEqual(runner.supervisor.mode, BehaviorMode.WALK)
+
+    def test_pose_protection_remains_enabled_outside_sim2sim(self):
+        cfg = load_config(CONFIG)
+        supervisor = BehaviorSupervisor(cfg.supervisor, init_available=True)
+        result = supervisor.update((.4, 0, 0), SupervisorState(.4, 1.2, 0, 0), .02)
+        self.assertEqual(result.mode, BehaviorMode.DISABLED)
+        self.assertEqual(result.reason, 'unsupported_init_pose')
+
+    def test_init_tilt_does_not_exit_simulation(self):
+        runner = make_runner()
+        with patch.object(runner.robot, 'tilt_angle', return_value=1.2), \
+             redirect_stdout(io.StringIO()):
+            result = runner.run((0, 0, 0), init_request_source=lambda: True, duration=.1,
+                                realtime=False, print_interval=100)
+        self.assertEqual(result.termination_reason, 'duration')
+        self.assertEqual(runner.supervisor.mode, BehaviorMode.INIT)
 
     def test_config_validation(self):
         source = CONFIG.read_text()

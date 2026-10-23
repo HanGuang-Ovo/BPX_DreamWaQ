@@ -4,7 +4,7 @@
 
 - ``vx`` 与 ``wz`` 从 ``GridAdaptiveCommandScheduler`` 的联合网格分布采样
   （同一单元），绝不独立采样后组合；
-- ``vy`` 保持原有均匀采样，不受课程影响；
+- 常规分支 ``vy`` 保持原有均匀采样，低速分支同步收窄三轴指令；
 - 站立环境（``rel_standing_envs`` 概率）指令置零，与原实现一致；
 - 每个指令执行区间（episode 内重采样周期或 episode 结束）结束时，把该区间
   的平均跟踪误差写回对应网格单元，驱动课程扩展——不会把整个 episode 的
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -68,13 +69,21 @@ class TerrainAwareUniformVelocityCommand(_TerrainMetricsMixin, UniformVelocityCo
 
 
 class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
-    """vx-wz 联合网格课程 + vy 均匀采样的速度指令生成器。"""
+    """vx-wz 联合网格内连续采样，并增加三轴零速附近的指令。"""
 
     cfg: GridAdaptiveVelocityCommandCfg
 
     def __init__(self, cfg: GridAdaptiveVelocityCommandCfg, env):
         super().__init__(cfg, env)
         self.robot = env.scene[self.cfg.asset_name]
+        vy_range = self.cfg.lin_vel_y_range
+        low_vy_range = self.cfg.low_speed_vy_range
+        for bounds in (vy_range, low_vy_range):
+            if len(bounds) != 2 or not all(math.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError("侧向采样范围必须为有限且递增的区间")
+        self._low_vy_range = (max(vy_range[0], low_vy_range[0]), min(vy_range[1], low_vy_range[1]))
+        if self.cfg.low_speed_sampling_prob > 0 and self._low_vy_range[0] >= self._low_vy_range[1]:
+            raise ValueError("low_speed_vy_range 与侧向任务量程必须有非空交集")
         self.grid = GridAdaptiveCommandScheduler(
             vx_resolution=self.cfg.vx_resolution,
             yaw_resolution=self.cfg.yaw_resolution,
@@ -90,6 +99,10 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
             exploration_prob=self.cfg.exploration_prob,
             command_jitter=self.cfg.command_jitter,
             device=self.device,
+            continuous_sampling=self.cfg.continuous_sampling,
+            low_speed_sampling_prob=self.cfg.low_speed_sampling_prob,
+            low_speed_vx_range=self.cfg.low_speed_vx_range,
+            low_speed_yaw_range=self.cfg.low_speed_yaw_range,
         )
         self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
         self.is_standing_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -140,11 +153,15 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
                     mean_err_yaw=self.interval_err_yaw[finished] / steps,
                 )
         # 2) 从联合网格分布采样新指令。
-        cell_idx, vx, wz = self.grid.sample(env_ids_t.numel())
+        cell_idx, vx, wz, low_speed = self.grid.sample_with_low_speed_mask(env_ids_t.numel())
         self.cell_idx[env_ids_t] = cell_idx.to(self.device)
         r = torch.empty(env_ids_t.numel(), device=self.device)
         self.vel_command_b[env_ids_t, 0] = vx.to(self.device)
-        self.vel_command_b[env_ids_t, 1] = r.uniform_(*self.cfg.lin_vel_y_range)
+        vy = r.uniform_(*self.cfg.lin_vel_y_range).clone()
+        if self.cfg.low_speed_sampling_prob > 0:
+            low_vy = r.uniform_(*self._low_vy_range)
+            vy = torch.where(low_speed, low_vy, vy)
+        self.vel_command_b[env_ids_t, 1] = vy
         self.vel_command_b[env_ids_t, 2] = wz.to(self.device)
         # 3) 重置区间累计。
         self.interval_err_vx[env_ids_t] = 0.0
@@ -173,11 +190,11 @@ class GridAdaptiveVelocityCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     """场景中的机器人名称。"""
 
-    rel_standing_envs: float = 0.02
-    """站立（零指令）环境比例。"""
+    rel_standing_envs: float = 0.1
+    """精确全零站立指令的重采样概率；不计入网格课程成功统计。"""
 
     lin_vel_y_range: tuple[float, float] = (-0.5, 0.5)
-    """侧向速度指令范围（保持原有采样方式，不参与课程）。"""
+    """常规分支的侧向速度指令范围，不参与网格扩展。"""
 
     # ---- 课程网格参数 ----
     vx_resolution: float = 0.5
@@ -192,4 +209,12 @@ class GridAdaptiveVelocityCommandCfg(CommandTermCfg):
     min_samples: int = 5
     ema_alpha: float = 0.7
     exploration_prob: float = 0.1
+    continuous_sampling: bool = True
+    """在选中格与任务量程的交集内连续均匀采样；关闭时使用中心/旧式抖动。"""
     command_jitter: float = 0.0
+    """仅 continuous_sampling=False 时使用，且不得跨出所属单元。"""
+    low_speed_sampling_prob: float = 0.3
+    """30% 指令来自已激活格与低速区域的交集，其余保留原课程/探索分布。"""
+    low_speed_vx_range: tuple[float, float] = (-0.25, 0.25)
+    low_speed_vy_range: tuple[float, float] = (-0.1, 0.1)
+    low_speed_yaw_range: tuple[float, float] = (-0.25, 0.25)

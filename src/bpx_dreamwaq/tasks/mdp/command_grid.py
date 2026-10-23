@@ -12,13 +12,15 @@ Grid-Adaptive Curriculum 思想：在前向速度 ``vx`` 与偏航角速度 ``wz
 2. 成功判定为「一个指令执行区间的平均 |Δvx| 与 |Δwz| 同时低于各自阈值」；
 3. 单元达标（成功 EMA ≥ 阈值且采样次数 ≥ min_samples）时激活其 4 邻域内
    合法单元，激活单调递增（不撤销）；
-4. 采样分布在激活单元上均匀分布，并与「全体合法单元均匀分布」按
-   ``exploration_prob`` 混合，保留最低探索概率；
-5. 前向速度与偏航角速度始终从联合分布（同一单元）采样，不独立组合。
+4. 常规分布混合激活单元均匀分布与全合法单元探索，再与已激活区域内的
+   零速附近分布混合；导出的概率包含这两类采样；
+5. 前向速度与偏航角速度始终从同一单元内连续采样，裁到任务量程；
+   低速分支只使用单元与低速区域的交集，统计仍归实际所属单元。
 """
 
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 import torch
@@ -43,15 +45,33 @@ class GridAdaptiveCommandScheduler:
         exploration_prob: float = 0.1,
         command_jitter: float = 0.0,
         device: str = "cpu",
+        continuous_sampling: bool = True,
+        low_speed_sampling_prob: float = 0.3,
+        low_speed_vx_range: Tuple[float, float] = (-0.25, 0.25),
+        low_speed_yaw_range: Tuple[float, float] = (-0.25, 0.25),
     ):
-        if vx_resolution <= 0 or yaw_resolution <= 0:
-            raise ValueError("网格分辨率必须为正")
+        if not all(math.isfinite(r) and r > 0 for r in (vx_resolution, yaw_resolution)):
+            raise ValueError("网格分辨率必须为有限正数")
         if not 0.0 <= exploration_prob < 1.0:
             raise ValueError("exploration_prob 必须在 [0, 1) 内")
         if min_samples < 1:
             raise ValueError("min_samples 至少为 1")
         if not 0.5 <= success_ratio_threshold <= 1.0:
             raise ValueError("success_ratio_threshold 必须在 [0.5, 1.0] 内")
+        if not 0.0 <= low_speed_sampling_prob <= 1.0:
+            raise ValueError("low_speed_sampling_prob 必须在 [0, 1] 内")
+        if (
+            not math.isfinite(command_jitter)
+            or not 0 <= command_jitter <= min(vx_resolution, yaw_resolution) / 2
+        ):
+            raise ValueError("command_jitter 必须为有限非负数，且不超过任一轴的半格宽")
+        for name, bounds in (
+            ("max_vx_range", max_vx_range), ("max_yaw_range", max_yaw_range),
+            ("initial_vx_range", initial_vx_range), ("initial_yaw_range", initial_yaw_range),
+            ("low_speed_vx_range", low_speed_vx_range), ("low_speed_yaw_range", low_speed_yaw_range),
+        ):
+            if len(bounds) != 2 or not all(math.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError(f"{name} 必须为有限且递增的区间")
         self.vx_resolution = vx_resolution
         self.yaw_resolution = yaw_resolution
         self.success_threshold_vx = success_threshold_vx
@@ -61,12 +81,18 @@ class GridAdaptiveCommandScheduler:
         self.ema_alpha = ema_alpha
         self.exploration_prob = exploration_prob
         self.command_jitter = command_jitter
+        self.continuous_sampling = continuous_sampling
+        self.low_speed_sampling_prob = low_speed_sampling_prob
+        self.low_speed_vx_range = low_speed_vx_range
+        self.low_speed_yaw_range = low_speed_yaw_range
         self.device = device
 
         def centers(res: float, max_range: Tuple[float, float]) -> torch.Tensor:
             # 网格中心取分辨率的整数倍，限制在合法最大范围内。
-            k_max = int(torch.floor(torch.tensor(max_range[1]) / res).item())
-            k_min = -int(torch.floor(torch.tensor(abs(max_range[0])) / res).item())
+            k_max = math.floor(max_range[1] / res)
+            k_min = math.ceil(max_range[0] / res)
+            if k_min > k_max:
+                raise ValueError("任务量程内至少需要一个网格中心")
             return torch.arange(k_min, k_max + 1, dtype=torch.float32, device=device) * res
 
         self.vx_centers = centers(vx_resolution, max_vx_range)
@@ -74,6 +100,30 @@ class GridAdaptiveCommandScheduler:
         self.num_vx = self.vx_centers.numel()
         self.num_yaw = self.yaw_centers.numel()
         self.num_cells = self.num_vx * self.num_yaw
+
+        def sampling_bounds(values, resolution, limits, low_speed_limits):
+            half_width = resolution / 2 if continuous_sampling else command_jitter
+            lower = (values - half_width).clamp_min(limits[0])
+            upper = (values + half_width).clamp_max(limits[1])
+            # 连续模式的两端单元覆盖非整格量程剩余部分，仍保持各格互不重叠。
+            if continuous_sampling:
+                lower[0], upper[-1] = limits[0], limits[1]
+            low_lower = lower.clamp_min(low_speed_limits[0])
+            low_upper = upper.clamp_max(low_speed_limits[1])
+            overlap = (low_upper - low_lower).clamp_min(0)
+            # 离散兼容模式中，中心点位于低速区内也可被加采样。
+            overlap = torch.where(
+                (lower == upper) & (low_lower <= low_upper), torch.ones_like(overlap), overlap
+            )
+            return lower, upper, low_lower, low_upper, overlap
+
+        (self._vx_lower, self._vx_upper, self._low_vx_lower,
+         self._low_vx_upper, vx_overlap) = sampling_bounds(
+            self.vx_centers, vx_resolution, max_vx_range, low_speed_vx_range)
+        (self._yaw_lower, self._yaw_upper, self._low_yaw_lower,
+         self._low_yaw_upper, yaw_overlap) = sampling_bounds(
+            self.yaw_centers, yaw_resolution, max_yaw_range, low_speed_yaw_range)
+        self._low_speed_area = (vx_overlap[:, None] * yaw_overlap[None, :]).flatten()
 
         # 初始激活：中心落在初始范围内的单元。
         def initial_mask(centers: torch.Tensor, rng: Tuple[float, float]) -> torch.Tensor:
@@ -109,21 +159,25 @@ class GridAdaptiveCommandScheduler:
 
     @property
     def active_vx_range(self) -> float:
-        """激活单元覆盖的最大 |vx|（含半格宽）。"""
+        """激活单元可采样的最大 |vx|，已裁到任务量程。"""
         idx = self.activated.any(dim=1).nonzero().flatten()
-        return float(self.vx_centers[idx].abs().max().item() + self.vx_resolution / 2) if idx.numel() else 0.0
+        if not idx.numel():
+            return 0.0
+        return float(torch.maximum(self._vx_lower[idx].abs(), self._vx_upper[idx].abs()).max())
 
     @property
     def active_yaw_range(self) -> float:
         idx = self.activated.any(dim=0).nonzero().flatten()
-        return float(self.yaw_centers[idx].abs().max().item() + self.yaw_resolution / 2) if idx.numel() else 0.0
+        if not idx.numel():
+            return 0.0
+        return float(torch.maximum(self._yaw_lower[idx].abs(), self._yaw_upper[idx].abs()).max())
 
     """
     采样与统计
     """
 
     def _update_probs(self):
-        """归一化采样概率：激活单元均匀分布 + 全合法单元探索混合。"""
+        """维护常规课程、已激活低速区域，以及导出用的混合边际概率。"""
         activated = self.activated.flatten().float()
         num_active = activated.sum().clamp_min(1.0)
         num_legal = float(self.num_cells)
@@ -134,23 +188,46 @@ class GridAdaptiveCommandScheduler:
         # 此分支仅在异常构造时触发）。
         if not torch.isfinite(probs).all() or probs.sum() <= 0:
             probs = legal_uniform
-        self._probs = probs / probs.sum()
+        self._regular_probs = probs / probs.sum()
+        low_weights = self._low_speed_area * activated
+        low_total = low_weights.sum()
+        self._low_speed_prob = self.low_speed_sampling_prob if low_total > 0 else 0.0
+        self._low_speed_probs = low_weights / low_total if low_total > 0 else self._regular_probs
+        self._probs = (
+            (1.0 - self._low_speed_prob) * self._regular_probs
+            + self._low_speed_prob * self._low_speed_probs
+        )
 
     def sample(self, num: int, generator: torch.Generator | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """从联合分布采样 ``num`` 个指令组合。
 
         Returns:
-            (cell_idx, vx, wz)：展平单元索引与对应指令值（可选加均匀抖动）。
+            (cell_idx, vx, wz)：实际所属的展平单元索引与格内指令。
         """
-        cell_idx = torch.multinomial(self._probs, num, replacement=True, generator=generator)
+        cell_idx, vx, wz, _ = self.sample_with_low_speed_mask(num, generator=generator)
+        return cell_idx, vx, wz
+
+    def sample_with_low_speed_mask(
+        self, num: int, generator: torch.Generator | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """额外返回低速分支掩码，供指令生成器同步收窄 vy 的采样范围。"""
+        cell_idx = torch.multinomial(self._regular_probs, num, replacement=True, generator=generator)
+        low_speed = torch.zeros(num, dtype=torch.bool, device=self.device)
+        if self._low_speed_prob > 0:
+            low_speed = torch.rand(num, device=self.device, generator=generator) < self._low_speed_prob
+            low_cells = torch.multinomial(self._low_speed_probs, num, replacement=True, generator=generator)
+            cell_idx = torch.where(low_speed, low_cells, cell_idx)
         vx_idx = torch.div(cell_idx, self.num_yaw, rounding_mode="floor")
         yaw_idx = cell_idx % self.num_yaw
-        vx = self.vx_centers[vx_idx].clone()
-        wz = self.yaw_centers[yaw_idx].clone()
-        if self.command_jitter > 0:
-            vx += (torch.rand(num, device=self.device) * 2.0 - 1.0) * self.command_jitter
-            wz += (torch.rand(num, device=self.device) * 2.0 - 1.0) * self.command_jitter
-        return cell_idx, vx, wz
+
+        def within_cell(index, lower, upper, low_lower, low_upper):
+            lo = torch.where(low_speed, low_lower[index], lower[index])
+            hi = torch.where(low_speed, low_upper[index], upper[index])
+            return lo + torch.rand(num, device=self.device, generator=generator) * (hi - lo)
+
+        vx = within_cell(vx_idx, self._vx_lower, self._vx_upper, self._low_vx_lower, self._low_vx_upper)
+        wz = within_cell(yaw_idx, self._yaw_lower, self._yaw_upper, self._low_yaw_lower, self._low_yaw_upper)
+        return cell_idx, vx, wz, low_speed
 
     def record_interval(
         self,

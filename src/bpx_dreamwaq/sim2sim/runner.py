@@ -2,7 +2,7 @@
 
 运行器是各层的汇合点，但不负责制定状态转换规则：
 
-- 200 Hz：采样 Init 足端轨迹、更新 PD 力矩、推进 MuJoCo、执行基础跌倒检查；
+- 200 Hz：采样 Init 足端轨迹、更新 PD 力矩、推进 MuJoCo；
 - 50 Hz：读取 command、更新 Supervisor、选择策略、构造观测并推理；
 - 起身控制器与策略切换：使用 ActionBlender 保证实际 action 连续；
 - 记录：把原始/过滤 command、行为模式、状态、动作和力矩写入 CSV。
@@ -183,6 +183,7 @@ class Sim2SimRunner:
         self.waiting_controller = ConstantPolicy(reset_action)
         if supervisor is not None:
             supervisor.init_available = True
+            supervisor.pose_protection = False
 
     def run(
         self,
@@ -211,7 +212,7 @@ class Sim2SimRunner:
             realtime: 是否按物理步长进行墙钟限速。
             log_path: 可选 CSV 输出路径。
             print_interval: 终端状态打印周期。
-            terminate_on_fall: 是否启用原有的物理步级跌倒终止逻辑。
+            terminate_on_fall: 兼容旧调用；sim2sim 已取消跌倒自动退出，此参数不再生效。
             torque_plot: 是否打开独立进程的实时关节力矩窗口。
             torque_window: 力矩曲线的滚动时间窗，单位秒。
             velocity_plot: 是否显示 command 与机体系实际速度的实时对比。
@@ -329,7 +330,7 @@ class Sim2SimRunner:
                         )
                         behavior_mode = decision.mode.value
                         if decision.mode == BehaviorMode.DISABLED:
-                            # DISABLED 不对应任何会继续驱动关节的策略，立即安全结束本次仿真。
+                            # 姿态停机已关闭；数值无效等运行异常仍然终止。
                             termination_reason = f"supervisor_{decision.reason}"
                             break
                         command_array[:] = decision.command
@@ -391,9 +392,6 @@ class Sim2SimRunner:
 
                 # Init 在物理步上采样五次轨迹；RL 动作仍按策略周期保持。
                 if isinstance(active_controller, FootTrajectoryInit):
-                    if active_controller.timed_out:
-                        termination_reason = "init_pd_timeout"
-                        break
                     action = active_controller()
                 target, torque = apply_control()
                 mujoco.mj_step(self.model, self.data)
@@ -437,30 +435,12 @@ class Sim2SimRunner:
                     )
                     next_print_time += print_interval
 
-                if terminate_on_fall and behavior_mode not in (
-                    BehaviorMode.WAITING_INIT.value,
-                    BehaviorMode.INIT.value,
-                ):
-                    reason = self._fall_reason()
-                    if reason is not None:
-                        termination_reason = reason
-                        break
-
                 if use_realtime:
                     remaining = self.config.simulation.timestep - (time.perf_counter() - wall_step_start)
                     if remaining > 0.0:
                         time.sleep(remaining)
 
         return RunResult(float(self.data.time), policy_steps, termination_reason)
-
-    def _fall_reason(self) -> str | None:
-        if self.robot.base_height() < self.config.termination.minimum_base_height:
-            return "base_height"
-        if self.robot.tilt_angle() > self.config.termination.maximum_tilt:
-            return "bad_orientation"
-        if self.robot.torso_touches_floor():
-            return "torso_contact"
-        return None
 
 
 class _NullViewerContext:

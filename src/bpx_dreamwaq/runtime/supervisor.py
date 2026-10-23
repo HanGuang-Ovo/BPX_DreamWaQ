@@ -95,10 +95,13 @@ class BehaviorSupervisor:
         init_available: bool = False,
         *,
         recovery_available: bool | None = None,
+        pose_protection: bool = True,
     ):
         self.config = config
         # recovery_available 是策略改名前的兼容关键字；新代码使用 init_available。
         self.init_available = init_available if recovery_available is None else recovery_available
+        # MuJoCo 可关闭姿态停机规则；实机及其他调用仍默认保留。
+        self.pose_protection = pose_protection
         self.command_scale = np.asarray(config.command_scale, dtype=np.float32)
         self.command_limiter = SlewRateLimiter(config.command_slew_rate)
         self.mode = BehaviorMode.STAND
@@ -109,7 +112,11 @@ class BehaviorSupervisor:
 
     def reset(self) -> None:
         self.command_limiter.reset()
-        self.mode = BehaviorMode.STAND
+        self.mode = (
+            BehaviorMode.WAITING_INIT
+            if self.init_available and not self.pose_protection
+            else BehaviorMode.STAND
+        )
         self.mode_time = 0.0
         self.condition_time = 0.0
         self.condition_name = None
@@ -177,7 +184,7 @@ class BehaviorSupervisor:
         excessive_tilt = state.tilt > self.config.fall_tilt
         not_standing = low_height or excessive_tilt
         prone_for_init = low_height and state.tilt < self.config.init_start_max_tilt
-        if self.mode not in (
+        if self.pose_protection and self.mode not in (
             BehaviorMode.WAITING_INIT,
             BehaviorMode.INIT,
             BehaviorMode.DISABLED,
@@ -197,7 +204,7 @@ class BehaviorSupervisor:
                 ) or mode_changed
             elif not low_height and state.tilt < self.config.fall_tilt:
                 mode_changed = self._transition(BehaviorMode.STAND, "already_standing") or mode_changed
-            elif not prone_for_init:
+            elif self.pose_protection and not prone_for_init:
                 mode_changed = self._transition(
                     BehaviorMode.DISABLED, "unsupported_init_pose"
                 ) or mode_changed
@@ -239,7 +246,7 @@ class BehaviorSupervisor:
         elif self.mode == BehaviorMode.INIT:
             # Init 只针对接近水平的腹部趴卧状态。若起身过程中倾角持续增大，说明策略
             # 已偏离训练目标；立即停止策略驱动，避免继续输出力矩直至完全翻倒。
-            if state.tilt >= self.config.init_abort_tilt:
+            if self.pose_protection and state.tilt >= self.config.init_abort_tilt:
                 mode_changed = self._transition(
                     BehaviorMode.DISABLED, "init_tilt_abort"
                 ) or mode_changed

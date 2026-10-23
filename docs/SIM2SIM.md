@@ -35,6 +35,11 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 `--auto-init` 可让手柄模式也自动起身。`--direct-policy` 跳过状态机，供站姿接口对拍使用。
 默认 `zero` 后端只检查 PD 和流程，不产生策略步态。
 
+MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导致的自动退出。
+策略接管后持续响应手柄；起身未完成时继续执行 Init 控制，直到满足接管条件。
+仿真在设定时长结束、关闭窗口或 Ctrl+C 时退出；输入/数值异常仍会报错。
+旧的 `--terminate-on-fall`/`--no-terminate` 参数仅保留命令兼容，不再改变行为。
+
 ## 场地和难度
 
 `--terrain` 覆盖 TOML 的 `terrain.kind`：
@@ -47,15 +52,16 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 | `mixed` | 同时包含崎岖路线和楼梯路线 |
 
 综合场地出生点为 `(0, 0)`，面向 +X。崎岖路线位于 `x=2..10 m`、`y=-2..2 m`，
-边缘平滑过渡。楼梯起点均为 `x=2 m`，终点为 `x=5.6 m`，路线如下：
+边缘平滑过渡。`bpx_mixed.toml` 中楼梯起点均为 `x=2 m`，终点为 `x=4.8 m`，路线如下：
 
 | 等级 | 单级高度 | 顶部高度 | 中心线 y | 颜色 |
 | --- | --- | --- | --- | --- |
 | 1 | 3 cm | 15 cm | -4.5 m | 绿 |
 | 2 | 8 cm | 40 cm | -7.5 m | 蓝 |
-| 3 | 15 cm | 75 cm | -10.5 m | 橙 |
+| 3 | 10 cm | 50 cm | -10.5 m | 橙 |
+| 4 | 15 cm | 75 cm | -13.5 m | 绿 |
 
-每条楼梯宽 2 m，踏面深 0.3 m，上升 5 个高差，顶部平台长 1.2 m，再下降 5 个高差。
+每条楼梯宽 2 m，踏面深 0.2 m，上升 5 个高差，顶部平台长 1.2 m，再下降 5 个高差。
 各楼梯为独立 box 碰撞体，保留竖直踢面；崎岖路面采用连续高度场，保留负高度谷地。
 地形标签显示在 viewer 内，CSV 记录 `terrain_region`、`ground_z`、`base_clearance`。
 高度判定使用机身正下方地面，跨台阶边缘时不是四足支撑面的平均高度。
@@ -72,7 +78,19 @@ python scripts/sim2sim.py --terrain stairs --step-heights 0.03 0.06 0.10 \
 
 TOML `[terrain]` 可设置 `step_heights`、`step_count`、`step_width`、`stair_width`、
 `platform_width`；`--terrain-seed` 控制崎岖路面的可复现随机种子。
-Init 轨迹面向水平趴卧状态，出生区安排在平地；侧翻/仰翻或 Init 超时会停止运行。
+Init 轨迹面向水平趴卧状态，出生区安排在平地；侧翻/仰翻或 Init 超时不再自动结束仿真。
+
+楼梯已统一并入综合场地，使用同一个配置即可测试崎岖地面和四档楼梯。
+例如，选择单级高 10 cm、踏面深 20 cm 的路线：
+
+```bash
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --backend onnx --gamepad --viewer --stair-level 3
+```
+
+改用 `--stair-level 4` 可选择单级高 15 cm 的路线；不指定该参数时，
+仍在崎岖路线前的平地出生。`step_width=0.20` 指沿行走方向的单级踏面深度，
+`stair_width=2.0` 指整条楼梯的横向宽度。
 
 ## 关节与控制契约
 
@@ -114,7 +132,8 @@ bash scripts/training_python.sh scripts/export_policy.py \
     --checkpoint outputs/training/bpx_dreamwaq/20261021_004207/model_3100.pt --format both
 ```
 
-使用该 ONNX 策略、自动起身、固定 vx，在综合场地完成以下实际推理冒烟：
+使用该 ONNX 策略、自动起身、固定 vx，在综合场地完成以下实际推理冒烟。
+以下为当时 30 cm 踏面、3/8/15 cm 三档楼梯的历史记录，未验证当前 20 cm 踏面场地：
 
 | 路线 | 指令 | 结果 |
 | --- | --- | --- |

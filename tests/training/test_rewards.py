@@ -68,6 +68,51 @@ def clearance(env, **kwargs):
     )
 
 
+class TestJointAccelerationPenalty(unittest.TestCase):
+    def penalty(self, acceleration, joint_ids=slice(None), **kwargs):
+        env = SimpleNamespace(scene=_Scene(robot=SimpleNamespace(
+            data=SimpleNamespace(joint_acc=acceleration),
+        )))
+        return rewards.joint_acc_l2(
+            env, asset_cfg=SimpleNamespace(name="robot", joint_ids=joint_ids), **kwargs,
+        )
+
+    def test_normal_accelerations_match_original_and_preserve_input(self):
+        acceleration = torch.tensor([[0., 100., -200.], [350., -500., 20.]])
+        original = acceleration.clone()
+        torch.testing.assert_close(self.penalty(acceleration), acceleration.square().sum(dim=1))
+        torch.testing.assert_close(acceleration, original)
+
+    def test_extreme_finite_accelerations_cannot_overflow(self):
+        acceleration = torch.full((2, 12), torch.finfo(torch.float32).max)
+        acceleration[1] *= -1
+        result = self.penalty(acceleration)
+        self.assertTrue(torch.isfinite(result).all())
+        torch.testing.assert_close(result, torch.full((2,), 1.0e8))
+        # 实际配置乘权重和策略 dt 后的贡献也必须有限、有下限。
+        torch.testing.assert_close(result * -2.5e-7 * .02, torch.full((2,), -.5))
+
+    def test_nonfinite_acceleration_receives_maximum_penalty_per_environment(self):
+        acceleration = torch.tensor([
+            [float("nan"), 0.], [float("inf"), 0.],
+            [float("-inf"), 0.], [3., 4.],
+        ])
+        result = self.penalty(acceleration, penalty_cap=100.)
+        torch.testing.assert_close(result, torch.tensor([100., 100., 100., 25.]))
+        self.assertTrue(torch.isnan(acceleration[0, 0]))
+        self.assertTrue(torch.isinf(acceleration[1:3, 0]).all())
+
+    def test_cap_applies_to_sum_and_joint_selection(self):
+        acceleration = torch.tensor([[float("nan"), 8., -8.], [1., 3., 4.]])
+        result = self.penalty(acceleration, joint_ids=[1, 2], penalty_cap=100.)
+        torch.testing.assert_close(result, torch.tensor([100., 25.]))
+
+    def test_invalid_caps_are_rejected(self):
+        for cap in (0., -1., float("nan"), float("inf"), 1.0e38):
+            with self.subTest(cap=cap), self.assertRaises(ValueError):
+                self.penalty(torch.zeros(1, 12), penalty_cap=cap)
+
+
 class TestBaseHeight(unittest.TestCase):
     def penalty(self, root_positions, ray_hits):
         env = SimpleNamespace(scene=_Scene(
@@ -231,6 +276,93 @@ class TestFeetLateralDistance(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.penalty([[[0, 0, 0]] * 3])
 
+
+class TestFeetLongitudinalDistance(unittest.TestCase):
+    def penalty(self, positions, quaternions=None, body_ids=slice(None), **kwargs):
+        if quaternions is None:
+            quaternions = [[1., 0., 0., 0.]] * len(positions)
+        env = SimpleNamespace(scene=_Scene(robot=SimpleNamespace(data=SimpleNamespace(
+            body_link_pos_w=torch.tensor(positions, dtype=torch.float32),
+            root_quat_w=torch.tensor(quaternions, dtype=torch.float32),
+        ))))
+        return rewards.feet_longitudinal_distance(
+            env, asset_cfg=SimpleNamespace(name="robot", body_ids=body_ids), **kwargs,
+        )
+
+    @staticmethod
+    def feet(left_length, right_length):
+        return [[left_length / 2, .17, 0], [right_length / 2, -.17, 0],
+                [-left_length / 2, .17, 0], [-right_length / 2, -.17, 0]]
+
+    def test_nominal_threshold_and_longer_stances_have_zero_cost(self):
+        result = self.penalty([self.feet(.4772, .4772), self.feet(.30, .30), self.feet(.6, .6)])
+        torch.testing.assert_close(result, torch.zeros(3))
+
+    def test_each_side_counts_and_crossed_feet_cannot_escape(self):
+        result = self.penalty([self.feet(.15, .30), self.feet(.15, .15),
+                               self.feet(0., 0.), self.feet(-.15, .30)])
+        torch.testing.assert_close(result, torch.tensor([.25, .5, 2., 2.25]))
+
+    def test_world_translation_yaw_and_height_do_not_change_cost(self):
+        positions, quaternions = [], []
+        for yaw in (0., math.pi / 2, -math.pi / 2, 2.3):
+            c, s = math.cos(yaw), math.sin(yaw)
+            feet = self.feet(.15, .15)
+            feet[0][2], feet[3][2] = .4, .8
+            positions.append([[c*x - s*y + 10, s*x + c*y - 5, z + 2] for x, y, z in feet])
+            quaternions.append([math.cos(yaw / 2), 0., 0., math.sin(yaw / 2)])
+        torch.testing.assert_close(self.penalty(positions, quaternions), torch.full((4,), .5))
+
+    def test_explicit_body_selection_restores_pair_order(self):
+        fl, fr, hl, hr = self.feet(.15, .30)
+        positions = [[[0, 0, 10], hr, fr, hl, fl]]
+        torch.testing.assert_close(self.penalty(positions, body_ids=[4, 2, 3, 1]), torch.tensor([.25]))
+
+    def test_invalid_distance_or_foot_count_is_rejected(self):
+        for distance in (0., -1., float("nan"), float("inf")):
+            with self.subTest(distance=distance), self.assertRaises(ValueError):
+                self.penalty([self.feet(.30, .30)], minimum_distance=distance)
+        with self.assertRaises(ValueError):
+            self.penalty([[[0, 0, 0]] * 3])
+
+
+class TestFeetAirTime(unittest.TestCase):
+    def reward(self, commands, air_times=None, first_contacts=None, **kwargs):
+        count = len(commands)
+        if air_times is None:
+            air_times = [[.6, .6, .6, .6]] * count
+        if first_contacts is None:
+            first_contacts = [[1., 1., 1., 1.]] * count
+        sensor = SimpleNamespace(
+            data=SimpleNamespace(last_air_time=torch.tensor(air_times, dtype=torch.float32)),
+            compute_first_contact=lambda _dt: torch.tensor(first_contacts, dtype=torch.float32),
+        )
+        command = torch.tensor(commands, dtype=torch.float32)
+        env = SimpleNamespace(
+            scene=_Scene(contact_forces=sensor), step_dt=.02,
+            command_manager=SimpleNamespace(get_command=lambda _name: command),
+        )
+        return rewards.feet_air_time(
+            env, command_name="base_velocity", threshold=.5,
+            sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=slice(None)), **kwargs,
+        )
+
+    def test_translation_and_pure_yaw_both_enable_stepping_reward(self):
+        result = self.reward([[.2, 0., 0.], [0., 0., .2], [0., 0., -.2], [0., 0., 0.]])
+        torch.testing.assert_close(result, torch.tensor([.4, .4, .4, 0.]))
+
+    def test_command_deadbands_are_independent(self):
+        result = self.reward(
+            [[.1, 0., .2], [.2, 0., .1], [.1, 0., .1]],
+            command_threshold=.1, yaw_command_threshold=.1,
+        )
+        torch.testing.assert_close(result, torch.tensor([.4, .4, 0.]))
+
+    def test_invalid_command_threshold_is_rejected(self):
+        for kwargs in ({"command_threshold": -1.}, {"command_threshold": float("nan")},
+                       {"yaw_command_threshold": -1.}, {"yaw_command_threshold": float("inf")}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.reward([[0., 0., 0.]], **kwargs)
 
 class TestActionSmoothness(unittest.TestCase):
     def setUp(self):

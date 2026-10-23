@@ -92,7 +92,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     termination_group.add_argument(
         "--terminate-on-fall",
         action="store_true",
-        help="机器人高度过低、倾角过大或躯干触地时提前结束（默认不提前结束）",
+        help=argparse.SUPPRESS,  # 兼容旧命令；MuJoCo 已取消姿态/跌倒自动退出。
     )
     termination_group.add_argument(
         "--no-terminate",

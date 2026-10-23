@@ -187,7 +187,7 @@ def _make_bpx_terrain_generator(num_levels: int):
             "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
                 proportion=0.2,
                 step_height_range=(0.03, 0.15),
-                step_width=0.3,
+                step_width=0.10,  # 踏面深度 10 cm。
                 platform_width=3.0,
                 border_width=1.0,
                 holes=False,
@@ -195,7 +195,7 @@ def _make_bpx_terrain_generator(num_levels: int):
             "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
                 proportion=0.2,
                 step_height_range=(0.03, 0.15),
-                step_width=0.3,
+                step_width=0.10,  # 踏面深度 10 cm。
                 platform_width=3.0,
                 border_width=1.0,
                 holes=False,
@@ -222,7 +222,7 @@ class CommandsCfg:
     base_velocity = lab_mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.1,
         rel_heading_envs=1.0,
         heading_command=False,
         debug_vis=False,
@@ -391,7 +391,7 @@ class RewardsCfg:
         func=lab_mdp.ang_vel_xy_l2,
         weight=-0.05
     )
-    # 相对有效高度扫描点的平均地面高度；目标先沿用初始化高度。
+    '''高度偏离目标惩罚'''
     base_height_l2 = RewTerm(
         func=bpx_rewards.base_height_l2,
         weight=-1.0,
@@ -408,8 +408,10 @@ class RewardsCfg:
     )
     '''关节加速度惩罚'''
     dof_acc_l2 = RewTerm(
-        func=lab_mdp.joint_acc_l2,
-        weight=-2.5e-7
+        func=bpx_rewards.joint_acc_l2,
+        weight=-2.5e-7,
+        # 原始平方和上限；乘权重和 0.02 s 后，每策略步该项最低为 -0.5。
+        params={"asset_cfg": SceneEntityCfg("robot"), "penalty_cap": 1.0e8},
     )
     '''动作变化率惩罚'''
     action_rate_l2 = RewTerm(
@@ -432,10 +434,10 @@ class RewardsCfg:
             "max_ray_distance": 0.15,
         },
     )
-    # 只约束前、后两组左右足的最小横向间距，达到下限后不再鼓励张腿。
+    '''脚间距惩罚：前后对角线距离不小于 0.26 m，前后纵向距离不小于 0.30 m。'''
     feet_lateral_distance = RewTerm(
         func=bpx_rewards.feet_lateral_distance,
-        weight=-0.1,
+        weight=-0.3,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -445,17 +447,31 @@ class RewardsCfg:
             "minimum_distance": 0.26,
         },
     )
+    feet_longitudinal_distance = RewTerm(
+        func=bpx_rewards.feet_longitudinal_distance,
+        weight=-0.3,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"],
+                preserve_order=True,
+            ),
+            "minimum_distance": 0.30,
+        },
+    )
     '''脚离地时间奖励'''
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
-        weight=0.05,
+        weight=0.1,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
-            "threshold": 0.5,
+            "threshold": 0.4,
+            "command_threshold": 0.1,
+            "yaw_command_threshold": 0.1,
         },
     )
-    # 着地瞬间奖励无法约束“始终不落脚”；连续悬空和长期触地失衡单独约束。
+    '''脚离地时间惩罚'''
     feet_air_time_excess = RewTerm(
         func=bpx_rewards.feet_air_time_excess,
         weight=-1.0,
@@ -482,12 +498,12 @@ class RewardsCfg:
     '''姿态水平惩罚（惩罚 roll/pitch 偏离水平，基于投影重力）'''
     flat_orientation_l2 = RewTerm(
         func=lab_mdp.flat_orientation_l2,
-        weight=-0.2
+        weight=-0.3
     )
     '''关节位置越界惩罚'''
     joint_pos_limits = RewTerm(
         func=lab_mdp.joint_pos_limits,
-        weight=0.0
+        weight=-0.2
     )
 
 
@@ -518,6 +534,9 @@ class CurriculumCfg:
 @configclass
 class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     """BPX 崎岖地形速度跟踪环境。"""
+
+    minimum_step_reward: float = -10.0
+    """每个环境每个策略步的总奖励下限；不缩放、不限制正奖励。"""
 
     # ---- 课程开关（模块 A / B 独立控制）----
     enable_terrain_curriculum: bool = True
@@ -550,11 +569,21 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     command_lin_vel_x_range: tuple = (-1.0, 1.0)
     command_lin_vel_y_range: tuple = (-0.5, 0.5)
     command_ang_vel_z_range: tuple = (-1.0, 1.0)
+    command_rel_standing_envs: float = 0.1
+    """每次重采样以此概率发送精确全零指令；独立于近零连续运动采样。"""
     # 指令课程初始范围（以零为中心逐步向外扩展）。
     command_curriculum_initial_vx_range: tuple = (-0.5, 0.5)
     command_curriculum_initial_yaw_range: tuple = (-0.5, 0.5)
     command_grid_resolution_vx: float = 0.5
     command_grid_resolution_yaw: float = 0.5
+    command_grid_continuous_sampling: bool = True
+    """保留网格课程，在所选格内连续采样 vx/wz，并裁到任务量程。"""
+    command_low_speed_sampling_prob: float = 0.3
+    """额外低速分支占全部非站立指令采样的比例，其余保留原网格分布。"""
+    command_low_speed_vx_range: tuple = (-0.25, 0.25)
+    command_low_speed_vy_range: tuple = (-0.1, 0.1)
+    command_low_speed_yaw_range: tuple = (-0.25, 0.25)
+    """低速分支的三轴范围；仅从已激活单元与这些范围的交集采样。"""
 
     # 场景与 MDP
     scene: BPXSceneCfg = BPXSceneCfg(num_envs=1024, env_spacing=2.5)
@@ -567,6 +596,8 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
+        if not 0.0 <= self.command_rel_standing_envs <= 1.0:
+            raise ValueError("command_rel_standing_envs 必须在 [0, 1] 内")
         # 通用设置：200 Hz 物理 × decimation 4 = 50 Hz 策略。
         self.decimation = 4
         self.episode_length_s = 20.0
@@ -609,7 +640,7 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
                 resampling_time_range=(10.0, 10.0),
                 debug_vis=False,
                 asset_name="robot",
-                rel_standing_envs=0.02,
+                rel_standing_envs=self.command_rel_standing_envs,
                 lin_vel_y_range=tuple(self.command_lin_vel_y_range),
                 vx_resolution=self.command_grid_resolution_vx,
                 yaw_resolution=self.command_grid_resolution_yaw,
@@ -617,6 +648,11 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
                 initial_yaw_range=tuple(self.command_curriculum_initial_yaw_range),
                 max_vx_range=tuple(self.command_lin_vel_x_range),
                 max_yaw_range=tuple(self.command_ang_vel_z_range),
+                continuous_sampling=self.command_grid_continuous_sampling,
+                low_speed_sampling_prob=self.command_low_speed_sampling_prob,
+                low_speed_vx_range=tuple(self.command_low_speed_vx_range),
+                low_speed_vy_range=tuple(self.command_low_speed_vy_range),
+                low_speed_yaw_range=tuple(self.command_low_speed_yaw_range),
             )
         else:
             # __post_init__ 可被命令行覆盖后再次调用，需要完整恢复均匀指令配置。
@@ -624,7 +660,7 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
                 class_type=bpx_commands.TerrainAwareUniformVelocityCommand,
                 asset_name="robot",
                 resampling_time_range=(10.0, 10.0),
-                rel_standing_envs=0.02,
+                rel_standing_envs=self.command_rel_standing_envs,
                 rel_heading_envs=1.0,
                 heading_command=False,
                 debug_vis=False,
