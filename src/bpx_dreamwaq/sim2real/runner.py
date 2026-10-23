@@ -1,5 +1,6 @@
 """实机执行和离线回放：仅验证有限数与四元数，不限幅、限速或限矩。"""
 
+import hashlib
 import time
 
 import numpy as np
@@ -64,8 +65,13 @@ def run_live(config, output_path, command, duration, *, armed=False, policy=None
     cal = controller.calibration
     zeros = np.zeros(12)
     send_period = 1. / config.control["send_rate_hz"]
+    model_path = config.model_path()
+    model_info = {"path": str(model_path),
+                  "sha256": hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.is_file() else None,
+                  "warmup": controller.actor.model_info}
     with JsonlWriter(output_path, {"mode": "live", "config": str(config.path), "runtime": config.runtime,
                                  "calibration": config.calibration, "duration_s": duration,
+                                 "model": model_info,
                                  "command_source": "dynamic" if command_source is not None else "constant"}) as log:
         with source_factory(config, joint_control=True) as source:
             sample = wait_for_feedback(source, guard, config.network["connect_timeout_s"], clock=clock, sleep=sleep)
@@ -81,14 +87,18 @@ def run_live(config, output_path, command, duration, *, armed=False, policy=None
                     break
                 sample = source.read()
                 guard.check(sample)
+                now = clock()
                 policy_due = now + 1e-9 >= next_policy
+                policy_lateness = max(0., now - next_policy) if policy_due else 0.
                 init_requested = False
                 if policy_due:
                     if command_source is not None:
                         command = vector(command_source(), 3, "command")
                     init_requested = bool(init_request_source()) if init_request_source is not None else False
                     policy_count += 1
-                    next_policy += config.period
+                    # 跳过错过的时刻，不连续补跑；非策略发送帧不能推迟策略截止时间。
+                    missed = max(0, int((now - next_policy + 1e-9) / config.period))
+                    next_policy += (missed + 1) * config.period
                 result = controller.step(sample, command, now=now, policy_due=policy_due,
                                          init_requested=init_requested)
                 target = vector(result["target_model"], 12, "target")
@@ -100,14 +110,18 @@ def run_live(config, output_path, command, duration, *, armed=False, policy=None
                     if status_callback is not None:
                         status_callback(controller.mode, result["reason"])
                     previous_mode = controller.mode
+                recorded_sample = sample.to_dict()
+                recorded_sample["telemetry"] = {
+                    **recorded_sample["telemetry"], "remote_command": command.tolist(),
+                    "remote_command_source": "实机录制手柄" if command_source is not None else "实机录制固定指令",
+                }
                 log.write({"type": "command", "host_time": after, "mode": controller.mode,
+                           "policy_due": policy_due, "policy_lateness_s": policy_lateness,
                            "raw_command": np.asarray(command).tolist(), "init_requested": init_requested,
                            "target_model": target.tolist(), "target_sdk": cal.position_to_sdk(target).tolist(),
                            "kp_model": controller.kp.tolist(), "kd_model": controller.kd.tolist(),
-                           "sample": sample.to_dict(), "policy": result})
+                           "sample": recorded_sample, "policy": result})
                 next_send += send_period
                 if after > next_send:
                     next_send = after + send_period
-                if after > next_policy:
-                    next_policy = after + config.period
     return policy_count

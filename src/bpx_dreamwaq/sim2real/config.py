@@ -8,9 +8,17 @@ import tomllib
 import numpy as np
 
 from bpx_dreamwaq.runtime.joints import POLICY_JOINT_NAMES, SDK_JOINT_NAMES, DEFAULT_JOINT_POSITION
+from bpx_dreamwaq.paths import CONFIGS_DIR
 
 # 仅用于窗口中的官方模型范围对照，不限制实机接管或发送目标。
 OFFICIAL_JOINT_LIMITS = ((-.8727, .8727),) * 4 + ((-.7854, 2.60661),) * 4 + ((-2.7531, -.5539),) * 4
+DEFAULT_CONFIG = CONFIGS_DIR / "sim2real/runtime.toml"
+
+
+def default_config():
+    """控制与监控入口使用同一份本机配置。"""
+    local = DEFAULT_CONFIG.with_name("local.runtime.toml")
+    return local if local.is_file() else DEFAULT_CONFIG
 
 
 def vector(value, size, name, *, positive=False):
@@ -99,7 +107,7 @@ class Config:
         return [] if self.model_path().is_file() else ["policy.model 不存在"]
 
 
-def load_config(path):
+def load_config(path, *, policy_path=None):
     path = Path(path).expanduser().resolve()
     with path.open("rb") as stream:
         raw = tomllib.load(stream)
@@ -131,6 +139,9 @@ def load_config(path):
         raise ValueError("network.state_rate_hz 要求 1..200")
     positive(net["connect_timeout_s"], "network.connect_timeout_s")
     policy = raw["policy"]
+    if policy_path is not None:
+        # 命令行路径相对于调用目录；TOML 中的路径相对于配置文件。
+        policy["model"] = str(Path(policy_path).expanduser().resolve())
     if not isinstance(policy.get("model"), str) or not policy["model"].strip():
         raise ValueError("policy.model 必须是非空路径")
     if policy["history_length"] not in (1, 10) or not isinstance(policy["include_base_lin_vel"], bool):
@@ -163,7 +174,10 @@ def load_config(path):
         raise ValueError("support_duration 必须小于 duration")
     if control["policy_rate_hz"] != 50:
         raise ValueError("当前策略及历史必须按 50 Hz 更新")
-    positive(control["send_rate_hz"], "control.send_rate_hz")
+    send_rate = positive(control["send_rate_hz"], "control.send_rate_hz")
+    ratio = send_rate / control["policy_rate_hz"]
+    if ratio < 1 or not math.isclose(ratio, round(ratio), abs_tol=1e-9):
+        raise ValueError("control.send_rate_hz 必须为 policy_rate_hz 的正整数倍（50/100/200 Hz 等）")
     for key in ("kp", "kd"):
         vector(control[key], 12, key)
     for key in ("takeover_duration_s", "action_blend_duration_s", "walk_enter_delay_s",

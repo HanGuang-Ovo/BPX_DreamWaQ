@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 from bpx_dreamwaq.paths import CONFIGS_DIR, PROJECT_ROOT
-from bpx_dreamwaq.sim2real.config import load_config as load_real_config
+from bpx_dreamwaq.sim2real.config import default_config, load_config as load_real_config
 from bpx_dreamwaq.sim2sim.config import load_config as load_sim_config
 from bpx_dreamwaq.validation import check_assets
 
@@ -32,7 +32,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(all(assets["joint_contract"].values()))
 
     def test_simulation_and_hardware_default_history_contract_matches(self):
-        sim = load_sim_config(CONFIGS_DIR / "sim2sim/bpx_history.toml")
+        sim = load_sim_config(CONFIGS_DIR / "sim2sim/bpx_mixed.toml")
         real = load_real_config(CONFIGS_DIR / "sim2real/runtime.toml")
         self.assertEqual(sim.observation.dimension, real.policy["observation_dimension"])
         self.assertEqual(sim.observation.history_length, real.policy["history_length"])
@@ -62,11 +62,17 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(report["project_root"], str(PROJECT_ROOT))
         self.assertEqual(report["errors"], [])
 
+    def test_setup_entry_runs_outside_project(self):
+        result = self.run_script("setup_env.py")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("[result] 检查通过", result.stdout)
+        self.assertIn(str(PROJECT_ROOT), result.stdout)
+
     def test_hardware_preflight_runs_outside_project_without_connecting(self):
         result = self.run_script("sim2real.py", "check")
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(Path(report["config"]), CONFIGS_DIR / "sim2real/runtime.toml")
+        self.assertEqual(Path(report["config"]), default_config())
         self.assertEqual(set(report["models"]), {"policy"})
         for model in report["models"].values():
             self.assertTrue(Path(model["path"]).is_relative_to(PROJECT_ROOT / "policies"))
@@ -87,6 +93,13 @@ assert not {'bpx_sdk', 'mujoco', 'isaaclab', 'onnxruntime', 'torch'} & sys.modul
         env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
         result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_visualize_entry_runs_outside_project_without_connecting(self):
+        result = self.run_script("visualize.py", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--demo", result.stdout)
+        self.assertIn("--no-policy", result.stdout)
+        self.assertIn("--recording", result.stdout)
 
 
 if __name__ == "__main__":

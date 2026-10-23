@@ -47,7 +47,8 @@ def load_samples(path):
                 if row.get("schema") != 1:
                     raise ValueError("不支持的录制 schema")
                 metadata = row
-            elif row.get("type") == "sample":
+            elif row.get("type") in ("sample", "command"):
+                # 实机发送日志也保存完整反馈，可直接分析与离线重新推理。
                 samples.append(Sample.from_dict(row["sample"]))
     if not samples:
         raise ValueError("录制中没有 sample")

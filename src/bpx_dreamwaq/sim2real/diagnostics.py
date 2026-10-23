@@ -14,6 +14,7 @@ from .calibration import Calibration
 from .config import vector
 from .safety import StateGuard, quaternion_xyzw
 from .state import Sample
+from .inference import validate_model, warmup_policy
 
 
 def rotation_to_rpy(rotation):
@@ -112,16 +113,9 @@ class PolicyPreview:
                 model = policy if policy is not None else OnnxPolicy(
                     config.model_path(), config.policy["observation_dimension"], 12
                 )
-                session = getattr(model, "session", None)
-                if session is not None:
-                    ins, outs = session.get_inputs(), session.get_outputs()
-                    if (
-                        len(ins) != 1
-                        or len(outs) != 1
-                        or ins[0].shape != [1, config.policy["observation_dimension"]]
-                        or outs[0].shape != [1, 12]
-                    ):
-                        raise ValueError("模型必须匹配配置的输入维度及 12 维输出")
+                validate_model(model, config)
+                if policy is None:
+                    warmup_policy(model, config)
                 self.policy = model
             except Exception as exc:
                 self.errors["policy"] = str(exc)

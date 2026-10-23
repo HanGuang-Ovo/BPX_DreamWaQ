@@ -1,0 +1,38 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "BPX: 只读启动前检查",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/visualize.py",
+      "python": "${env:HOME}/miniconda3/envs/bpx-real/bin/python",
+      "envFile": "${workspaceFolder}/.vscode/sim2real.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/bpx-real/lib",
+        "CONDA_PREFIX": "${env:HOME}/miniconda3/envs/bpx-real",
+        "CONDA_DEFAULT_ENV": "bpx-real"
+      },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "BPX: 只读界面 DEMO（不连接机器人）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/visualize.py",
+      "python": "${env:HOME}/miniconda3/envs/bpx-real/bin/python",
+      "envFile": "${workspaceFolder}/.vscode/sim2real.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/bpx-real/lib",
+        "CONDA_PREFIX": "${env:HOME}/miniconda3/envs/bpx-real",
+        "CONDA_DEFAULT_ENV": "bpx-real"
+      },
+      "args": ["--demo"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

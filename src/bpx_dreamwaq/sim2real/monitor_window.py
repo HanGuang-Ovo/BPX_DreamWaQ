@@ -12,6 +12,7 @@ import numpy as np
 from bpx_dreamwaq.runtime.joints import SDK_JOINT_NAMES
 from .monitor_worker import MonitorWorker
 from .monitor_geometry import leg_points
+from .monitor_checks import PreflightWorker, startup_rows
 
 
 class MonitorWindow:
@@ -60,6 +61,9 @@ class MonitorWindow:
         self.demo, self.recording, self.no_policy, self.output = demo, recording, no_policy, output
         self.gamepad_device, self.gamepad_index = gamepad_device, gamepad_index
         self.messages = queue.Queue(maxsize=8)
+        self.preflight_messages = queue.Queue(maxsize=1)
+        self.preflight_worker = None
+        self.preflight_report = None
         self.worker = None
         self.snapshot = None
         self.closing = False
@@ -77,7 +81,7 @@ class MonitorWindow:
         self.policy_status = tk.StringVar(value="模型尚未加载")
         self.attitude_text = tk.StringVar(value="等待有效四元数 xyzw…")
         self.warning = tk.StringVar(value="读取电脑手柄并自动选择预览模型；不发送速度、关节或起身命令。")
-        root.title("BPX · SDK 反馈与策略对齐")
+        root.title("BPX DreamWaQ · 只读启动前检查")
         width = min(3400, root.winfo_screenwidth() - 120)
         height = min(2000, root.winfo_screenheight() - 120)
         self.window_width = max(1180, width)
@@ -121,6 +125,7 @@ class MonitorWindow:
         self.change_font_size()
         root.bind("<Configure>", self.resize_window)
         root.after(50, self.pump)
+        root.after(100, self.check_configuration)
         if demo or recording:
             root.after(150, self.start)
 
@@ -132,7 +137,7 @@ class MonitorWindow:
         ttk, tk = self.ttk, self.tk
         header = ttk.Frame(self.root, padding=(22, 16))
         header.pack(fill="x")
-        self.label(header, "BPX / 参数对齐", font=self.title_font).pack(side="left")
+        self.label(header, "BPX / 启动前检查", font=self.title_font).pack(side="left")
         self.label(header, "READ ONLY · 不发送运动或标零命令", foreground=self.CYAN).pack(side="right")
         toolbar = ttk.Frame(self.root, padding=(22, 0, 22, 12))
         toolbar.pack(fill="x")
@@ -194,10 +199,13 @@ class MonitorWindow:
         self.footer_labels[0].pack(anchor="w")
         self.footer_labels[1].pack(anchor="w", pady=(3, 0))
         notebook = ttk.Notebook(self.root)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True, padx=22)
-        overview, parameters = ttk.Frame(notebook), ttk.Frame(notebook)
+        checks, overview, parameters = ttk.Frame(notebook), ttk.Frame(notebook), ttk.Frame(notebook)
+        notebook.add(checks, text="启动前检查")
         notebook.add(overview, text="实时反馈与姿态")
         notebook.add(parameters, text="官方定义 / 当前配置")
+        self._checks(checks)
         overview.columnconfigure(0, weight=7)
         overview.columnconfigure(1, weight=4)
         overview.rowconfigure(0, weight=1)
@@ -278,6 +286,58 @@ class MonitorWindow:
             wraplength=650,
         ).pack(anchor="w")
         self._parameters(parameters)
+
+    def _checks(self, parent):
+        ttk = self.ttk
+        header = ttk.Frame(parent, padding=12)
+        header.pack(fill="x")
+        self.check_button = ttk.Button(header, text="重新检查模型（不连接）", command=self.check_configuration)
+        self.check_button.pack(anchor="w")
+        self.label(header, "模型检查不连接 SDK；DEMO / 录制结果不表示已连接实机。",
+                   foreground=self.MUTED, wraplength=self.window_width - 80).pack(anchor="w", pady=8)
+        self.label(header, f"配置：{self.config.path}\n模型：{self.config.model_path()}",
+                   foreground=self.MUTED, wraplength=self.window_width - 80).pack(anchor="w")
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill="both", expand=True)
+        self.style.configure("Startup.Treeview", font=self.body_font)
+        self.check_table = ttk.Treeview(frame, columns=("item", "status", "detail"),
+                                       show="headings", height=9, style="Startup.Treeview")
+        for key, label, width in (("item", "检查项", 270), ("status", "当前结果", 350), ("detail", "说明", 1400)):
+            self.check_table.heading(key, text=label)
+            self.check_table.column(key, width=width, minwidth=width, anchor="w", stretch=key == "detail")
+        self.check_table.tag_configure("ok", foreground=self.CYAN)
+        self.check_table.tag_configure("pending", foreground=self.ORANGE)
+        for key, label, status, detail in startup_rows(self.config, no_policy=self.no_policy):
+            self.check_table.insert("", "end", iid=key, values=(label, status, detail))
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.check_table.yview)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.check_table.xview)
+        self.check_table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.check_table.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+
+    def check_configuration(self):
+        if self.closing or (self.preflight_worker and self.preflight_worker.is_alive()):
+            return
+        self.preflight_report = None
+        self.check_button.configure(state="disabled")
+        self.preflight_worker = PreflightWorker(self.config, self.preflight_messages, no_policy=self.no_policy)
+        self.preflight_worker.start()
+
+    def refresh_checks(self):
+        try:
+            self.preflight_report = self.preflight_messages.get_nowait()
+            self.check_button.configure(state="normal")
+        except queue.Empty:
+            pass
+        elapsed = max(0., time.monotonic() - self.snapshot["received_at"]) if self.snapshot else 0.
+        rows = startup_rows(self.config, self.snapshot, self.preflight_report,
+                            active=self.active, elapsed=elapsed, no_policy=self.no_policy)
+        for key, label, status, detail in rows:
+            tag = "ok" if status in ("通过", "有效", "已安装") else "pending"
+            self.check_table.item(key, values=(label, status, detail), tags=(tag,))
 
     def _parameters(self, parent):
         ttk = self.ttk
@@ -414,6 +474,12 @@ class MonitorWindow:
                     + 28
                 )
                 table.column(column, width=width, minwidth=width)
+        for key, samples in (
+            ("item", [self.check_table.item(row, "values")[0] for row in self.check_table.get_children()]),
+            ("status", ["未连接 / 会话结束", "DEMO · 模拟反馈"]),
+        ):
+            width = max(270 if key == "item" else 350, max(self.body_font.measure(s) for s in samples) + 28)
+            self.check_table.column(key, width=width, minwidth=width)
         self.resize_feedback_table()
         self.redraw()
 
@@ -491,12 +557,13 @@ class MonitorWindow:
         self.root.after(50, self._finish_close)
 
     def _finish_close(self):
-        if self.worker and self.worker.is_alive():
+        if any(worker and worker.is_alive() for worker in (self.worker, self.preflight_worker)):
             self.root.after(50, self._finish_close)
         else:
             self.root.destroy()
 
     def pump(self):
+        self.refresh_checks()
         refresh_needed = False
         try:
             # 一轮只取有界数量，只绘制最新帧。不能一边慢速绘图一边

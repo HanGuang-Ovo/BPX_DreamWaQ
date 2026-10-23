@@ -2,6 +2,61 @@
 
 日期：2026-10-20。所有测试在本机离线执行，未连接机器人。
 
+## sim2real 部署验证（2026-10-23）
+
+- 当前实机默认模型与 `configs/sim2sim/bpx_mixed.toml` 一致：
+  `policy_20261023_iter2250_stable.onnx`；SHA256 为
+  `fd3ee9395d99653fddd3891c81f447c3473dd3c04cc6e7eb0e4b9b23150407c4`。
+- `bpx-real` 环境中的 `check` 和默认 `run` 离线预检均返回 `ready: true`，
+  确认 float32 `[1,450] → [1,12]`、名义站姿有限输出及 SDK / ONNX 依赖。
+  从 `/tmp` 调用和 `--policy` 替换模型也通过验证。
+- sim2real 80 项、sim2sim 42 项、project 9 项全部通过，共 131 项。
+  当前实机模型的试推理和完整控制流程测试均实际执行，无模型相关跳过。
+- 使用当前 ONNX 模型、模拟 SDK 反馈与时钟，完成 9 秒 / 900 次发送的
+  `waiting_init → init → stand → walk → stopping → stand` 流程；
+  不提供真实线速度或里程计高度，全部关节目标保持有限。
+- 新增回归覆盖模型接口 / dtype / 非有限输出、连接前预热、预热历史隔离、
+  发送耗时波动时的策略调度、实机日志分析与回放、手柄输入保存和配置覆盖。
+- 本轮未创建真实 SDK 连接，未执行实机运动；上述结论仅验证软件部署链路。
+
+复现命令：
+
+```bash
+~/miniconda3/envs/bpx-real/bin/python scripts/sim2real.py check
+PYTHONPATH=src ~/miniconda3/envs/bpx-real/bin/python -m unittest discover -s tests/sim2real -v
+PYTHONPATH=src ~/miniconda3/envs/bpx-sim2sim/bin/python -m unittest discover -s tests/sim2sim -v
+PYTHONPATH=src ~/miniconda3/envs/bpx-sim2sim/bin/python -m unittest discover -s tests/project -v
+```
+
+## 只读可视化启动检查（2026-10-23）
+
+- 保留原界面的关节表、骨架、曲线和参数对照，新增 `scripts/visualize.py`
+  对应入口、VS Code 启动配置，以及独立“启动前检查”页。
+- 在 `bpx-real` 桌面环境中，sim2real 的 80 项测试（含 2 项真实 Tk 窗口测试）
+  和 project 的 9 项测试全部通过；无桌面环境中 2 项 Tk 测试按预期跳过。
+- 实际创建 Tk 窗口验证三页、12 行反馈、ONNX 预览、禁用模型模式、无回调异常、
+  线程退出，并截取三页 DEMO 图片逐页检查。全程禁止创建 SDK 连接对象。
+- 新增状态回归覆盖 DEMO 来源、过期 / 结束会话、关节与 IMU 独立新鲜度、
+  缺失数据、有效零手柄输入、模型失败和后台错误回传。
+- 图形界面测试需可用桌面：
+
+```bash
+PYTHONPATH=src ~/miniconda3/envs/bpx-real/bin/python -m unittest discover \
+    -s tests/sim2real -p test_monitor_gui.py -v
+```
+
+窗口截图与使用流程见 [只读窗口说明](SIM2REAL_WINDOW.md)。
+
+## 一键环境检查（2026-10-23）
+
+- 新增 `scripts/setup_env.py`：当前解释器与资源检查、`--install` 可编辑安装、
+  `--tests` 离线测试、`--train-check` 训练栈检查、`--all-envs` 环境探测和 `--json`。
+- 在 `bpx-sim2sim`、`bpx-real` 与 `isaaclab` 下实际执行默认检查均通过；
+  `--tests` 运行 project 9 项、sim2sim 42 项、sim2real 80 项（training 按环境
+  跳过或以 `training_python.sh` 另行运行）；`--train-check` 返回
+  `bpx_training_ready: true`。
+- `tests/project` 新增入口回归：从工程外调用 `setup_env.py` 返回 0 且报告通过。
+
 ## 资源与项目边界
 
 - 29 个模型、网格、许可证和说明文件与 BPX_test 原文件的 SHA-256 一致。

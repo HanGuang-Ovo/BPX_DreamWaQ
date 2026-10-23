@@ -37,10 +37,13 @@ scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 �
 6. `sim2real/sdk_robot.py`：唯一直接持有 SDK 对象的适配层。
 7. `sim2real/diagnostics.py`、`monitor_worker.py`：离线诊断和只读采样线程。
 8. `sim2real/monitor.py`、`monitor_window.py`、`monitor_geometry.py`：窗口入口、布局刷新和骨架几何。
+9. `sim2real/preflight.py`、`monitor_checks.py`：CLI / 窗口共用的软件预检、后台模型检查与实时检查状态。
 
 ## 当前部署契约
 
-- 仅一个策略模型：默认 `policies/policy.onnx`，站立、行走和减速共用模型及连续历史。
+- 仅一个策略模型：站立、行走和减速共用模型及连续历史。实机当前与
+  `bpx_mixed.toml` 共用 `policies/policy_20261023_iter2250_stable.onnx`，
+  可通过 `--policy` 覆盖；通用导出入口仍默认输出 `policies/policy.onnx`。
 - 起身由足端轨迹 + PD 执行，等待起身时保持初始姿态，不使用独立策略权重。
 - 12 维动作；`q_target = q_default + 0.5 × action`。
 - 默认角按策略顺序为 roll=0、pitch=0.7、knee=-1.4。
@@ -63,6 +66,8 @@ scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 �
 
 ## 后续扩展位置
 
-训练任务在 `tasks/` 添加，算法在 `algorithms/` 添加。奖励和课程当前没有实现，
-因此不提供训练入口或 Gym 环境注册。接入 Isaac Lab 时先生成 USD，
-再明确 DreamWaQ 观测、估计器、隐变量及导出契约，最后添加训练配置。
+训练任务在 `tasks/` 添加，算法实验在 `algorithms/` 添加。奖励、课程、训练入口与
+Gym 环境注册已实现；新增奖励/课程时按现有 `RewardsCfg`、`CurriculumCfg` 接线，
+并同步更新 `tests/training` 的离线测试。环境验证与安装入口为
+`scripts/setup_env.py`，它只检查资源和 pip extras，不安装 Isaac Lab、Isaac Sim
+或机器人 SDK。

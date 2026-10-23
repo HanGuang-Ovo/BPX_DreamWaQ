@@ -4,23 +4,19 @@ import argparse
 from contextlib import ExitStack
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import sys
 import time
 
-from bpx_dreamwaq.runtime.joints import SDK_JOINT_NAMES
+from bpx_dreamwaq.paths import OUTPUTS_DIR
 from bpx_dreamwaq.runtime.gamepad import GamepadCommandSource, select_gamepad, BTN_TL, BTN_TR
-from bpx_dreamwaq.paths import CONFIGS_DIR, OUTPUTS_DIR
-from .config import load_config, positive
+from .config import default_config, load_config, positive
+from .preflight import check
 from .recording import JsonlWriter, load_samples, summarize
 from .runner import replay, run_live
 from .sdk_robot import SDKSource
 from .safety import require_ready
-
-DEFAULT_CONFIG = CONFIGS_DIR / "sim2real/runtime.toml"
 
 
 def write_json(path, data):
@@ -29,37 +25,6 @@ def write_json(path, data):
     with path.open("x", encoding="utf-8") as stream:
         json.dump(data, stream, ensure_ascii=False, allow_nan=False, indent=2)
         stream.write("\n")
-
-
-def check(config):
-    p = config.model_path()
-    models = {"policy": {
-        "path": str(p),
-        "exists": p.is_file(),
-        "sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
-    }}
-    dependencies = {name: importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime", "bpx_sdk")}
-    return {
-        "config": str(config.path),
-        "calibration": str(config.calibration_path),
-        "dependencies": dependencies,
-        "models": models,
-        "observe_blockers": [] if dependencies["bpx_sdk"] else ["当前 Python 未安装 bpx_sdk"],
-        "replay_blockers": [] if dependencies["onnxruntime"] else ["当前 Python 未安装 onnxruntime"],
-        "deploy_blockers": config.blockers("deploy"),
-        "mapping": [
-            {
-                "policy_index": i,
-                "name": j.name,
-                "sdk_index": j.sdk_index,
-                "sdk_documented_name": SDK_JOINT_NAMES[j.sdk_index],
-                "sign": j.sign,
-                "offset": j.offset,
-                "alignment_verified": config.alignment_verified,
-            }
-            for i, j in enumerate(config.joints)
-        ],
-    }
 
 
 def capture(config, output, duration, poll_hz, *, source_factory=SDKSource):
@@ -108,7 +73,8 @@ def capture(config, output, duration, poll_hz, *, source_factory=SDKSource):
 
 def parser():
     p = argparse.ArgumentParser(description="BPX 分阶段 sim2real 工具")
-    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    p.add_argument("--config", type=Path, default=default_config())
+    p.add_argument("--policy", type=Path, help="覆盖 ONNX 模型，路径相对于当前目录")
     sub = p.add_subparsers(dest="command", required=True)
     monitor = sub.add_parser("monitor", help="只读反馈、策略预览与三维姿态窗口")
     monitor.add_argument("--demo", action="store_true", help="模拟反馈，不连接 SDK")
@@ -153,7 +119,7 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, policy_path=args.policy)
         if args.command == "monitor":
             from .monitor import launch, list_gamepads
 
@@ -185,9 +151,11 @@ def main(argv=None):
             result = {"policy_steps": count, "output": str(args.output), "mode": "offline"}
         elif args.command == "run":
             if not args.live:
+                report = check(config)
                 result = {
+                    **report,
                     "mode": "preflight",
-                    "blockers": config.blockers("deploy"),
+                    "blockers": report["deploy_blockers"],
                     "note": "未创建 SDK 对象；--live 才进入关节控制；仅检查有限数与四元数模长，退出尝试阻尼",
                 }
             else:
@@ -217,7 +185,7 @@ def main(argv=None):
                 result = {"policy_steps": count, "output": str(args.output)}
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
         return 0
-    except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError, FloatingPointError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

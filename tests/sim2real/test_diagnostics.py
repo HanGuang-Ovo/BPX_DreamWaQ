@@ -136,8 +136,8 @@ class TestDiagnostics(unittest.TestCase):
             with self.subTest(controller=factory.__name__):
                 policy = self.policy()
                 policy.session = Mock()
-                policy.session.get_inputs.return_value = [Mock(shape=[1, 450])]
-                policy.session.get_outputs.return_value = [Mock(shape=[1, 12])]
+                policy.session.get_inputs.return_value = [Mock(shape=[1, 450], type="tensor(float)")]
+                policy.session.get_outputs.return_value = [Mock(shape=[1, 12], type="tensor(float)")]
                 with patch(f"bpx_dreamwaq.sim2real.{module}.OnnxPolicy", return_value=policy) as loader:
                     instance = factory(self.cfg)
                     for tick in range(20):
@@ -149,7 +149,7 @@ class TestDiagnostics(unittest.TestCase):
                         else:
                             instance.step(sample)
                     loader.assert_called_once_with(self.cfg.model_path(), 450, 12)
-                    self.assertEqual(policy.call_count, 20)
+                    self.assertEqual(policy.call_count, 21)  # 独立预热一次，再处理 20 帧反馈
 
     def test_no_input_unsupported_motion_and_stale_motion_never_fabricate_policy(self):
         for fields in (
@@ -231,6 +231,7 @@ class TestDiagnostics(unittest.TestCase):
         for name in ("status", "freshness", "root", "policy_status"):
             setattr(window, name, Mock())
         window.update_snapshot = Mock()
+        window.refresh_checks = Mock()
         window.refresh_table = Mock()
         window.draw_robot = Mock()
         window.pump()

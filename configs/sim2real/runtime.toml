@@ -10,7 +10,9 @@ state_rate_hz = 100
 connect_timeout_s = 5.0
 
 [policy]
-model = "../../policies/policy.onnx"
+# 与 configs/sim2sim/bpx_mixed.toml 使用同一份融合 CENet + Actor 模型。
+# 新训练导出后可改此路径，或通过入口的 --policy 临时指定。
+model = "../../policies/policy_20261023_iter2250_stable.onnx"
 history_length = 10
 include_base_lin_vel = false
 observation_dimension = 450

@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from .config import load_config, positive
+from .config import default_config, load_config, positive
 from .monitor_window import MonitorWindow
 from .monitor_worker import MonitorWorker
 from .monitor_geometry import leg_points
@@ -56,11 +56,9 @@ def launch(
 
 
 def main(argv=None):
-    from .cli import DEFAULT_CONFIG
-
-    local = DEFAULT_CONFIG.with_name("local.runtime.toml")
     parser = argparse.ArgumentParser(description="BPX 只读反馈、策略输出与姿态对齐窗口")
-    parser.add_argument("--config", type=Path, default=local if local.exists() else DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, default=default_config())
+    parser.add_argument("--policy", type=Path, help="覆盖 ONNX 模型，路径相对于当前目录")
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--recording", type=Path)
     parser.add_argument("--no-policy", action="store_true")
@@ -72,7 +70,7 @@ def main(argv=None):
         if args.list_gamepads:
             return list_gamepads()
         return launch(
-            load_config(args.config),
+            load_config(args.config, policy_path=args.policy),
             demo=args.demo,
             recording=args.recording,
             no_policy=args.no_policy,

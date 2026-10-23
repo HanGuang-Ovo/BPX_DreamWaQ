@@ -8,25 +8,24 @@ from bpx_dreamwaq.runtime.policy import OnnxPolicy
 from bpx_dreamwaq.runtime.transition import ActionBlender
 from bpx_dreamwaq.runtime.routing import PolicyRouter
 from .calibration import Calibration
+from .inference import validate_model, warmup_policy
 
 
 class ActorController:
     def __init__(self, config, *, policy=None):
         self.config = config
         self.calibration = Calibration(config)
-        self.policy = policy if policy is not None else OnnxPolicy(
-            config.model_path(), config.policy["observation_dimension"], 12
-        )
-        session = getattr(self.policy, "session", None)
-        if session is not None:
-            inputs, outputs = session.get_inputs(), session.get_outputs()
-            if (
-                len(inputs) != 1
-                or len(outputs) != 1
-                or inputs[0].shape != [1, config.policy["observation_dimension"]]
-                or outputs[0].shape != [1, 12]
-            ):
-                raise ValueError("模型的输入输出尺寸不符合实机配置")
+        # 首次推理及模型错误均在创建 SDK / 接管关节之前处理。
+        self.model_info = None
+        if policy is None:
+            try:
+                self.policy = OnnxPolicy(config.model_path(), config.policy["observation_dimension"], 12)
+                self.model_info = warmup_policy(self.policy, config)
+            except Exception as exc:
+                raise RuntimeError(f"部署模型加载或预热失败：{exc}") from exc
+        else:
+            self.policy = policy
+            validate_model(self.policy, config)
         settings = config.policy
         self.history = ObservationHistory(
             settings["history_length"], include_base_lin_vel=settings["include_base_lin_vel"]

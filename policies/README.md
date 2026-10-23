@@ -17,6 +17,10 @@ python scripts/sim2sim.py --backend torchscript --policy policies/policy.pt --vi
 
 MuJoCo 默认使用 `zero` 后端，不读取权重。实机和只读监控使用 ONNX，
 在 `configs/sim2real/runtime.toml` 的 `[policy].model` 配置同一个模型路径。
+当前实机默认与 `configs/sim2sim/bpx_mixed.toml` 共用
+`policy_20261023_iter2250_stable.onnx`。模型文件不纳入 Git，复制工程到新机器时
+需同时提供该权重。实机控制和监控入口也可通过 `--policy policies/other.onnx`
+临时覆盖；统一 CLI 将该参数放在 `check`、`run` 等子命令之前。
 不再提供独立的 stand、walk、init 策略路径和命令行参数；旧本机配置需改用上述统一键。
 
 ## DreamWaQ 导出契约（已实现）
