@@ -37,6 +37,24 @@ flat_orientation_l2 = _lab_mdp.flat_orientation_l2
 joint_pos_limits = _lab_mdp.joint_pos_limits
 
 
+def joint_power(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Sum absolute mechanical joint power (W); braking cannot cancel motoring."""
+    data = env.scene[asset_cfg.name].data
+    power = data.applied_torque[:, asset_cfg.joint_ids] * data.joint_vel[:, asset_cfg.joint_ids]
+    return power.abs().sum(dim=-1)
+
+
+def power_distribution(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """DreamWaQ Table I: square of population variance of signed motor power.
+
+    This follows the displayed var(tau * qdot)^2 formula literally, rather than
+    variance of absolute power or mean squared power. Units are W^4.
+    """
+    data = env.scene[asset_cfg.name].data
+    power = data.applied_torque[:, asset_cfg.joint_ids] * data.joint_vel[:, asset_cfg.joint_ids]
+    return power.var(dim=-1, unbiased=False).square()
+
+
 def _standing_command_mask(command: torch.Tensor, command_threshold: float) -> torch.Tensor:
     """三轴指令绝对值都小于门限的环境掩码；参数非法时抛 ``ValueError``。"""
     if not math.isfinite(command_threshold) or command_threshold <= 0:

@@ -86,6 +86,9 @@ def main():
     agent_cfg = _load_class(agent_cfg_entry)()
 
     # ---- 命令行覆盖 ----
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+        agent_cfg.device = args_cli.device
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.num_terrain_levels is not None:

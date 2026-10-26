@@ -212,7 +212,7 @@ CENet 共享编码器 ──► 速度估计头 ──► vel_hat (3)          �
         └──────────────► VAE 头 ──► μ (16, 确定性) ──────┘
                              └──► z (采样) ──► Decoder ──► 预测下一时刻 45 维观测
 
-Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 23] = 71 维
+Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 187] = 235 维
 辅助损失: L_CE = λ_vel·MSE(vel_hat, 真实线速度) + λ_pred·MSE(ô_{t+1}, o_{t+1}) + β·KL
 ```
 
@@ -628,7 +628,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | 策略频率 | 50 Hz（200 Hz 物理 × decimation 4） | 50 Hz 策略 / 100 Hz 发送 |
 | 单帧观测 | 45 维：角速度 3、投影重力 3、指令 3、相对关节角 12、关节速度 12、上一步动作 12 | 同左 |
 | 历史观测 | H=10，term-major、项内旧→新，共 450 维 | 同左 |
-| Critic 观测 | 71 维：真实线速度 3 + 45 维单帧 + 高度扫描 23 | 不使用 |
+| Critic 观测 | 235 维：真实线速度 3 + 45 维单帧 + 高度扫描 187 | 不使用 |
 | 动作 | 12 维关节位置目标，`q = q_default + 0.5 × a` | 同左 |
 | 关节顺序 | FL/FR/HL/HR roll → pitch → knee | 同左；SDK 通道 `[0,3,6,9,1,4,7,10,2,5,8,11]` |
 | 默认角 | 每腿 `[0, 0.7, -1.4]` rad | 同左 |
@@ -645,7 +645,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 - **VAE 头**：`[128] → μ/σ (16)`；训练时采样 `z` 送入 Decoder，Actor 使用 μ。
 - **Decoder**：`[128, 128] → 45`，预测下一时刻单帧观测。
 - **Actor**：`[45 + 3 + 16 = 64] → [512, 256, 128] → 12`。
-- **Critic**：71 维特权观测 → `[512, 256, 128] → 1`。
+- **Critic**：235 维特权观测 → `[512, 256, 128] → 1`。
 - **PPO**：lr 1e-3（自适应 KL 0.01）、γ 0.99、λ 0.95、clip 0.2、熵系数 0.01；
   每迭代 24 步 × 5 epoch × 4 minibatch；`max_iterations=1500`，
   `save_interval=50`。
@@ -711,10 +711,14 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 
 | 事件 | 模式 | 参数 |
 | --- | --- | --- |
-| 物理材质 | startup | 静摩擦 0.8、动摩擦 0.6、恢复系数 0、64 桶随机 |
-| 机身质量 | startup | torso 加 −1.0～+3.0 kg |
+| 物理材质 | startup | 静/动摩擦 [0.2, 1.25]，动摩擦不超过静摩擦；恢复系数 0、64 桶随机 |
+| 机身质量 | startup | torso 加 −1.0～+2.0 kg |
 | 初始位姿 | reset | x/y ∈ ±0.5 m，yaw ∈ ±π，初速度为零 |
 | 关节复位 | reset | 位置比例 1.0，速度 0 |
+| 质心 | startup | torso 的 x/y/z 各 ±0.05 m |
+| PD 增益 / 电机强度 | actuator reset | 每环境、每关节独立乘 [0.9, 1.1]；从名义值采样，不累乘 |
+| 执行器延迟 | actuator reset | 每环境独立抽取 0–3 个物理步，即 0/5/10/15 ms |
+| 本体测量噪声 | 每次观测 | 均匀噪声：角速度 ±0.2 rad/s、重力 ±0.05、关节角 ±0.01 rad、关节速度 ±1.5 rad/s |
 | 外力推挤 | interval 10–15 s | x/y 速度 ±0.5 m/s |
 
 **终止条件**（`TerminationsCfg`）
@@ -752,6 +756,8 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | `joint_pos_limits` | −0.2 | 内置 | 关节位置越界 |
 | `dof_torques_l2` | −1.0e-4 | 内置 | 关节力矩平方和 |
 | `dof_acc_l2` | −2.5e-7 | 本工程 | 关节加速度平方和；单环境上限 1e8，异常加速度按上限计 |
+| `joint_power` | −2e−5 | 本工程 | `sum(abs(applied_torque * joint_vel))`，正负功率不抵消 |
+| `power_distribution` | −1e−5 | 本工程 | 按论文表 I 的字面公式：有符号功率的总体方差再平方，`Var(τ·q̇)²`，不是绝对功率方差 |
 | `action_rate_l2` | −0.01 | 内置 | 一阶动作变化率 |
 | `action_smoothness_l2` | −0.01 | 本工程 | 二阶动作差分 `sum((a_t − 2a_{t−1} + a_{t−2})²)` |
 
@@ -761,7 +767,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | --- | --- | --- | --- |
 | `feet_air_time` | +0.1 | 本工程 | 触地瞬间，滞空时间超过 0.3 s 的部分给予奖励；平移或 yaw 指令超过 0.05 / 0.1 时启用 |
 | `feet_air_time_excess` | −1.0 | 本工程 | 单脚连续悬空超过 0.6 s 后线性惩罚，每脚上限 1 |
-| `feet_contact_balance` | −0.5 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
+| `feet_contact_balance` | −1.0 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
 | `feet_clearance` | −0.01 | 本工程 | `toe_link` 距局部地面 0.10 m 的误差平方 × 足端水平速度 |
 | `feet_lateral_distance` | −0.3 | 本工程 | 左右足横向间距不足 0.26 m 的归一化缺口平方 |
 | `feet_longitudinal_distance` | −0.3 | 本工程 | 同侧前后足纵向间距不足 0.30 m 的归一化缺口平方 |
@@ -858,12 +864,19 @@ PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
    Decoder 预测下一时刻观测）与论文一致。
 2. **隐变量送入 Actor**：论文未说明用 μ 还是采样 z；本实现默认确定性 μ
    （保证 PPO 概率比一致性），可配置 `"sample"`。
-3. **梯度连接**：论文未说明 PPO 梯度是否回传 CENet；默认 detach，可配置。
+3. **梯度连接**：默认 PPO 不回传 CENet。`algorithm.ppo_grad_to_cenet=True`
+   是更新阶段的控制开关，开启后重算特征并保留 rollout 的 AdaBoot 分支；
+   此模式要求 `latent_actor_mode="mean"`，不支持随机 latent 重采样。
 4. **损失权重**：论文未给出 λ_vel/λ_pred/β 数值；默认 1.0/1.0/1e-3。
-5. **观测归一化**：论文 VAE 先验依赖零均值单位方差输入；本工程部署契约无
-   观测归一化器，故 `empirical_normalization=False`（记录为差异）。
+5. **观测归一化**：默认 `empirical_normalization=True`。每轮优化结束后，用整轮采样的
+   本体末帧和特权观测更新统计，供下一轮使用；采样与 PPO 更新期间冻结。
+   第一轮使用单位变换，避免只用 reset 状态初始化统计。
+   单帧、历史各帧、下一帧预测目标共用本体统计，速度监督保留 m/s。
+   标准差下限为 0.01，避免常量观测产生除零。统计保存在模型内并随 ONNX /
+   TorchScript 导出，部署继续输入原始 450 维历史，无需外部归一化。
 6. **AdaBoot**：论文按回合奖励变异系数 p = 1 − tanh(CV(R))；本实现默认采用
    该公式，并提供按速度估计误差过渡的 `error` 模式与 `linear` 线性爬升模式。
+   回合奖励统计独立于日志目录；初始及无有效 CV 时使用 `p_min`（默认 0）。
 7. **Critic 特权信息**：论文含随机扰动力 d_t；本实现 Critic 为真实线速度 +
    单帧观测 + 高度扫描（扰动只有 push 事件，未把扰动力显式入观测）。
 8. **地形课程**：DreamWaQ 使用游戏式课程规则（走半块升级/不足预期半程降级），
@@ -916,3 +929,17 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 8. [策略文件说明](policies/README.md)——导出契约与模型放置
 
 模型许可证见 [assets/robots/bpx/LICENSE](assets/robots/bpx/LICENSE)。
+
+### 6.7 归一化与随机化升级后的训练 / 导出
+
+训练使用显式延迟 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），以便在物理步
+级别施加延迟和电机强度变化。PLAY 配置关闭新增随机化与噪声。Runner 从
+历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
+Critic 保留无噪声特权观测。
+
+新模型的归一化统计随 checkpoint 恢复和导出。旧 checkpoint 仍可按原始未
+归一化方式导出；继续旧训练需匹配旧配置（包括关闭经验归一化），不要把旧权重
+直接视为已适配新的归一化、奖励和显式执行器。建议为此配置开启新的训练运行。
+
+功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
+与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。

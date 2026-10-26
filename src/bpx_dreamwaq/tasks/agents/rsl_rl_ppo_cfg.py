@@ -87,7 +87,7 @@ class BPXDreamWaQPPORunnerCfg:
     device: str = "cuda:0"
     num_steps_per_env: int = 24
     max_iterations: int = 1500
-    empirical_normalization: bool = False
+    empirical_normalization: bool = True
     policy: DreamWaQActorCriticCfg = DreamWaQActorCriticCfg()
     algorithm: DreamWaQPpoAlgorithmCfg = DreamWaQPpoAlgorithmCfg()
     clip_actions: float | None = None

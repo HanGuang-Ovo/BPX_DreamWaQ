@@ -260,6 +260,7 @@ class TestRunnerFiniteGuard(unittest.TestCase):
         runner.env.step = Mock(return_value=(obs, torch.tensor([1., float("-inf")]),
                                              torch.tensor([0, 1]), extras))
         runner.alg = Mock()
+        runner.alg.policy = make_policy()
         runner.alg.act.return_value = torch.zeros(2, 12)
         with self.assertRaisesRegex(FloatingPointError, "iteration 718"):
             runner.learn(1)

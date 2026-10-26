@@ -28,6 +28,8 @@ from rsl_rl.modules import ActorCritic
 
 from ..obs_contract import DEFAULT_HISTORY_LENGTH, history_obs_dim, newest_frame_slices, single_obs_dim
 from .cenet import CENet
+from .normalization import ObservationNormalizer
+from ..obs_contract import POLICY_OBS_TERM_WIDTHS
 
 
 class DreamWaQActorCritic(ActorCritic):
@@ -49,6 +51,7 @@ class DreamWaQActorCritic(ActorCritic):
         cenet_activation: str = "elu",
         # ---- 梯度与特征策略 ----
         detach_cenet_from_actor: bool = True,
+        observation_normalization: bool = False,
         latent_actor_mode: str = "mean",  # "mean" | "sample"
         # ---- 基类参数 ----
         actor_hidden_dims=(512, 256, 128),
@@ -83,6 +86,10 @@ class DreamWaQActorCritic(ActorCritic):
             **kwargs,
         )
 
+        self.observation_normalization = observation_normalization
+        self.obs_normalizer = ObservationNormalizer(num_actor_obs) if observation_normalization else nn.Identity()
+        self.critic_normalizer = ObservationNormalizer(num_critic_obs) if observation_normalization else nn.Identity()
+        self._frame_slices = newest_frame_slices(history_length)
         self.cenet = CENet(
             num_history_obs=self.num_history_obs,
             num_next_obs=self.num_next_obs,
@@ -102,6 +109,28 @@ class DreamWaQActorCritic(ActorCritic):
     CENet 特征接口
     """
 
+    def current_frame(self, history_obs: torch.Tensor) -> torch.Tensor:
+        return torch.cat([history_obs[..., a:b] for a, b in self._frame_slices], dim=-1)
+
+    def history_frames(self, history_obs: torch.Tensor) -> torch.Tensor:
+        blocks = torch.split(history_obs, [w * self.history_length for w in POLICY_OBS_TERM_WIDTHS], dim=-1)
+        return torch.cat([b.reshape(-1, self.history_length, w) for b, w in zip(blocks, POLICY_OBS_TERM_WIDTHS)], dim=-1)
+
+    def normalize_history(self, history_obs: torch.Tensor) -> torch.Tensor:
+        if not self.observation_normalization:
+            return history_obs
+        frames = self.obs_normalizer(self.history_frames(history_obs))
+        return torch.cat([b.flatten(1) for b in torch.split(frames, POLICY_OBS_TERM_WIDTHS, dim=-1)], dim=-1)
+
+    @torch.no_grad()
+    def update_normalization(self, history_obs: torch.Tensor, critic_obs: torch.Tensor):
+        if self.observation_normalization:
+            self.obs_normalizer.update(self.current_frame(history_obs))
+            self.critic_normalizer.update(critic_obs)
+
+    def evaluate(self, critic_observations, **kwargs):
+        return super().evaluate(self.critic_normalizer(critic_observations), **kwargs)
+
     @torch.no_grad()
     def encode_cenet(self, history_obs: torch.Tensor) -> torch.Tensor:
         """从历史观测计算送入 Actor 的特征 ``[vel_hat, latent]``。
@@ -113,6 +142,7 @@ class DreamWaQActorCritic(ActorCritic):
             raise ValueError(
                 f"历史观测维度 {history_obs.shape[-1]} 与网络配置 {self.num_history_obs} 不一致"
             )
+        history_obs = self.normalize_history(history_obs)
         if self.latent_actor_mode == "mean":
             vel_hat, latent = self.cenet.deterministic_latent(history_obs)
         else:
@@ -122,11 +152,11 @@ class DreamWaQActorCritic(ActorCritic):
         self._cenet_features = torch.cat([vel_hat, latent], dim=-1)
         return self._cenet_features
 
-    def set_cenet_features(self, cenet_features: torch.Tensor):
+    def set_cenet_features(self, cenet_features: torch.Tensor, *, detach: bool = True):
         """直接设置 Actor 使用的 CENet 特征（更新阶段复用 rollout 保存值）。"""
         if cenet_features.shape[-1] != self.cenet_vel_dim + self.cenet_latent_dim:
             raise ValueError("cenet_features 维度与 vel_dim + latent_dim 不一致")
-        self._cenet_features = cenet_features.detach()
+        self._cenet_features = cenet_features.detach() if detach else cenet_features
 
     """
     Actor-Critic 接口（覆盖 rsl_rl.ActorCritic）
@@ -138,7 +168,7 @@ class DreamWaQActorCritic(ActorCritic):
                 "必须在调用 act/update_distribution 前设置 CENet 特征"
                 "（调用 encode_cenet 或 set_cenet_features）"
             )
-        return torch.cat([observations, self._cenet_features], dim=-1)
+        return torch.cat([self.obs_normalizer(observations), self._cenet_features], dim=-1)
 
     def update_distribution(self, observations):
         mean = self.actor(self._actor_input(observations))
@@ -190,7 +220,7 @@ class DeployableDreamWaQPolicy(nn.Module):
         return torch.cat(frames, dim=-1)
 
     def forward(self, history_obs: torch.Tensor) -> torch.Tensor:
-        current_obs = self.extract_current_frame(history_obs)
-        vel_hat, latent = self.policy.cenet.deterministic_latent(history_obs)
+        current_obs = self.policy.obs_normalizer(self.extract_current_frame(history_obs))
+        vel_hat, latent = self.policy.cenet.deterministic_latent(self.policy.normalize_history(history_obs))
         actor_input = torch.cat([current_obs, vel_hat, latent], dim=-1)
         return self.policy.actor(actor_input)

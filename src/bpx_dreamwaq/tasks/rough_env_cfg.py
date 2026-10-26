@@ -8,11 +8,11 @@
 - ``prop_history`` 组：同样 6 项观测，组级 ``history_length=10``、
   ``flatten_history_dim=True``，输出 450 维 term-major（项内从最旧到最新）
   历史观测，供 CENet 编码；与部署端 ``ObservationHistory`` 布局一致。
-- ``critic`` 组（特权）：[真实机体线速度 3, 45 维单帧观测, 高度扫描 23]，
-  共 71 维。真实速度位于前 3 维（``true_vel_slice=(0, 3)``）。
+- ``critic`` 组（特权）：[真实机体线速度 3, 45 维单帧观测, 高度扫描 187]，
+  共 235 维。真实速度位于前 3 维（``true_vel_slice=(0, 3)``）。
 
 动作与控制契约与部署一致：12 维动作，``q_target = q_default + 0.5 × a``，
-隐式 PD（stiffness 40，damping 1），200 Hz 物理步（dt=0.005）× 4 分频 =
+显式延迟 PD（名义 stiffness 40，damping 1），200 Hz 物理步（dt=0.005）× 4 分频 =
 50 Hz 策略频率。
 
 课程开关（模块 A / 模块 B，可独立启停）：
@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from .actuators import RandomizedDelayedPDActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -44,6 +44,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as UniformNoise
 
 import isaaclab.envs.mdp as lab_mdp
 
@@ -108,9 +109,12 @@ BPX_USD_CFG = ArticulationCfg(
         joint_pos=dict(_BPX_JOINT_PATTERNS),
     ),
     actuators={
-        "legs": ImplicitActuatorCfg(
+        "legs": RandomizedDelayedPDActuatorCfg(
             joint_names_expr=[".*_hip_roll_joint", ".*_hip_pitch_joint", ".*_knee_joint"],
+            effort_limit=30.0,
             effort_limit_sim=30.0,
+            min_delay=0,
+            max_delay=3,  # 0–15 ms at 200 Hz; resampled per environment reset.
             velocity_limit_sim=20.0,
             stiffness=40.0,
             damping=1.0,
@@ -270,17 +274,18 @@ class ObservationsCfg:
         与部署端 ObservationHistory 完全一致；reset 后首帧填满窗口。
         """
 
-        base_ang_vel = ObsTerm(func=lab_mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=lab_mdp.projected_gravity)
+        base_ang_vel = ObsTerm(func=lab_mdp.base_ang_vel, noise=UniformNoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(func=lab_mdp.projected_gravity, noise=UniformNoise(n_min=-0.05, n_max=0.05))
         velocity_commands = ObsTerm(func=lab_mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg(
+        joint_pos = ObsTerm(func=lab_mdp.joint_pos_rel, noise=UniformNoise(n_min=-0.01, n_max=0.01), params={"asset_cfg": SceneEntityCfg(
             "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
-        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg(
+        joint_vel = ObsTerm(func=lab_mdp.joint_vel_rel, noise=UniformNoise(n_min=-1.5, n_max=1.5), params={"asset_cfg": SceneEntityCfg(
             "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)})
         actions = ObsTerm(func=lab_mdp.last_action)
 
         def __post_init__(self):
             self.concatenate_terms = True
+            self.enable_corruption = True
             self.history_length = DEFAULT_HISTORY_LENGTH
             self.flatten_history_dim = True
 
@@ -320,8 +325,9 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8),
-            "dynamic_friction_range": (0.6, 0.6),
+            "static_friction_range": (0.2, 1.25),
+            "dynamic_friction_range": (0.2, 1.25),
+            "make_consistent": True,
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -331,8 +337,16 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="torso"),
-            "mass_distribution_params": (-1.0, 3.0),
+            "mass_distribution_params": (-1.0, 2.0),
             "operation": "add",
+        },
+    )
+    base_com = EventTerm(
+        func=lab_mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso"),
+            "com_range": {axis: (-0.05, 0.05) for axis in ("x", "y", "z")},
         },
     )
     reset_base = EventTerm(
@@ -414,7 +428,16 @@ class RewardsCfg:
             "target_height": 0.42,
         },
     )
-    '''关节力矩惩罚'''
+    # 机械功率总量与电机功率分布（DreamWaQ Table I）。
+    joint_power = RewTerm(
+        func=bpx_rewards.joint_power, weight=-2.0e-5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
+    )
+    power_distribution = RewTerm(
+        func=bpx_rewards.power_distribution, weight=-1.0e-5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
+    )
+    # 保留原有力矩平方正则。
     dof_torques_l2 = RewTerm(
         func=lab_mdp.joint_torques_l2,
         weight=-1.0e-4
@@ -494,9 +517,10 @@ class RewardsCfg:
             "penalty_cap": 1.0,
         },
     )
+    '''脚部接触平衡奖励'''
     feet_contact_balance = RewTerm(
         func=bpx_rewards.feet_contact_balance,
-        weight=-0.5,
+        weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "time_constant": 1.0,
@@ -707,3 +731,10 @@ class BPXRoughEnvCfg_PLAY(BPXRoughEnvCfg):
             self.scene.terrain.terrain_generator.curriculum = False
         self.curriculum.terrain_levels = None
         self.events.push_robot = None
+        self.events.physics_material = None
+        self.events.add_base_mass = None
+        self.events.base_com = None
+        self.observations.prop_history.enable_corruption = False
+        actuator = self.scene.robot.actuators["legs"]
+        actuator.min_delay = actuator.max_delay = 0
+        actuator.kp_factor_range = actuator.kd_factor_range = actuator.strength_range = (1.0, 1.0)
