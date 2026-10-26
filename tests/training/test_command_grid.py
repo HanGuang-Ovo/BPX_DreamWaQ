@@ -225,6 +225,39 @@ class TestGridAdaptiveCommandScheduler(unittest.TestCase):
         _, _, _, low = grid.sample_with_low_speed_mask(100)
         self.assertFalse(low.any())  # 零速区域尚未激活时，退回常规课程。
 
+    def test_unsigned_low_speed_branch_samples_both_signs_and_avoids_zero(self):
+        grid = make_scheduler(
+            continuous_sampling=True, low_speed_sampling_prob=1.,
+            initial_vx_range=(-1., 1.), initial_yaw_range=(-1., 1.),
+            low_speed_vx_range=(.05, .25), low_speed_random_sign=True,
+        )
+        cell, vx, yaw, low = grid.sample_with_low_speed_mask(
+            20000, generator=torch.Generator().manual_seed(11))
+        self.assertTrue(low.all())
+        self.assertTrue((cell == 12).all())  # 统计仍归中心格
+        self.assertTrue((vx.abs() >= .05 - 1e-6).all())
+        self.assertTrue((vx.abs() <= .25 + 1e-6).all())
+        self.assertAlmostEqual((vx > 0).float().mean().item(), .5, delta=.02)
+        self.assertTrue((yaw.abs() <= .25).all())
+        frequencies = torch.bincount(cell, minlength=grid.num_cells).float() / cell.numel()
+        torch.testing.assert_close(frequencies, grid.probs, atol=.01, rtol=0.)
+
+    def test_discrete_low_speed_branch_only_takes_points_inside_the_range(self):
+        grid = make_scheduler(continuous_sampling=False, low_speed_sampling_prob=1.,
+                              low_speed_vx_range=(.4, .6))
+        cell, vx, _, low = grid.sample_with_low_speed_mask(
+            2000, generator=torch.Generator().manual_seed(12))
+        self.assertTrue(low.all())
+        self.assertTrue((vx == .5).all())  # 低于下限的中心点不应获得权重
+        self.assertTrue((torch.div(cell, grid.num_yaw, rounding_mode="floor") == 3).all())
+
+    def test_random_sign_requires_continuous_sampling_and_unsigned_range(self):
+        for args in (dict(low_speed_random_sign=True, continuous_sampling=False),
+                     dict(low_speed_random_sign=True, continuous_sampling=True,
+                          low_speed_vx_range=(-.2, .2))):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                make_scheduler(**args)
+
     def test_seed_controls_cell_branch_and_continuous_draws(self):
         grid = make_scheduler(continuous_sampling=True, low_speed_sampling_prob=.3)
         first = grid.sample_with_low_speed_mask(100, generator=torch.Generator().manual_seed(42))

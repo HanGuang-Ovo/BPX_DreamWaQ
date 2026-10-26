@@ -4,11 +4,16 @@
 
 - ``vx`` 与 ``wz`` 从 ``GridAdaptiveCommandScheduler`` 的联合网格分布采样
   （同一单元），绝不独立采样后组合；
-- 常规分支 ``vy`` 保持原有均匀采样，低速分支同步收窄三轴指令；
-- 站立环境（``rel_standing_envs`` 概率）指令置零，与原实现一致；
+- 常规分支 ``vy`` 保持原有均匀采样，低速分支同步收窄三轴指令，并可按
+  ``low_speed_random_sign`` 在正负两侧对称采样；
+- 站立环境（``rel_standing_envs`` 概率）指令置零，与原实现一致；站立
+  指令在回合结束前不再重采样（重采样周期只对运动指令生效），使策略
+  面对与验收同量级的连续站定时长；
 - 每个指令执行区间（episode 内重采样周期或 episode 结束）结束时，把该区间
   的平均跟踪误差写回对应网格单元，驱动课程扩展——不会把整个 episode 的
-  表现错误地归到最后一格。
+  表现错误地归到最后一格；
+- 额外记录站立环境的残速指标（``stand_drift_vxy`` / ``stand_drift_wz`` /
+  ``stand_fraction``），在 TensorBoard 上可直接观察零指令漂移。
 """
 
 from __future__ import annotations
@@ -103,14 +108,24 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
             low_speed_sampling_prob=self.cfg.low_speed_sampling_prob,
             low_speed_vx_range=self.cfg.low_speed_vx_range,
             low_speed_yaw_range=self.cfg.low_speed_yaw_range,
+            low_speed_random_sign=self.cfg.low_speed_random_sign,
         )
         self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
         self.is_standing_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # 站立环境只在回合重置时重新抽取，定时重采样时保持零。
+        self._force_resample = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # 每个环境当前使用的网格单元与区间累计误差。
         self.cell_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.interval_err_vx = torch.zeros(self.num_envs, device=self.device)
         self.interval_err_yaw = torch.zeros(self.num_envs, device=self.device)
         self.interval_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # 站立环境残速统计：用于在训练期直接观察零指令漂移，不进入 metrics
+        # 字典（那里是逐环境累计值，均值的含义会被站立时长稀释）。
+        self.stand_drift_vxy = torch.zeros(self.num_envs, device=self.device)
+        self.stand_drift_wz = torch.zeros(self.num_envs, device=self.device)
+        self.stand_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.total_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # 兼容 UniformVelocityCommand 的指标（per-env 累计，reset 时取均值清零）。
         self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
@@ -136,6 +151,43 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
         self.interval_err_vx += err_vx * active
         self.interval_err_yaw += err_yaw * active
         self.interval_steps += active.long()
+        # 站立残速：只累加站立步，供 reset 时按站立时长求均值。
+        standing = self.is_standing_env
+        self.stand_drift_vxy += torch.linalg.vector_norm(
+            self.robot.data.root_lin_vel_b[:, :2], dim=-1
+        ) * standing
+        self.stand_drift_wz += self.robot.data.root_ang_vel_b[:, 2].abs() * standing
+        self.stand_steps += standing.long()
+        self.total_steps += 1
+
+    def reset(self, env_ids=None):
+        """回合重置：站立环境在此重新抽取指令，并输出站立残速指标。"""
+        ids = slice(None) if env_ids is None else env_ids
+        self._force_resample[ids] = True
+        extras = super().reset(env_ids)
+        extras.update(self._stand_metric_extras(ids))
+        return extras
+
+    def _stand_metric_extras(self, env_ids) -> dict[str, float]:
+        """按站立步数求每次指令区间的残速均值并清零；从未站立的环境不参与。"""
+        stand_steps = self.stand_steps[env_ids].float()
+        total_steps = self.total_steps[env_ids].clamp_min(1).float()
+        standing = stand_steps > 0
+        if bool(standing.any()):
+            drift_vxy = (self.stand_drift_vxy[env_ids][standing] / stand_steps[standing]).mean().item()
+            drift_wz = (self.stand_drift_wz[env_ids][standing] / stand_steps[standing]).mean().item()
+        else:
+            drift_vxy = drift_wz = 0.0
+        fraction = (stand_steps.sum() / total_steps.sum()).item()
+        self.stand_drift_vxy[env_ids] = 0.0
+        self.stand_drift_wz[env_ids] = 0.0
+        self.stand_steps[env_ids] = 0
+        self.total_steps[env_ids] = 0
+        return {
+            "stand_drift_vxy": drift_vxy,
+            "stand_drift_wz": drift_wz,
+            "stand_fraction": fraction,
+        }
 
     def _resample_command(self, env_ids: Sequence[int]):
         if isinstance(env_ids, slice):
@@ -152,23 +204,37 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
                     mean_err_vx=self.interval_err_vx[finished] / steps,
                     mean_err_yaw=self.interval_err_yaw[finished] / steps,
                 )
-        # 2) 从联合网格分布采样新指令。
-        cell_idx, vx, wz, low_speed = self.grid.sample_with_low_speed_mask(env_ids_t.numel())
-        self.cell_idx[env_ids_t] = cell_idx.to(self.device)
-        r = torch.empty(env_ids_t.numel(), device=self.device)
-        self.vel_command_b[env_ids_t, 0] = vx.to(self.device)
+        # 2) 站立环境保持零指令直到回合结束：定时重采样只重置区间累计，
+        #    只有回合重置（_force_resample）才重新抽取指令。
+        forced = self._force_resample[env_ids_t]
+        self._force_resample[env_ids_t] = False
+        hold = self.is_standing_env[env_ids_t] & ~forced
+        sampled_ids = env_ids_t[~hold]
+        held_ids = env_ids_t[hold]
+        if held_ids.numel() > 0:
+            self.vel_command_b[held_ids, :] = 0.0
+            self.interval_err_vx[held_ids] = 0.0
+            self.interval_err_yaw[held_ids] = 0.0
+            self.interval_steps[held_ids] = 0
+        if sampled_ids.numel() == 0:
+            return
+        # 3) 从联合网格分布采样新指令。
+        cell_idx, vx, wz, low_speed = self.grid.sample_with_low_speed_mask(sampled_ids.numel())
+        self.cell_idx[sampled_ids] = cell_idx.to(self.device)
+        r = torch.empty(sampled_ids.numel(), device=self.device)
+        self.vel_command_b[sampled_ids, 0] = vx.to(self.device)
         vy = r.uniform_(*self.cfg.lin_vel_y_range).clone()
         if self.cfg.low_speed_sampling_prob > 0:
             low_vy = r.uniform_(*self._low_vy_range)
             vy = torch.where(low_speed, low_vy, vy)
-        self.vel_command_b[env_ids_t, 1] = vy
-        self.vel_command_b[env_ids_t, 2] = wz.to(self.device)
-        # 3) 重置区间累计。
-        self.interval_err_vx[env_ids_t] = 0.0
-        self.interval_err_yaw[env_ids_t] = 0.0
-        self.interval_steps[env_ids_t] = 0
-        # 4) 站立环境标记。
-        self.is_standing_env[env_ids_t] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+        self.vel_command_b[sampled_ids, 1] = vy
+        self.vel_command_b[sampled_ids, 2] = wz.to(self.device)
+        # 4) 重置区间累计。
+        self.interval_err_vx[sampled_ids] = 0.0
+        self.interval_err_yaw[sampled_ids] = 0.0
+        self.interval_steps[sampled_ids] = 0
+        # 5) 站立环境标记。
+        self.is_standing_env[sampled_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
 
     def _update_command(self):
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
@@ -218,3 +284,5 @@ class GridAdaptiveVelocityCommandCfg(CommandTermCfg):
     low_speed_vx_range: tuple[float, float] = (-0.25, 0.25)
     low_speed_vy_range: tuple[float, float] = (-0.1, 0.1)
     low_speed_yaw_range: tuple[float, float] = (-0.25, 0.25)
+    low_speed_random_sign: bool = False
+    """把 ``low_speed_vx_range`` 当作无符号幅值区间，在单元内正负两侧采样。"""

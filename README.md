@@ -321,14 +321,15 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
    terrain_curriculum_coverage_ratio = 0.25         # 轴向空间覆盖门槛 = 地形边长 × 0.25
 
    enable_grid_adaptive_command_curriculum = True    # 指令课程总开关
-   command_rel_standing_envs = 0.1        # 10% 精确全零站立指令
+   command_rel_standing_envs = 0.2        # 20% 精确全零站立指令，保持到回合结束
    command_grid_resolution_vx = 0.5        # vx 网格分辨率 (m/s)
    command_grid_resolution_yaw = 0.5       # wz 网格分辨率 (rad/s)
    command_curriculum_initial_vx_range = (-0.5, 0.5)  # 初始激活范围
    command_curriculum_initial_yaw_range = (-0.5, 0.5)
    command_grid_continuous_sampling = True          # 选格后在格内连续采样
    command_low_speed_sampling_prob = 0.3            # 30% 额外低速样本
-   command_low_speed_vx_range = (-0.25, 0.25)        # m/s
+   command_low_speed_vx_range = (0.05, 0.25)         # 无符号幅值 (m/s)，避开零点
+   command_low_speed_random_sign = True              # 正负两侧按长度加权对称采样
    command_low_speed_vy_range = (-0.1, 0.1)          # m/s
    command_low_speed_yaw_range = (-0.25, 0.25)       # rad/s
    # 最大扩展范围从 command_lin_vel_x_range / command_ang_vel_z_range（±1.0）读取
@@ -701,8 +702,8 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | 项目 | 值 |
 | --- | --- |
 | 任务量程 | vx ∈ [−1.0, 1.0] m/s，vy ∈ [−0.5, 0.5] m/s，wz ∈ [−1.0, 1.0] rad/s |
-| 重采样 | 每 10 s（episode 内） |
-| 站立比例 | 每次重采样 10% 精确全零指令 |
+| 重采样 | 每 10 s（episode 内），站立指令保持到回合结束 |
+| 站立比例 | 每次抽样 20% 精确全零指令 |
 | 航向 | `heading_command=False`，直接采样角速度 |
 | 课程关闭时 | `TerrainAwareUniformVelocityCommand` 均匀采样（仍记录地形统计） |
 
@@ -737,6 +738,8 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | --- | --- | --- | --- |
 | `track_lin_vel_xy_exp` | +1.5 | Isaac Lab 内置，`std=0.5` | 平面线速度跟踪 |
 | `track_ang_vel_z_exp` | +0.75 | 内置，`std=0.5` | 偏航角速度跟踪 |
+| `track_lin_vel_xy_stand_exp` | +1.5 | 本工程，`std=0.1` | 仅三轴指令 < 0.05 时生效的平面速度跟踪；非站立环境为 0 |
+| `track_ang_vel_z_stand_exp` | +1.0 | 本工程，`std=0.1` | 仅零指令时生效的偏航角速度跟踪；非站立环境为 0 |
 
 **姿态与能耗正则**
 
@@ -756,7 +759,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 
 | 奖励项 | 权重 | 实现 | 作用 |
 | --- | --- | --- | --- |
-| `feet_air_time` | +0.1 | 本工程 | 触地瞬间，滞空时间超过 0.4 s 的部分给予奖励；平移或 yaw 指令超过 0.1 时启用 |
+| `feet_air_time` | +0.1 | 本工程 | 触地瞬间，滞空时间超过 0.3 s 的部分给予奖励；平移或 yaw 指令超过 0.05 / 0.1 时启用 |
 | `feet_air_time_excess` | −1.0 | 本工程 | 单脚连续悬空超过 0.6 s 后线性惩罚，每脚上限 1 |
 | `feet_contact_balance` | −0.5 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
 | `feet_clearance` | −0.01 | 本工程 | `toe_link` 距局部地面 0.10 m 的误差平方 × 足端水平速度 |
@@ -777,8 +780,13 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
   达到下限后代价为零，不鼓励无限张腿。
 - `feet_air_time` 只在落脚瞬间给奖励；`feet_air_time_excess` 持续惩罚超时悬空，
   防止三足支撑策略通过始终不落脚逃避着地项。
+- 两个 `*_stand_exp` 项用比默认窄 5 倍的核（`std=0.1`）只覆盖近零指令：默认核下
+  0.01 m/s 残速仍拿到 99.96%，策略没有把速度压到零的动力；收紧后 0.07 m/s 与
+  0.07 rad/s 只剩约 61%，且这两项对运动指令为 0，不改变行走段的奖励结构。
 - 逐脚指标可在 TensorBoard 查看：`gait/{fl,fr,hl,hr}/contact_fraction`、
-  `air_time_max_s`、`long_air_fraction`。左后腿长期抬起问题的复现与修正见
+  `air_time_max_s`、`long_air_fraction`。零指令表现看
+  `Metrics/base_velocity/stand_drift_vxy`、`stand_drift_wz`、`stand_fraction`
+  （只对站立步求均值，未站立的环境不参与）。左后腿长期抬起问题的复现与修正见
   [步态诊断](docs/GAIT_DIAGNOSIS.md)。
 
 ### 6.5 课程学习（模块 A / 模块 B）
@@ -822,13 +830,19 @@ TensorBoard（`curriculum/terrain/*`、`Curriculum/terrain_levels/*`）；
 |Δwz| < 0.5 rad/s」的 EMA 成功率达标且采样 ≥ `min_samples` 后激活 4 邻域。
 
 非站立样本中，默认 70% 指令使用原分布（90% 激活单元均匀 + 10% 全合法单元
-均匀探索），另外 30% 从已激活格与零速附近区域的交集采样；低速区尚未激活时
-退回原分布。低速分布按格与低速区域的交叠面积加权，不绕过课程激活门控。
-vx 与 wz 先联合选同一单元，再在格内连续采样；两端格截断到任务量程。
-常规分支 vy 均匀采样于任务量程，低速分支同步收窄到 ±0.1 m/s。每次重采样
-独立以 10% 概率发送精确全零站立指令（`command_rel_standing_envs`），不参与
-课程成功统计。因此默认最终采样比例约为 10% 精确零速、27% 近零连续运动、
-63% 常规网格课程与探索；比例指重采样次数，实际步数占比受回合提前结束影响。
+均匀探索），另外 30% 从一个避开零点的低速带采样；低速区尚未激活时退回原分布。
+低速分布按格与低速区域的交叠面积加权，不绕过课程激活门控。vx 与 wz 先联合
+选同一单元，再在格内连续采样；两端格截断到任务量程。常规分支 vy 均匀采样于
+任务量程，低速分支同步收窄到 ±0.1 m/s。低速带默认取 |vx| ∈ [0.05, 0.25] m/s
+（`command_low_speed_vx_range` 按无符号幅值解释，`command_low_speed_random_sign`
+在格内正负两侧按区间长度加权），使"慢走"与"站定"成为不同的训练状态；下限
+留出的 [0, 0.05) 只有精确零指令会进入。
+
+每次重采样独立以 20% 概率发送精确全零站立指令（`command_rel_standing_envs`），
+不参与课程成功统计，且在**回合结束前不再重采样**——重采样周期只对运动指令
+生效，因此站立环境会连续站满一个回合（默认 20 s），与验收时的长时站定同量级。
+因此默认最终采样比例约为 20% 精确零速、24% 低速带、56% 常规网格课程与探索；
+比例指重采样次数，实际步数占比受回合提前结束影响。
 
 统计按指令执行区间（episode 内 10 s 重采样周期）结算，不混入整个 episode。
 关闭时恢复 `UniformVelocityCommand` 均匀采样；两套课程同时关闭即为原始

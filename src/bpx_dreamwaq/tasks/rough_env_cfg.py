@@ -222,7 +222,7 @@ class CommandsCfg:
     base_velocity = lab_mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.1,
+        rel_standing_envs=0.2,
         rel_heading_envs=1.0,
         heading_command=False,
         debug_vis=False,
@@ -380,6 +380,19 @@ class RewardsCfg:
         weight=0.75,
         params={"command_name": "base_velocity", "std": 0.5},
     )
+    '''零指令站立：只在三轴指令近零时生效的窄核速度跟踪。
+    std 从 0.5 收紧到 0.1，使 0.01 m/s 残速与 0.07 rad/s 漂移产生实际梯度
+    （默认宽度下两者几乎不损失奖励）。非站立环境为 0，不改变行走段。'''
+    track_lin_vel_xy_stand_exp = RewTerm(
+        func=bpx_rewards.track_lin_vel_xy_stand_exp,
+        weight=1.5,
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+    )
+    track_ang_vel_z_stand_exp = RewTerm(
+        func=bpx_rewards.track_ang_vel_z_stand_exp,
+        weight=1.0,
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+    )
     # -- 正则
     '''z轴抖动惩罚'''
     lin_vel_z_l2 = RewTerm(
@@ -466,8 +479,8 @@ class RewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
-            "threshold": 0.4,
-            "command_threshold": 0.1,
+            "threshold": 0.3,
+            "command_threshold": 0.05,
             "yaw_command_threshold": 0.1,
         },
     )
@@ -569,8 +582,10 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     command_lin_vel_x_range: tuple = (-1.0, 1.0)
     command_lin_vel_y_range: tuple = (-0.5, 0.5)
     command_ang_vel_z_range: tuple = (-1.0, 1.0)
-    command_rel_standing_envs: float = 0.1
-    """每次重采样以此概率发送精确全零指令；独立于近零连续运动采样。"""
+    command_rel_standing_envs: float = 0.2
+    """每次抽取指令时以此概率发送精确全零指令；独立于低速带采样。
+    Grid-Adaptive 下站立指令在回合结束前保持为零（重采样周期只对运动指令
+    生效），使策略面对与验收同量级的连续站定时长。"""
     # 指令课程初始范围（以零为中心逐步向外扩展）。
     command_curriculum_initial_vx_range: tuple = (-0.5, 0.5)
     command_curriculum_initial_yaw_range: tuple = (-0.5, 0.5)
@@ -580,7 +595,12 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
     """保留网格课程，在所选格内连续采样 vx/wz，并裁到任务量程。"""
     command_low_speed_sampling_prob: float = 0.3
     """额外低速分支占全部非站立指令采样的比例，其余保留原网格分布。"""
-    command_low_speed_vx_range: tuple = (-0.25, 0.25)
+    command_low_speed_vx_range: tuple = (0.05, 0.25)
+    """低速分支的 vx 幅值区间；下限避开零点，使"慢走"与"站定"成为不同的
+    训练状态，而不是积分到同一个低速吸引子。"""
+    command_low_speed_random_sign: bool = True
+    """把 command_low_speed_vx_range 当作无符号幅值，正负两侧对称采样，
+    避免低速指令只剩单向而引入前向偏移。"""
     command_low_speed_vy_range: tuple = (-0.1, 0.1)
     command_low_speed_yaw_range: tuple = (-0.25, 0.25)
     """低速分支的三轴范围；仅从已激活单元与这些范围的交集采样。"""
@@ -653,6 +673,7 @@ class BPXRoughEnvCfg(ManagerBasedRLEnvCfg):
                 low_speed_vx_range=tuple(self.command_low_speed_vx_range),
                 low_speed_vy_range=tuple(self.command_low_speed_vy_range),
                 low_speed_yaw_range=tuple(self.command_low_speed_yaw_range),
+                low_speed_random_sign=self.command_low_speed_random_sign,
             )
         else:
             # __post_init__ 可被命令行覆盖后再次调用，需要完整恢复均匀指令配置。

@@ -2,6 +2,8 @@
 
 通用奖励（速度跟踪、姿态、能耗、接触等）直接复用 Isaac Lab 内置实现
 （``isaaclab.envs.mdp``，见 ``tasks/rough_env_cfg.py`` 的 RewardsCfg）。
+零指令站立另有一对窄核跟踪项（``track_*_stand_exp``），只在三轴指令都
+接近零时生效，使"把残速压到零"有实际梯度；非站立环境该项为 0。
 机身高度、足端净空与二阶动作平滑项采用 DreamWaQ 风格的误差平方惩罚。
 关节加速度平方和设有可配置上限，异常加速度按最大惩罚处理。
 ``feet_air_time`` 与上游
@@ -33,6 +35,66 @@ action_rate_l2 = _lab_mdp.action_rate_l2
 undesired_contacts = _lab_mdp.undesired_contacts
 flat_orientation_l2 = _lab_mdp.flat_orientation_l2
 joint_pos_limits = _lab_mdp.joint_pos_limits
+
+
+def _standing_command_mask(command: torch.Tensor, command_threshold: float) -> torch.Tensor:
+    """三轴指令绝对值都小于门限的环境掩码；参数非法时抛 ``ValueError``。"""
+    if not math.isfinite(command_threshold) or command_threshold <= 0:
+        raise ValueError("command_threshold 必须为有限正数")
+    return (command.abs() < command_threshold).all(dim=1)
+
+
+def _validate_stand_std(std: float) -> None:
+    if not math.isfinite(std) or std <= 0:
+        raise ValueError("std 必须为有限正数")
+
+
+def track_lin_vel_xy_stand_exp(
+    env: "ManagerBasedRLEnv",
+    std: float,
+    command_name: str,
+    command_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """零指令站立时的水平速度跟踪奖励，非站立环境为 0。
+
+    与 ``track_lin_vel_xy_exp`` 使用同一指数核，但只在三轴指令绝对值都
+    小于 ``command_threshold`` 时生效，``std`` 取 0.1 量级。默认 0.5 的核
+    在零指令下对残速几乎没有梯度：0.01 m/s 仍拿到该项最大值的 99.96%；
+    收紧到 0.1 后同样的 0.01 m/s 保留 99%，而 0.07 m/s 只剩 61%，使策略
+    有动力把速度压到零。指令非零的环境该项为 0，不改变行走段的奖励结构。
+    """
+    _validate_stand_std(std)
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    standing = _standing_command_mask(command, command_threshold)
+    lin_vel_error = torch.sum(
+        torch.square(command[:, :2] - asset.data.root_lin_vel_b[:, :2]), dim=1
+    )
+    reward = torch.exp(-lin_vel_error / std**2)
+    return torch.where(standing, reward, torch.zeros_like(reward))
+
+
+def track_ang_vel_z_stand_exp(
+    env: "ManagerBasedRLEnv",
+    std: float,
+    command_name: str,
+    command_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """零指令站立时的偏航角速度跟踪奖励，非站立环境为 0。
+
+    门限与窄化理由同 :func:`track_lin_vel_xy_stand_exp`。站立时持续
+    0.07 rad/s 的偏航在 25 s 内累计约 1.75 rad，而默认核只损失 0.4%，
+    因此需要单独收紧这一项。
+    """
+    _validate_stand_std(std)
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    standing = _standing_command_mask(command, command_threshold)
+    ang_vel_error = torch.square(command[:, 2] - asset.data.root_ang_vel_b[:, 2])
+    reward = torch.exp(-ang_vel_error / std**2)
+    return torch.where(standing, reward, torch.zeros_like(reward))
 
 
 def joint_acc_l2(

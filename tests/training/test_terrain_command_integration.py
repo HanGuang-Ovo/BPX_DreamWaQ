@@ -222,6 +222,59 @@ class TestTerrainCommandIntegration(unittest.TestCase):
         with self.assertRaises(ValueError):
             commands.GridAdaptiveVelocityCommand(cfg, env)
 
+    def test_standing_command_holds_zero_across_resampling_until_episode_reset(self):
+        env = make_env(enabled=False)
+        cfg = commands.GridAdaptiveVelocityCommandCfg(
+            asset_name="robot", resampling_time_range=(.1, .1), rel_standing_envs=1.,
+        )
+        term = commands.GridAdaptiveVelocityCommand(cfg, env)
+        term.reset()
+        self.assertTrue(term.is_standing_env.all())
+        for _ in range(5):
+            # 定时重采样（非回合重置）不得重新抽取站立环境。
+            term.time_left[:] = 0
+            term.compute(env.step_dt)
+            self.assertTrue(term.is_standing_env.all())
+            torch.testing.assert_close(term.command, torch.zeros(2, 3))
+        # 回合重置才重新抽取；改为不站立后指令恢复由课程采样。
+        cfg.rel_standing_envs = 0.
+        term.reset()
+        self.assertFalse(term.is_standing_env.any())
+        self.assertFalse(term._force_resample.any())
+        # 非站立环境仍按定时重采样更新网格单元，不会被站立保持逻辑冻结。
+        cells = set()
+        for _ in range(30):
+            term.time_left[:] = 0
+            term.compute(env.step_dt)
+            cells.update(term.cell_idx.tolist())
+        self.assertGreater(len(cells), 1)
+
+    def test_stand_metrics_report_only_standing_steps(self):
+        env = make_env(enabled=False)
+        cfg = commands.GridAdaptiveVelocityCommandCfg(
+            asset_name="robot", resampling_time_range=(10., 10.), rel_standing_envs=1.,
+        )
+        term = commands.GridAdaptiveVelocityCommand(cfg, env)
+        term.reset()
+        term._update_command()
+        data = env.scene["robot"].data
+        data.root_lin_vel_b[:, 0] = .02
+        data.root_lin_vel_b[:, 1] = -.01
+        data.root_ang_vel_b[:, 2] = -.05
+        for _ in range(5):
+            term._update_metrics()
+        extras = term.reset()
+        self.assertAlmostEqual(extras["stand_drift_vxy"], .01 * 5 ** .5, places=5)
+        self.assertAlmostEqual(extras["stand_drift_wz"], .05, places=5)
+        self.assertAlmostEqual(extras["stand_fraction"], 1.)
+        # 累加器按环境清零，下一次重置不应重复报告上一回合的漂移。
+        data.root_lin_vel_b.zero_()
+        data.root_ang_vel_b.zero_()
+        extras = term.reset()
+        self.assertEqual(extras["stand_drift_vxy"], 0.)
+        self.assertEqual(extras["stand_drift_wz"], 0.)
+        self.assertEqual(extras["stand_fraction"], 0.)
+
 
 class TestEnvironmentConfiguration(unittest.TestCase):
     def setUp(self):
@@ -254,11 +307,11 @@ class TestEnvironmentConfiguration(unittest.TestCase):
     def test_default_grid_and_uniform_fallback_both_support_terrain_metrics(self):
         self.configure(self.cfg)
         self.assertIs(self.cfg.commands.base_velocity.class_type, commands.GridAdaptiveVelocityCommand)
-        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .1)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .2)
         self.cfg.enable_grid_adaptive_command_curriculum = False
         self.configure(self.cfg)
         self.assertIs(self.cfg.commands.base_velocity.class_type, commands.TerrainAwareUniformVelocityCommand)
-        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .1)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .2)
         self.assertIs(self.cfg.curriculum.terrain_levels.func, curriculums.terrain_levels_vel)
         self.assertNotIn("success_ratio", self.cfg.curriculum.terrain_levels.params)
 
@@ -274,28 +327,31 @@ class TestEnvironmentConfiguration(unittest.TestCase):
         self.configure(self.cfg)
         command = self.cfg.commands.base_velocity
         self.assertTrue(command.continuous_sampling)
-        self.assertEqual(command.rel_standing_envs, .1)
+        self.assertEqual(command.rel_standing_envs, .2)
         self.assertEqual(command.low_speed_sampling_prob, .3)
-        self.assertEqual(command.low_speed_vx_range, (-.25, .25))
+        self.assertEqual(command.low_speed_vx_range, (.05, .25))
         self.assertEqual(command.low_speed_vy_range, (-.1, .1))
         self.assertEqual(command.low_speed_yaw_range, (-.25, .25))
+        self.assertTrue(command.low_speed_random_sign)
         self.cfg.command_grid_continuous_sampling = False
-        self.cfg.command_rel_standing_envs = .2
+        self.cfg.command_rel_standing_envs = .25
         self.cfg.command_low_speed_sampling_prob = .15
         self.cfg.command_low_speed_vx_range = (-.2, .2)
+        self.cfg.command_low_speed_random_sign = False
         self.cfg.command_low_speed_vy_range = (-.05, .05)
         self.cfg.command_low_speed_yaw_range = (-.1, .1)
         self.configure(self.cfg)
         command = self.cfg.commands.base_velocity
         self.assertFalse(command.continuous_sampling)
-        self.assertEqual(command.rel_standing_envs, .2)
+        self.assertEqual(command.rel_standing_envs, .25)
         self.assertEqual(command.low_speed_sampling_prob, .15)
         self.assertEqual(command.low_speed_vx_range, (-.2, .2))
+        self.assertFalse(command.low_speed_random_sign)
         self.assertEqual(command.low_speed_vy_range, (-.05, .05))
         self.assertEqual(command.low_speed_yaw_range, (-.1, .1))
         self.cfg.enable_grid_adaptive_command_curriculum = False
         self.configure(self.cfg)
-        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .2)
+        self.assertEqual(self.cfg.commands.base_velocity.rel_standing_envs, .25)
 
 
 if __name__ == "__main__":

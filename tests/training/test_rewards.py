@@ -31,7 +31,13 @@ def _load_rewards():
 
     modules["isaaclab.managers"].ManagerTermBase = ManagerTermBase
     modules["isaaclab.managers"].RewardTermCfg = SimpleNamespace
-    modules["isaaclab.managers"].SceneEntityCfg = SimpleNamespace
+
+    class SceneEntityCfg(SimpleNamespace):
+        # 奖励函数把 SceneEntityCfg("robot") 作为默认参数，运行时会实例化。
+        def __init__(self, name=None, **kwargs):
+            super().__init__(name=name, **kwargs)
+
+    modules["isaaclab.managers"].SceneEntityCfg = SceneEntityCfg
     modules["isaaclab.sensors"].ContactSensor = SimpleNamespace
     modules["isaaclab.sensors"].RayCaster = SimpleNamespace
     path = Path(__file__).resolve().parents[2] / "src/bpx_dreamwaq/tasks/mdp/rewards.py"
@@ -324,6 +330,70 @@ class TestFeetLongitudinalDistance(unittest.TestCase):
                 self.penalty([self.feet(.30, .30)], minimum_distance=distance)
         with self.assertRaises(ValueError):
             self.penalty([[[0, 0, 0]] * 3])
+
+
+class TestStandTrackingRewards(unittest.TestCase):
+    def evaluate(self, term, commands, lin_vels=None, ang_vel_z=None, **kwargs):
+        count = len(commands)
+        if lin_vels is None:
+            lin_vels = [[0., 0., 0.]] * count
+        if ang_vel_z is None:
+            ang_vel_z = [0.] * count
+        ang_vel = torch.zeros(count, 3)
+        ang_vel[:, 2] = torch.tensor(ang_vel_z, dtype=torch.float32)
+        command = torch.tensor(commands, dtype=torch.float32)
+        env = SimpleNamespace(
+            scene=_Scene(robot=SimpleNamespace(data=SimpleNamespace(
+                root_lin_vel_b=torch.tensor(lin_vels, dtype=torch.float32),
+                root_ang_vel_b=ang_vel,
+            ))),
+            command_manager=SimpleNamespace(get_command=lambda _name: command),
+        )
+        kwargs.setdefault("std", .1)
+        return getattr(rewards, term)(
+            env, command_name="base_velocity", asset_cfg=SimpleNamespace(name="robot"), **kwargs,
+        )
+
+    def test_only_zero_command_is_scored(self):
+        result = self.evaluate(
+            "track_lin_vel_xy_stand_exp",
+            [[0., 0., 0.], [0., 0., .06], [.2, 0., 0.], [0., 0., 0.]],
+        )
+        torch.testing.assert_close(result, torch.tensor([1., 0., 0., 1.]))
+
+    def test_narrow_kernel_penalizes_residual_drift_that_default_kernel_ignores(self):
+        lin = self.evaluate(
+            "track_lin_vel_xy_stand_exp", [[0., 0., 0.]] * 4,
+            lin_vels=[[0., 0., 0.], [.01, 0., 0.], [0., .07, 0.], [0., 0., 9.]],
+        )
+        # 0.07 m/s 残速在默认 std=0.5 下只损失 1.9%，收紧到 0.1 后损失 39%。
+        self.assertAlmostEqual(lin[1].item(), math.exp(-.01), places=6)
+        self.assertAlmostEqual(lin[2].item(), math.exp(-.49), places=6)
+        self.assertLess(lin[2].item(), .62)
+        self.assertEqual(lin[3].item(), 1.)  # z 速度不参与水平项
+        yaw = self.evaluate(
+            "track_ang_vel_z_stand_exp", [[0., 0., 0.]] * 2, ang_vel_z=[0., .07],
+        )
+        self.assertAlmostEqual(yaw[1].item(), math.exp(-.49), places=6)
+
+    def test_command_gate_is_off_for_nonzero_components(self):
+        # 指令与真实角速度一致时奖励为 1，门控只取决于指令是否近零。
+        result = self.evaluate(
+            "track_ang_vel_z_stand_exp",
+            [[0., 0., .04], [0., 0., -.04], [0., 0., .06]],
+            ang_vel_z=[.04, -.04, .06],
+            command_threshold=.05,
+        )
+        torch.testing.assert_close(result, torch.tensor([1., 1., 0.]))
+
+    def test_invalid_parameters_are_rejected(self):
+        for term in ("track_lin_vel_xy_stand_exp", "track_ang_vel_z_stand_exp"):
+            for std in (0., -1., float("nan"), float("inf")):
+                with self.subTest(term=term, std=std), self.assertRaises(ValueError):
+                    self.evaluate(term, [[0., 0., 0.]], std=std)
+            for threshold in (0., -1., float("nan"), float("inf")):
+                with self.subTest(term=term, threshold=threshold), self.assertRaises(ValueError):
+                    self.evaluate(term, [[0., 0., 0.]], command_threshold=threshold)
 
 
 class TestFeetAirTime(unittest.TestCase):

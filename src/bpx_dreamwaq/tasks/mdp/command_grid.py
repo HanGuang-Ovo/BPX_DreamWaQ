@@ -15,7 +15,10 @@ Grid-Adaptive Curriculum 思想：在前向速度 ``vx`` 与偏航角速度 ``wz
 4. 常规分布混合激活单元均匀分布与全合法单元探索，再与已激活区域内的
    零速附近分布混合；导出的概率包含这两类采样；
 5. 前向速度与偏航角速度始终从同一单元内连续采样，裁到任务量程；
-   低速分支只使用单元与低速区域的交集，统计仍归实际所属单元。
+   低速分支只使用单元与低速区域的交集，统计仍归实际所属单元；
+6. 可选 ``low_speed_random_sign``：``low_speed_vx_range`` 按非负幅值区间
+   解释，低速分支在单元内正负两侧各按区间长度加权采样，因此把低速区间
+   移出零点后仍保持左右对称的指令分布；仅支持连续采样。
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ class GridAdaptiveCommandScheduler:
         low_speed_sampling_prob: float = 0.3,
         low_speed_vx_range: Tuple[float, float] = (-0.25, 0.25),
         low_speed_yaw_range: Tuple[float, float] = (-0.25, 0.25),
+        low_speed_random_sign: bool = False,
     ):
         if not all(math.isfinite(r) and r > 0 for r in (vx_resolution, yaw_resolution)):
             raise ValueError("网格分辨率必须为有限正数")
@@ -85,6 +89,12 @@ class GridAdaptiveCommandScheduler:
         self.low_speed_sampling_prob = low_speed_sampling_prob
         self.low_speed_vx_range = low_speed_vx_range
         self.low_speed_yaw_range = low_speed_yaw_range
+        self.low_speed_random_sign = low_speed_random_sign
+        if low_speed_random_sign:
+            if not continuous_sampling:
+                raise ValueError("low_speed_random_sign 需要 continuous_sampling=True")
+            if low_speed_vx_range[0] < 0:
+                raise ValueError("low_speed_random_sign 要求 low_speed_vx_range 为无符号幅值区间")
         self.device = device
 
         def centers(res: float, max_range: Tuple[float, float]) -> torch.Tensor:
@@ -101,28 +111,49 @@ class GridAdaptiveCommandScheduler:
         self.num_yaw = self.yaw_centers.numel()
         self.num_cells = self.num_vx * self.num_yaw
 
-        def sampling_bounds(values, resolution, limits, low_speed_limits):
+        def sampling_bounds(values, resolution, limits):
             half_width = resolution / 2 if continuous_sampling else command_jitter
             lower = (values - half_width).clamp_min(limits[0])
             upper = (values + half_width).clamp_max(limits[1])
             # 连续模式的两端单元覆盖非整格量程剩余部分，仍保持各格互不重叠。
             if continuous_sampling:
                 lower[0], upper[-1] = limits[0], limits[1]
-            low_lower = lower.clamp_min(low_speed_limits[0])
-            low_upper = upper.clamp_max(low_speed_limits[1])
-            overlap = (low_upper - low_lower).clamp_min(0)
-            # 离散兼容模式中，中心点位于低速区内也可被加采样。
-            overlap = torch.where(
-                (lower == upper) & (low_lower <= low_upper), torch.ones_like(overlap), overlap
-            )
-            return lower, upper, low_lower, low_upper, overlap
+            return lower, upper
 
-        (self._vx_lower, self._vx_upper, self._low_vx_lower,
-         self._low_vx_upper, vx_overlap) = sampling_bounds(
-            self.vx_centers, vx_resolution, max_vx_range, low_speed_vx_range)
-        (self._yaw_lower, self._yaw_upper, self._low_yaw_lower,
-         self._low_yaw_upper, yaw_overlap) = sampling_bounds(
-            self.yaw_centers, yaw_resolution, max_yaw_range, low_speed_yaw_range)
+        self._vx_lower, self._vx_upper = sampling_bounds(
+            self.vx_centers, vx_resolution, max_vx_range)
+        self._yaw_lower, self._yaw_upper = sampling_bounds(
+            self.yaw_centers, yaw_resolution, max_yaw_range)
+
+        # 低速分支的 vx 交集按两侧分别保存：默认只取配置区间，开启幅值模式
+        # 时同时使用其镜像（负速度），两者都裁在所属单元内部。
+        low_vx_lo, low_vx_hi = self.low_speed_vx_range
+        self._low_vx_pos_lower = self._vx_lower.clamp(low_vx_lo, low_vx_hi)
+        self._low_vx_pos_upper = self._vx_upper.clamp(low_vx_lo, low_vx_hi)
+        self._low_vx_pos_len = (self._low_vx_pos_upper - self._low_vx_pos_lower).clamp_min(0)
+        self._low_vx_neg_lower = self._vx_lower.clamp(-low_vx_hi, -low_vx_lo)
+        self._low_vx_neg_upper = self._vx_upper.clamp(-low_vx_hi, -low_vx_lo)
+        self._low_vx_neg_len = (self._low_vx_neg_upper - self._low_vx_neg_lower).clamp_min(0)
+
+        self._low_yaw_lower = self._yaw_lower.clamp_min(self.low_speed_yaw_range[0])
+        self._low_yaw_upper = self._yaw_upper.clamp_max(self.low_speed_yaw_range[1])
+        yaw_overlap = (self._low_yaw_upper - self._low_yaw_lower).clamp_min(0)
+        # 离散兼容模式中，中心点位于低速区内也可被加采样。
+        yaw_overlap = torch.where(
+            (self._yaw_lower == self._yaw_upper)
+            & (self._low_yaw_lower <= self._low_yaw_upper),
+            torch.ones_like(yaw_overlap), yaw_overlap,
+        )
+        vx_overlap = self._low_vx_pos_len
+        if not low_speed_random_sign:
+            # 离散兼容模式中，中心点落在低速区内也可被加采样。
+            vx_overlap = torch.where(
+                (self._vx_lower == self._vx_upper)
+                & (self._vx_lower >= low_vx_lo) & (self._vx_lower <= low_vx_hi),
+                torch.ones_like(vx_overlap), vx_overlap,
+            )
+        else:
+            vx_overlap = vx_overlap + self._low_vx_neg_len
         self._low_speed_area = (vx_overlap[:, None] * yaw_overlap[None, :]).flatten()
 
         # 初始激活：中心落在初始范围内的单元。
@@ -221,12 +252,32 @@ class GridAdaptiveCommandScheduler:
         yaw_idx = cell_idx % self.num_yaw
 
         def within_cell(index, lower, upper, low_lower, low_upper):
-            lo = torch.where(low_speed, low_lower[index], lower[index])
-            hi = torch.where(low_speed, low_upper[index], upper[index])
+            """按低速度掩码在低速区间或整格内采样；区间均为逐采样点张量。"""
+            lo = torch.where(low_speed, low_lower, lower[index])
+            hi = torch.where(low_speed, low_upper, upper[index])
             return lo + torch.rand(num, device=self.device, generator=generator) * (hi - lo)
 
-        vx = within_cell(vx_idx, self._vx_lower, self._vx_upper, self._low_vx_lower, self._low_vx_upper)
-        wz = within_cell(yaw_idx, self._yaw_lower, self._yaw_upper, self._low_yaw_lower, self._low_yaw_upper)
+        # 幅值模式：低速分支在单元内正负两侧按区间长度加权，保持左右对称。
+        if self.low_speed_random_sign:
+            pos_len = self._low_vx_pos_len[vx_idx]
+            neg_len = self._low_vx_neg_len[vx_idx]
+            take_positive = (
+                torch.rand(num, device=self.device, generator=generator) * (pos_len + neg_len) < pos_len
+            )
+            low_vx_lower = torch.where(
+                take_positive, self._low_vx_pos_lower[vx_idx], self._low_vx_neg_lower[vx_idx]
+            )
+            low_vx_upper = torch.where(
+                take_positive, self._low_vx_pos_upper[vx_idx], self._low_vx_neg_upper[vx_idx]
+            )
+        else:
+            low_vx_lower = self._low_vx_pos_lower[vx_idx]
+            low_vx_upper = self._low_vx_pos_upper[vx_idx]
+        vx = within_cell(vx_idx, self._vx_lower, self._vx_upper, low_vx_lower, low_vx_upper)
+        wz = within_cell(
+            yaw_idx, self._yaw_lower, self._yaw_upper,
+            self._low_yaw_lower[yaw_idx], self._low_yaw_upper[yaw_idx],
+        )
         return cell_idx, vx, wz, low_speed
 
     def record_interval(
