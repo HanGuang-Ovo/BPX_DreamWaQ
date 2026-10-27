@@ -133,6 +133,15 @@ class TestPowerCosts(unittest.TestCase):
         cfg.joint_ids = [0]
         torch.testing.assert_close(rewards.power_distribution(env, cfg), torch.zeros(3))
 
+    def test_power_distribution_caps_large_watt_fourth_cost(self):
+        data = SimpleNamespace(applied_torque=torch.tensor([[100., -100.]]),
+                               joint_vel=torch.tensor([[100., 100.]]))
+        env = SimpleNamespace(scene=_Scene(robot=SimpleNamespace(data=data)))
+        cfg = SimpleNamespace(name='robot', joint_ids=slice(None))
+        torch.testing.assert_close(
+            rewards.power_distribution(env, cfg, penalty_cap=1.0e6), torch.tensor([1.0e6]),
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

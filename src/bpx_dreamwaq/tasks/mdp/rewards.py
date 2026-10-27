@@ -44,15 +44,20 @@ def joint_power(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     return power.abs().sum(dim=-1)
 
 
-def power_distribution(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+def power_distribution(
+    env, asset_cfg: SceneEntityCfg, penalty_cap: float = 1.0e8,
+) -> torch.Tensor:
     """DreamWaQ Table I: square of population variance of signed motor power.
 
     This follows the displayed var(tau * qdot)^2 formula literally, rather than
-    variance of absolute power or mean squared power. Units are W^4.
+    variance of absolute power or mean squared power. Units are W^4, so the
+    result is capped before RewardManager applies its weight and dt.
     """
+    if not math.isfinite(penalty_cap) or penalty_cap <= 0:
+        raise ValueError("penalty_cap 必须为有限正数")
     data = env.scene[asset_cfg.name].data
     power = data.applied_torque[:, asset_cfg.joint_ids] * data.joint_vel[:, asset_cfg.joint_ids]
-    return power.var(dim=-1, unbiased=False).square()
+    return power.var(dim=-1, unbiased=False).square().clamp(max=penalty_cap)
 
 
 def _standing_command_mask(command: torch.Tensor, command_threshold: float) -> torch.Tensor:
@@ -146,13 +151,17 @@ def base_height_l2(
     target_height: float,
     asset_cfg: SceneEntityCfg,
     sensor_cfg: SceneEntityCfg,
+    height_scale: float = 1.0,
 ) -> torch.Tensor:
-    """惩罚机身相对扫描区域平均地面高度与目标高度的平方误差。
+    """惩罚机身相对扫描区域平均地面高度的归一化平方误差。
 
     与 Isaac Lab 的地形感知高度项一致，额外过滤无效射线；整个环境
     没有有效命中点时返回零。扫描均值是对坡面、台阶支撑面的近似，
     ``target_height`` 指机器人根坐标原点距该参考面的高度（米）。
+    误差除以 ``height_scale``（米）后平方；默认 1.0 保持原始尺度。
     """
+    if not math.isfinite(height_scale) or height_scale <= 0:
+        raise ValueError("height_scale 必须为有限正数")
     asset = env.scene[asset_cfg.name]
     sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
     ray_hits = sensor.data.ray_hits_w
@@ -161,7 +170,7 @@ def base_height_l2(
     ground_height = torch.where(valid_hits, ray_hits[:, :, 2], 0.0).sum(dim=1)
     ground_height = ground_height / valid_count.clamp_min(1)
     height_error = asset.data.root_pos_w[:, 2] - ground_height - target_height
-    return torch.where(valid_count > 0, torch.square(height_error), 0.0)
+    return torch.where(valid_count > 0, torch.square(height_error / height_scale), 0.0)
 
 
 def feet_clearance(
@@ -203,17 +212,21 @@ def feet_lateral_distance(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,
     minimum_distance: float = 0.26,
+    maximum_distance: float = 0.42,
 ) -> torch.Tensor:
-    """惩罚前、后左右足的横向间距不足，返回归一化缺口的平方和。
+    """惩罚前、后左右足横向间距超出允许区间，返回归一化偏差平方和。
 
     ``asset_cfg`` 必须按 FL、FR、HL、HR 顺序选择四个 toe_link（配置需
     ``preserve_order=True``）。间距是仅消除机身 yaw 后的有符号 y 差；
-    不使用前后距离或高度差，交叉腿也持续受罚。达到下限后代价为零，
-    不鼓励无限张腿。站立、摆腿和转向均计算，不依赖触地或速度门限。
+    不使用前后距离或高度差，交叉腿也持续受罚。区间内代价为零；
+    过窄、过宽的偏差均除以 minimum_distance，保持两侧同等惩罚尺度。
+    站立、摆腿和转向均计算，不依赖触地或速度门限。
     RewardManager 统一乘权重与 dt，此处只返回非负代价。
     """
     if not math.isfinite(minimum_distance) or minimum_distance <= 0:
         raise ValueError("minimum_distance 必须为有限正数")
+    if not math.isfinite(maximum_distance) or maximum_distance < minimum_distance:
+        raise ValueError("maximum_distance 必须有限且不小于 minimum_distance")
     asset = env.scene[asset_cfg.name]
     foot_pos = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
     if foot_pos.shape[1] != 4:
@@ -228,7 +241,8 @@ def feet_lateral_distance(
         + yaw.cos().unsqueeze(1) * pair_delta[:, :, 1]
     )
     deficit = torch.clamp(1.0 - lateral_distance / minimum_distance, min=0.0)
-    return deficit.square().sum(dim=1)
+    excess = torch.clamp((lateral_distance - maximum_distance) / minimum_distance, min=0.0)
+    return (deficit.square() + excess.square()).sum(dim=1)
 
 
 def feet_longitudinal_distance(

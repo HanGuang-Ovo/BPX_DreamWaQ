@@ -711,13 +711,10 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 
 | 事件 | 模式 | 参数 |
 | --- | --- | --- |
-| 物理材质 | startup | 静/动摩擦 [0.2, 1.25]，动摩擦不超过静摩擦；恢复系数 0、64 桶随机 |
-| 机身质量 | startup | torso 加 −1.0～+2.0 kg |
-| 初始位姿 | reset | x/y ∈ ±0.5 m，yaw ∈ ±π，初速度为零 |
-| 关节复位 | reset | 位置比例 1.0，速度 0 |
-| 质心 | startup | torso 的 x/y/z 各 ±0.05 m |
-| PD 增益 / 电机强度 | actuator reset | 每环境、每关节独立乘 [0.9, 1.1]；从名义值采样，不累乘 |
-| 执行器延迟 | actuator reset | 每环境独立抽取 0–3 个物理步，即 0/5/10/15 ms |
+| 物理材质 | startup | 静摩擦 [0.5, 1.4]、动摩擦 [0.4, 1.0]；恢复系数 0、64 桶随机，与 BPX_test 相同 |
+| 初始位姿 | reset | x/y ∈ ±0.1 m，yaw ∈ ±π，初速度为零，与 BPX_test 粗糙地形任务相同 |
+| 关节复位 | reset | 默认关节角加 ±0.2 rad，关节速度 ±0.1 rad/s |
+| PD 增益 | startup | 刚度、阻尼各乘 [0.9, 1.1]，均匀分布 |
 | 本体测量噪声 | 每次观测 | 均匀噪声：角速度 ±0.2 rad/s、重力 ±0.05、关节角 ±0.01 rad、关节速度 ±1.5 rad/s |
 | 外力推挤 | interval 10–15 s | x/y 速度 ±0.5 m/s |
 
@@ -751,13 +748,13 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | --- | --- | --- | --- |
 | `lin_vel_z_l2` | −2.0 | 内置 | 抑制机身竖直速度 |
 | `ang_vel_xy_l2` | −0.05 | 内置 | 抑制 roll/pitch 角速度抖动 |
-| `base_height_l2` | −1.0 | 本工程 | `(机身高度 − 扫描地面均值 − 0.42)²`；无有效射线时跳过该环境 |
+| `base_height_l2` | −1.0 | 本工程 | `((机身高度 − 扫描地面均值 − 0.42) / 0.10)²`；无有效射线时跳过该环境 |
 | `flat_orientation_l2` | −0.3 | 内置 | 惩罚 roll/pitch 偏离水平（投影重力） |
 | `joint_pos_limits` | −0.2 | 内置 | 关节位置越界 |
 | `dof_torques_l2` | −1.0e-4 | 内置 | 关节力矩平方和 |
 | `dof_acc_l2` | −2.5e-7 | 本工程 | 关节加速度平方和；单环境上限 1e8，异常加速度按上限计 |
 | `joint_power` | −2e−5 | 本工程 | `sum(abs(applied_torque * joint_vel))`，正负功率不抵消 |
-| `power_distribution` | −1e−5 | 本工程 | 按论文表 I 的字面公式：有符号功率的总体方差再平方，`Var(τ·q̇)²`，不是绝对功率方差 |
+| `power_distribution` | −1e−8 | 本工程 | 按论文表 I 的字面公式：有符号功率的总体方差再平方，`Var(τ·q̇)²`（W⁴），原始代价上限 1e8 |
 | `action_rate_l2` | −0.01 | 内置 | 一阶动作变化率 |
 | `action_smoothness_l2` | −0.01 | 本工程 | 二阶动作差分 `sum((a_t − 2a_{t−1} + a_{t−2})²)` |
 
@@ -769,7 +766,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | `feet_air_time_excess` | −1.0 | 本工程 | 单脚连续悬空超过 0.6 s 后线性惩罚，每脚上限 1 |
 | `feet_contact_balance` | −1.0 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
 | `feet_clearance` | −0.01 | 本工程 | `toe_link` 距局部地面 0.10 m 的误差平方 × 足端水平速度 |
-| `feet_lateral_distance` | −0.3 | 本工程 | 左右足横向间距不足 0.26 m 的归一化缺口平方 |
+| `feet_lateral_distance` | −0.3 | 本工程 | 前、后左右足横向间距超出 0.26–0.42 m 时，偏差除以 0.26 m 后平方求和 |
 | `feet_longitudinal_distance` | −0.3 | 本工程 | 同侧前后足纵向间距不足 0.30 m 的归一化缺口平方 |
 | `undesired_contacts` | −1.0 | 内置 | torso 接触力 > 1 N |
 
@@ -932,14 +929,14 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 
 ### 6.7 归一化与随机化升级后的训练 / 导出
 
-训练使用显式延迟 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），以便在物理步
-级别施加延迟和电机强度变化。PLAY 配置关闭新增随机化与噪声。Runner 从
+训练使用与 BPX_test 相同的隐式 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），
+不启用质量、质心、电机强度或延迟随机化。PLAY 配置关闭材质、增益随机化、推扰与观测噪声。Runner 从
 历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
 Critic 保留无噪声特权观测。
 
 新模型的归一化统计随 checkpoint 恢复和导出。旧 checkpoint 仍可按原始未
 归一化方式导出；继续旧训练需匹配旧配置（包括关闭经验归一化），不要把旧权重
-直接视为已适配新的归一化、奖励和显式执行器。建议为此配置开启新的训练运行。
+直接视为已适配当前归一化、奖励和执行器配置。建议为此配置开启新的训练运行。
 
 功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
 与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。

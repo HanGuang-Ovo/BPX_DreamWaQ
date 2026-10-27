@@ -12,7 +12,7 @@
   共 235 维。真实速度位于前 3 维（``true_vel_slice=(0, 3)``）。
 
 动作与控制契约与部署一致：12 维动作，``q_target = q_default + 0.5 × a``，
-显式延迟 PD（名义 stiffness 40，damping 1），200 Hz 物理步（dt=0.005）× 4 分频 =
+隐式 PD（stiffness 40，damping 1），200 Hz 物理步（dt=0.005）× 4 分频 =
 50 Hz 策略频率。
 
 课程开关（模块 A / 模块 B，可独立启停）：
@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 
 import isaaclab.sim as sim_utils
-from .actuators import RandomizedDelayedPDActuatorCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -109,12 +109,9 @@ BPX_USD_CFG = ArticulationCfg(
         joint_pos=dict(_BPX_JOINT_PATTERNS),
     ),
     actuators={
-        "legs": RandomizedDelayedPDActuatorCfg(
+        "legs": ImplicitActuatorCfg(
             joint_names_expr=[".*_hip_roll_joint", ".*_hip_pitch_joint", ".*_knee_joint"],
-            effort_limit=30.0,
             effort_limit_sim=30.0,
-            min_delay=0,
-            max_delay=3,  # 0–15 ms at 200 Hz; resampled per environment reset.
             velocity_limit_sim=20.0,
             stiffness=40.0,
             damping=1.0,
@@ -325,35 +322,28 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.2, 1.25),
-            "dynamic_friction_range": (0.2, 1.25),
-            "make_consistent": True,
+            "static_friction_range": (0.5, 1.4),
+            "dynamic_friction_range": (0.4, 1.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
     )
-    add_base_mass = EventTerm(
-        func=lab_mdp.randomize_rigid_body_mass,
+    actuator_gains = EventTerm(
+        func=lab_mdp.randomize_actuator_gains,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="torso"),
-            "mass_distribution_params": (-1.0, 2.0),
-            "operation": "add",
-        },
-    )
-    base_com = EventTerm(
-        func=lab_mdp.randomize_rigid_body_com,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="torso"),
-            "com_range": {axis: (-0.05, 0.05) for axis in ("x", "y", "z")},
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform",
         },
     )
     reset_base = EventTerm(
         func=lab_mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
@@ -365,9 +355,9 @@ class EventCfg:
         },
     )
     reset_robot_joints = EventTerm(
-        func=lab_mdp.reset_joints_by_scale,
+        func=lab_mdp.reset_joints_by_offset,
         mode="reset",
-        params={"position_range": (1.0, 1.0), "velocity_range": (0.0, 0.0)},
+        params={"position_range": (-0.2, 0.2), "velocity_range": (-0.1, 0.1)},
     )
     push_robot = EventTerm(
         func=lab_mdp.push_by_setting_velocity,
@@ -426,6 +416,7 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
             "target_height": 0.42,
+            "height_scale": 0.10,  # 10 cm 偏差对应单位代价，再乘权重和 dt。
         },
     )
     # 机械功率总量与电机功率分布（DreamWaQ Table I）。
@@ -434,8 +425,11 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
     )
     power_distribution = RewTerm(
-        func=bpx_rewards.power_distribution, weight=-1.0e-5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
+        func=bpx_rewards.power_distribution, weight=-1.0e-8,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True),
+            "penalty_cap": 1.0e8,
+        },
     )
     # 保留原有力矩平方正则。
     dof_torques_l2 = RewTerm(
@@ -470,7 +464,7 @@ class RewardsCfg:
             "max_ray_distance": 0.15,
         },
     )
-    '''脚间距惩罚：前后对角线距离不小于 0.26 m，前后纵向距离不小于 0.30 m。'''
+    '''脚间距惩罚：前、后左右足横向间距为 0.26–0.42 m，同侧前后纵向间距不小于 0.30 m。'''
     feet_lateral_distance = RewTerm(
         func=bpx_rewards.feet_lateral_distance,
         weight=-0.3,
@@ -481,6 +475,7 @@ class RewardsCfg:
                 preserve_order=True,
             ),
             "minimum_distance": 0.26,
+            "maximum_distance": 0.32,
         },
     )
     feet_longitudinal_distance = RewTerm(
@@ -732,9 +727,5 @@ class BPXRoughEnvCfg_PLAY(BPXRoughEnvCfg):
         self.curriculum.terrain_levels = None
         self.events.push_robot = None
         self.events.physics_material = None
-        self.events.add_base_mass = None
-        self.events.base_com = None
+        self.events.actuator_gains = None
         self.observations.prop_history.enable_corruption = False
-        actuator = self.scene.robot.actuators["legs"]
-        actuator.min_delay = actuator.max_delay = 0
-        actuator.kp_factor_range = actuator.kd_factor_range = actuator.strength_range = (1.0, 1.0)

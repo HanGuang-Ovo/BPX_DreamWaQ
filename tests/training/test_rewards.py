@@ -120,7 +120,7 @@ class TestJointAccelerationPenalty(unittest.TestCase):
 
 
 class TestBaseHeight(unittest.TestCase):
-    def penalty(self, root_positions, ray_hits):
+    def penalty(self, root_positions, ray_hits, **kwargs):
         env = SimpleNamespace(scene=_Scene(
             robot=SimpleNamespace(data=SimpleNamespace(
                 root_pos_w=torch.tensor(root_positions, dtype=torch.float32),
@@ -133,7 +133,20 @@ class TestBaseHeight(unittest.TestCase):
             env, target_height=0.42,
             asset_cfg=SimpleNamespace(name="robot"),
             sensor_cfg=SimpleNamespace(name="height_scanner"),
+            **kwargs,
         )
+
+    def test_ten_centimetre_scale_normalizes_both_sides(self):
+        result = self.penalty(
+            [[0, 0, .32], [0, 0, .52], [0, 0, .37]],
+            [[[0, 0, 0]]] * 3, height_scale=.10,
+        )
+        torch.testing.assert_close(result, torch.tensor([1., 1., .25]))
+
+    def test_invalid_height_scale_is_rejected(self):
+        for scale in (0., -1., float("nan"), float("inf")):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                self.penalty([[0, 0, .42]], [[[0, 0, 0]]], height_scale=scale)
 
     def test_target_height_on_flat_and_raised_ground(self):
         result = self.penalty(
@@ -241,9 +254,18 @@ class TestFeetLateralDistance(unittest.TestCase):
         return [[.24, front_width / 2, 0], [.24, -front_width / 2, 0],
                 [-.24, hind_width / 2, 0], [-.24, -hind_width / 2, 0]]
 
-    def test_nominal_threshold_and_wider_stances_have_zero_cost(self):
-        result = self.penalty([self.feet(.34244, .34244), self.feet(.26, .26), self.feet(.5, .5)])
+    def test_nominal_and_interval_boundaries_have_zero_cost(self):
+        result = self.penalty([self.feet(.34244, .34244), self.feet(.26, .26), self.feet(.42, .42)])
         torch.testing.assert_close(result, torch.zeros(3))
+
+    def test_wide_and_narrow_pairs_have_equal_cost_for_equal_deviation(self):
+        result = self.penalty([self.feet(.55, .42), self.feet(.55, .55),
+                               self.feet(.13, .55)])
+        torch.testing.assert_close(result, torch.tensor([.25, .5, .5]))
+
+    def test_custom_upper_limit(self):
+        result = self.penalty([self.feet(.56, .30)], maximum_distance=.30)
+        torch.testing.assert_close(result, torch.ones(1))
 
     def test_each_pair_counts_and_crossed_feet_cannot_escape(self):
         result = self.penalty([self.feet(.13, .26), self.feet(.13, .13),
@@ -276,6 +298,9 @@ class TestFeetLateralDistance(unittest.TestCase):
         torch.testing.assert_close(self.penalty(positions, body_ids=[4, 2, 3, 1]), torch.tensor([.25]))
 
     def test_invalid_distance_or_foot_count_is_rejected(self):
+        for distance in (.25, 0., -1., float("nan"), float("inf")):
+            with self.subTest(maximum_distance=distance), self.assertRaises(ValueError):
+                self.penalty([self.feet(.26, .26)], maximum_distance=distance)
         for distance in (0., -1., float("nan"), float("inf")):
             with self.subTest(distance=distance), self.assertRaises(ValueError):
                 self.penalty([self.feet(.26, .26)], minimum_distance=distance)
