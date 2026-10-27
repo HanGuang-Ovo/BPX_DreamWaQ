@@ -58,12 +58,20 @@ def main():
         import gymnasium as gym
         import torch
         import bpx_dreamwaq.tasks  # noqa: F401
+        from isaaclab.actuators import IdealPDActuatorCfg
         from isaaclab.envs.mdp import UniformVelocityCommandCfg
         from bpx_dreamwaq.tasks.rough_env_cfg import BPXRoughEnvCfg_PLAY
         from bpx_dreamwaq.tasks.agents.checkpoint import build_policy_from_checkpoint
         from bpx_dreamwaq.tasks.evaluation import AcceptanceMetrics
 
         cfg = BPXRoughEnvCfg_PLAY()
+        # 保留显式 PD 验收语义，不依赖训练环境的默认执行器。
+        cfg.scene.robot.actuators["legs"] = IdealPDActuatorCfg(
+            joint_names_expr=[".*_hip_roll_joint", ".*_hip_pitch_joint", ".*_knee_joint"],
+            effort_limit=30.0, effort_limit_sim=30.0,
+            velocity_limit=20.0, velocity_limit_sim=1.0e9,
+            stiffness=40.0, damping=1.0,
+        )
         cfg.seed = args.seed
         cfg.scene.num_envs = args.num_envs
         cfg.scene.env_spacing = 3.0

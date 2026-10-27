@@ -15,7 +15,7 @@ realtime = true
 integrator = "euler"
 
 [control]
-# Isaac Lab JointPositionActionCfg 与 IdealPDActuatorCfg 的名义参数。
+# 与训练的关节目标和名义增益一致；MuJoCo 使用显式力矩 PD。
 mode = "explicit"
 action_scale = 0.5
 stiffness = 40.0

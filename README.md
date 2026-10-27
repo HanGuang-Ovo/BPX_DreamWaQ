@@ -931,7 +931,8 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 
 ### 6.7 归一化与随机化升级后的训练 / 导出
 
-训练使用与部署端相同形式的显式力矩 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），
+训练使用 PhysX 隐式 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm、速度上限 20 rad/s），
+MuJoCo 部署使用显式力矩 PD；两种执行器的动力学不完全相同。
 不启用质量、质心、电机强度或延迟随机化。PLAY 配置关闭材质、增益随机化、推扰与观测噪声。Runner 从
 历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
 Critic 保留无噪声特权观测。
@@ -941,30 +942,31 @@ Critic 保留无噪声特权观测。
 继续训练；如需启用归一化训练，把配置改回 `True` 并开新运行，不要把旧权重
 直接视为已适配当前归一化、奖励和执行器配置。
 
+隐式执行器提供给奖励的力矩是近似值，不是 PhysX 关节驱动力矩的精确测量。
 功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
 与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。
 
-### 6.8 显式 PD 微调与确定性验收
+### 6.8 微调与显式 PD 确定性验收
 
-每个 5 ms 物理步执行 `tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`，
-策略每 20 ms 更新一次目标。训练中原有的 ±10% 增益随机化仍生效，PLAY/验收关闭它。
-部署显式 PD 没有实现硬速度制动，因此训练使用 `velocity_limit_sim=1e9` 避免 PhysX
-在 20 rad/s 处额外制动；`velocity_limit=20` 只是名义参数，IdealPDActuator 不据此裁剪速度。
+训练使用隐式 PD，策略每 20 ms 更新一次目标；训练中的 ±10% 增益随机化仍生效，
+PLAY/验收关闭它。验收脚本独立使用显式 PD，每个 5 ms 物理步执行
+`tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`；验收不施加
+20 rad/s 的 PhysX 硬速度制动，便于检查策略对显式力矩控制的适应性。
 
-从当前隐式 PD checkpoint 开始微调：
+使用与当前网络维度和归一化设置兼容的 checkpoint 开始微调：
 
 ```bash
 bash scripts/training_python.sh scripts/train.py \
   --headless --num_envs 512 --finetune \
   --checkpoint outputs/training/20261027_113955/model_1200.pt \
-  --max_iterations 1000 --run_name explicit_pd
+  --max_iterations 1000 --run_name implicit_pd
 ```
 
 `--finetune` 加载全部网络权重与归一化统计，使用新优化器、从第 0 轮计数，默认初始
 学习率 `1e-4`，默认关闭 AdaBoot，使 Actor 在微调时全部使用 CENet 估计速度。
 Critic 和 CENet 的监督损失仍使用真实速度。可用 `--learning_rate` 和 `--adaboot`
 显式覆盖上述微调默认值。`--max_iterations` 是本次额外训练轮数。
-从头训练仍保留原有 AdaBoot 默认设置；`--resume` 保留优化器和轮次，适合继续同一显式 PD 训练。
+从头训练仍保留原有 AdaBoot 默认设置；`--resume` 保留优化器和轮次，适合继续同一配置训练。
 源 checkpoint 应使用与当前配置兼容的网络维度和归一化设置；形状/统计缺失会报错。
 每次运行在 `params/env.yaml`、`params/agent.yaml` 保存配置，checkpoint 元数据记录控制方式和源权重路径。
 

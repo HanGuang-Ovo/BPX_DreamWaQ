@@ -161,7 +161,7 @@ def main():
     train_cfg["control_contract"] = {
         "actuator": actuator_cfg.class_type.__name__,
         "stiffness": actuator_cfg.stiffness, "damping": actuator_cfg.damping,
-        "torque_limit": actuator_cfg.effort_limit,
+        "torque_limit": actuator_cfg.effort_limit_sim,
         "velocity_limit_sim": actuator_cfg.velocity_limit_sim,
         "action_scale": env_cfg.actions.joint_pos.scale, "physics_dt": env_cfg.sim.dt,
         "decimation": env_cfg.decimation,
@@ -174,7 +174,7 @@ def main():
 
     try:
         if args_cli.finetune:
-            print(f"[train] 显式 PD 微调，加载权重/归一化，重建优化器: {args_cli.checkpoint}")
+            print(f"[train] 微调，加载权重/归一化，重建优化器: {args_cli.checkpoint}")
             runner.load_for_finetuning(args_cli.checkpoint)
         elif args_cli.resume:
             print(f"[train] 从 checkpoint 恢复: {args_cli.checkpoint}")
