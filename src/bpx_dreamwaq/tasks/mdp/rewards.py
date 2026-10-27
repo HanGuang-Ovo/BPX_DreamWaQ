@@ -120,6 +120,29 @@ def track_ang_vel_z_stand_exp(
     return torch.where(standing, reward, torch.zeros_like(reward))
 
 
+def feet_slip_stand(
+    env: "ManagerBasedRLEnv",
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """全零指令时，对触地足端的世界坐标水平速度求和（m/s）。
+
+    两个实体配置必须按相同顺序选择足端；腾空足端与非零指令不计费。
+    接触状态使用传感器当前接触时间，奖励管理器负责乘权重与 dt。
+    """
+    asset = env.scene[asset_cfg.name]
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    foot_vel = asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids, :2]
+    contact = sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    if foot_vel.shape[:2] != contact.shape:
+        raise ValueError("足端速度和接触传感器必须选择相同数量的足端")
+    speed = torch.linalg.vector_norm(foot_vel, dim=-1)
+    command = env.command_manager.get_command(command_name)
+    standing = (command == 0).all(dim=1)
+    return torch.where(standing, torch.where(contact, speed, 0.0).sum(dim=1), 0.0)
+
+
 def joint_acc_l2(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,

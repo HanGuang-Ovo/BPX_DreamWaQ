@@ -865,7 +865,9 @@ PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
    是更新阶段的控制开关，开启后重算特征并保留 rollout 的 AdaBoot 分支；
    此模式要求 `latent_actor_mode="mean"`，不支持随机 latent 重采样。
 4. **损失权重**：论文未给出 λ_vel/λ_pred/β 数值；默认 1.0/1.0/1e-3。
-5. **观测归一化**：默认 `empirical_normalization=True`。每轮优化结束后，用整轮采样的
+5. **观测归一化**：默认关闭（`empirical_normalization=False`），策略直接使用原始
+   观测，checkpoint 不保存 `obs_normalizer`/`critic_normalizer` 统计，可与早期
+   未归一化 checkpoint 互相恢复。置为 `True` 时，每轮优化结束后用整轮采样的
    本体末帧和特权观测更新统计，供下一轮使用；采样与 PPO 更新期间冻结。
    第一轮使用单位变换，避免只用 reset 状态初始化统计。
    单帧、历史各帧、下一帧预测目标共用本体统计，速度监督保留 m/s。
@@ -934,9 +936,10 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
 Critic 保留无噪声特权观测。
 
-新模型的归一化统计随 checkpoint 恢复和导出。旧 checkpoint 仍可按原始未
-归一化方式导出；继续旧训练需匹配旧配置（包括关闭经验归一化），不要把旧权重
-直接视为已适配当前归一化、奖励和执行器配置。建议为此配置开启新的训练运行。
+新模型的归一化统计随 checkpoint 恢复和导出。当前默认关闭经验归一化
+（`empirical_normalization=False`），旧 checkpoint 可直接按原始未归一化方式导出或
+继续训练；如需启用归一化训练，把配置改回 `True` 并开新运行，不要把旧权重
+直接视为已适配当前归一化、奖励和执行器配置。
 
 功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
 与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。

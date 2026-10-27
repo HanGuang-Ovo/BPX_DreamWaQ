@@ -57,6 +57,26 @@ class _Scene(dict):
         return self
 
 
+class TestStandFootSlip(unittest.TestCase):
+    def test_only_contacting_feet_at_exact_zero_command_are_penalized(self):
+        velocities = torch.tensor([
+            [[3., 4., 9.], [10., 0., 0.], [0., 2., 0.], [0., 0., 5.]],
+        ] * 4)
+        contacts = torch.tensor([[.1, 0., .2, .1]] * 4)
+        commands = torch.tensor([[0., 0., 0.], [.01, 0., 0.], [0., 0., .01], [0., 0., 0.]])
+        contacts[3] = 0
+        env = SimpleNamespace(
+            scene=_Scene(robot=SimpleNamespace(data=SimpleNamespace(body_link_lin_vel_w=velocities)),
+                         contact_forces=SimpleNamespace(data=SimpleNamespace(current_contact_time=contacts))),
+            command_manager=SimpleNamespace(get_command=lambda name: commands),
+        )
+        result = rewards.feet_slip_stand(
+            env, "base_velocity", SimpleNamespace(name="robot", body_ids=[0, 1, 2, 3]),
+            SimpleNamespace(name="contact_forces", body_ids=[0, 1, 2, 3]),
+        )
+        torch.testing.assert_close(result, torch.tensor([7., 0., 0., 0.]))
+
+
 def make_clearance_env(positions, velocities, hits):
     data = SimpleNamespace(
         body_link_pos_w=torch.tensor(positions, dtype=torch.float32),

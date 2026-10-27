@@ -87,7 +87,9 @@ class BPXDreamWaQPPORunnerCfg:
     device: str = "cuda:0"
     num_steps_per_env: int = 24
     max_iterations: int = 1500
-    empirical_normalization: bool = True
+    # 关闭经验观测归一化（默认关闭）：策略直接吃原始观测，checkpoint 不再保存
+    # obs_normalizer/critic_normalizer 统计，可与 2026-10-23 之前的旧 checkpoint 互相恢复。
+    empirical_normalization: bool = False
     policy: DreamWaQActorCriticCfg = DreamWaQActorCriticCfg()
     algorithm: DreamWaQPpoAlgorithmCfg = DreamWaQPpoAlgorithmCfg()
     clip_actions: float | None = None

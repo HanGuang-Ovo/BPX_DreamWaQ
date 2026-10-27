@@ -402,6 +402,16 @@ class RewardsCfg:
         weight=2.0,
         params={"command_name": "base_velocity", "std": 0.05, "command_threshold": 0.05},
     )
+    # 全零指令时惩罚触地足端水平滑动；两侧按相同足端顺序选择。
+    feet_slip_stand = RewTerm(
+        func=bpx_rewards.feet_slip_stand,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"], preserve_order=True),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"], preserve_order=True),
+        },
+    )
     # -- 正则
     '''z轴抖动惩罚'''
     lin_vel_z_l2 = RewTerm(
@@ -416,7 +426,7 @@ class RewardsCfg:
     '''高度偏离目标惩罚'''
     base_height_l2 = RewTerm(
         func=bpx_rewards.base_height_l2,
-        weight=-1.0,
+        weight=-0.2,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -480,7 +490,7 @@ class RewardsCfg:
                 preserve_order=True,
             ),
             "minimum_distance": 0.26,
-            "maximum_distance": 0.32,
+            "maximum_distance": 0.42,
         },
     )
     feet_longitudinal_distance = RewTerm(
