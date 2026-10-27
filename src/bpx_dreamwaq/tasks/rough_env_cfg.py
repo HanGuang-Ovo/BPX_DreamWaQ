@@ -375,27 +375,27 @@ class RewardsCfg:
     ''' 速度跟踪奖励 '''
     track_lin_vel_xy_exp = RewTerm(
         func=lab_mdp.track_lin_vel_xy_exp,
-        weight=1.5,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=2.0,
+        params={"command_name": "base_velocity", "std": 0.4},
     )
     '''角速度跟踪奖励'''
     track_ang_vel_z_exp = RewTerm(
         func=lab_mdp.track_ang_vel_z_exp,
-        weight=0.75,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=1.5,
+        params={"command_name": "base_velocity", "std": 0.4},
     )
     '''零指令站立：只在三轴指令近零时生效的窄核速度跟踪。
     std 从 0.5 收紧到 0.1，使 0.01 m/s 残速与 0.07 rad/s 漂移产生实际梯度
     （默认宽度下两者几乎不损失奖励）。非站立环境为 0，不改变行走段。'''
     track_lin_vel_xy_stand_exp = RewTerm(
         func=bpx_rewards.track_lin_vel_xy_stand_exp,
-        weight=1.5,
-        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+        weight=2.5,
+        params={"command_name": "base_velocity", "std": 0.05, "command_threshold": 0.05},
     )
     track_ang_vel_z_stand_exp = RewTerm(
         func=bpx_rewards.track_ang_vel_z_stand_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+        weight=2.0,
+        params={"command_name": "base_velocity", "std": 0.05, "command_threshold": 0.05},
     )
     # -- 正则
     '''z轴抖动惩罚'''
