@@ -37,7 +37,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 
-from .dreamwaq_actor_critic import DreamWaQActorCritic
+from .dreamwaq_actor_critic import DeployableDreamWaQPolicy, DreamWaQActorCritic
 
 
 def _compute_reward_cv(rewards) -> float | None:
@@ -607,6 +607,29 @@ class DreamWaQRunner(OnPolicyRunner):
     def _extract_true_vel(self, privileged_obs: torch.Tensor) -> torch.Tensor:
         start, end = self.true_vel_slice
         return privileged_obs[:, start:end]
+
+    def get_inference_policy(self, device=None):
+        """Return deterministic CENet + Actor; input is raw prop_history (B, 450).
+
+        Never reuse rollout AdaBoot features or the base runner's single-frame
+        inference path. Normalization is already inside the returned module.
+        """
+        self.eval_mode()
+        if device is not None:
+            self.policy.to(device)
+        return DeployableDreamWaQPolicy(self.policy).eval()
+
+    def load_for_finetuning(self, path: str):
+        """Load model and running moments into a fresh runner, keeping its optimizer.
+
+        Fine-tuning starts iteration numbering and AdaBoot state from this run's
+        configuration. Use load() for an optimizer-preserving resume instead.
+        """
+        if self.current_learning_iteration != 0 or self.alg.optimizer.state:
+            raise RuntimeError("微调权重必须加载到尚未训练的新 Runner")
+        infos = self.load(path, load_optimizer=False)
+        self.current_learning_iteration = 0
+        return infos
 
     def save(self, path: str, infos=None):
         infos = dict(infos or {})

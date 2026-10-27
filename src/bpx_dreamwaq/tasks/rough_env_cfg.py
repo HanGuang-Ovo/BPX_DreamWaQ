@@ -12,7 +12,7 @@
   共 235 维。真实速度位于前 3 维（``true_vel_slice=(0, 3)``）。
 
 动作与控制契约与部署一致：12 维动作，``q_target = q_default + 0.5 × a``，
-隐式 PD（stiffness 40，damping 1），200 Hz 物理步（dt=0.005）× 4 分频 =
+显式力矩 PD（stiffness 40，damping 1，力矩裁剪 ±30 Nm），200 Hz 物理步（dt=0.005）× 4 分频 =
 50 Hz 策略频率。
 
 课程开关（模块 A / 模块 B，可独立启停）：
@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -109,10 +109,15 @@ BPX_USD_CFG = ArticulationCfg(
         joint_pos=dict(_BPX_JOINT_PATTERNS),
     ),
     actuators={
-        "legs": ImplicitActuatorCfg(
+        "legs": IdealPDActuatorCfg(
             joint_names_expr=[".*_hip_roll_joint", ".*_hip_pitch_joint", ".*_knee_joint"],
+            # 每个物理步计算 clip(40 * (q_target - q) - dq, -30, 30)。
+            effort_limit=30.0,
             effort_limit_sim=30.0,
-            velocity_limit_sim=20.0,
+            velocity_limit=20.0,
+            # 部署显式 PD 没有硬速度制动；避免 PhysX 在 20 rad/s 处额外施力。
+            # IdealPDActuator 只裁剪力矩，不使用 velocity_limit 做转速降额。
+            velocity_limit_sim=1.0e9,
             stiffness=40.0,
             damping=1.0,
         ),

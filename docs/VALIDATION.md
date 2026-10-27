@@ -2,6 +2,26 @@
 
 日期：2026-10-20。所有测试在本机离线执行，未连接机器人。
 
+## 显式 PD 训练与确定性验收（2026-10-27）
+
+- 训练改用 `IdealPDActuatorCfg`：200 Hz 显式力矩 PD，Kp=40、Kd=1、
+  ±30 Nm 裁剪，50 Hz 策略；取消部署端没有的 PhysX 20 rad/s 硬制动。
+- 165 项训练单元测试通过。新增覆盖确定性推理不复用 AdaBoot 特征、微调保留新优化器、
+  归一化恢复、逐环境验收、warmup 失败统计、提前结束和非有限状态拒绝。
+- 本机 GPU 使用 `model_1200.pt` 做两轮、16 环境的微调冒烟测试：Actor、CENet、Critic
+  权重均发生更新，所有模型张量有限，归一化样本数增加 768；保存的配置确认使用显式 PD、
+  初始学习率 1e-4、关闭 AdaBoot。新 checkpoint 可由部署加载器读取。
+- `evaluate_policy.py` 在平地跑完零指令与 vx=0.3 两个 20 秒案例。
+  旧隐式 PD checkpoint 未通过：站立案例有 23 次提前终止；行走案例无终止，但逐环境
+  最大平面速度 RMSE 为 0.261 m/s，超过默认 0.15 门槛。
+- GPU 短测验证两个案例之间可正常 reset，报告完整写入，未达标返回码为 2。
+  使用 Kit `post_quit(code)` 保留返回码并避免关闭快速退出后出现的原生清理崩溃。
+- 验收报告位于 `outputs/evaluation/old_checkpoint_explicit_pd.json`，
+  微调冒烟核验位于 `outputs/evaluation/finetune_smoke_verification.json`。
+  本轮只验证训练/验收软件链路，未完成充分微调，不代表新策略已经通过迁移或实机验收。
+
+复现命令和验收门槛见 [README：显式 PD 微调与确定性验收](../README.md#68-显式-pd-微调与确定性验收)。
+
 ## sim2real 部署验证（2026-10-23）
 
 - 当前实机默认模型与 `configs/sim2sim/bpx_mixed.toml` 一致：

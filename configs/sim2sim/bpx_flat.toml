@@ -12,7 +12,7 @@ realtime = true
 integrator = "euler"
 
 [control]
-# Isaac Lab JointPositionActionCfg 与 ImplicitActuatorCfg 的名义参数。
+# Isaac Lab JointPositionActionCfg 与 IdealPDActuatorCfg 的名义参数。
 mode = "explicit"
 action_scale = 0.5
 stiffness = 40.0

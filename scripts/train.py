@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import math
 import os
 import random
 import sys
+import traceback
 from datetime import datetime
 
 from isaaclab.app import AppLauncher
@@ -49,13 +51,26 @@ parser.add_argument("--num_terrain_levels", type=int, default=None, help="Terrai
 parser.add_argument("--adaboot", action="store_true", help="Enable AdaBoot velocity bootstrapping.")
 parser.add_argument("--disable_adaboot", action="store_true", help="Disable AdaBoot velocity bootstrapping.")
 parser.add_argument("--adaboot_mode", type=str, default=None, choices=["error", "reward_cv", "linear"])
-parser.add_argument("--resume", action="store_true", help="Resume from a checkpoint.")
+loading = parser.add_mutually_exclusive_group()
+loading.add_argument("--resume", action="store_true", help="Resume model, optimizer and iteration from a checkpoint.")
+loading.add_argument("--finetune", action="store_true", help="Load weights/normalization with a fresh optimizer and iteration counter.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to load.")
+parser.add_argument("--learning_rate", type=float, default=None, help="Initial learning rate (fine-tuning default: 1e-4).")
 parser.add_argument("--run_name", type=str, default="", help="Sub-directory name for this run.")
 # append AppLauncher cli args and default to headless training
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(headless=True)
 args_cli, _ = parser.parse_known_args()
+if bool(args_cli.checkpoint) != bool(args_cli.resume or args_cli.finetune):
+    parser.error("--checkpoint 必须与 --resume 或 --finetune 一起使用")
+if args_cli.checkpoint and not os.path.isfile(args_cli.checkpoint):
+    parser.error(f"checkpoint 不存在: {args_cli.checkpoint}")
+if args_cli.learning_rate is not None and (
+    not math.isfinite(args_cli.learning_rate) or args_cli.learning_rate <= 0
+):
+    parser.error("--learning_rate 必须为有限正数")
+if args_cli.resume and args_cli.learning_rate is not None:
+    parser.error("--resume 保留优化器；指定新学习率请使用 --finetune")
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -70,6 +85,7 @@ import bpx_dreamwaq.tasks  # noqa: F401  — registers BPX gym environments
 from bpx_dreamwaq.tasks.agents.dreamwaq_ppo import DreamWaQRunner
 
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+from isaaclab.utils.io import dump_yaml
 
 
 def _load_class(entry_point: str):
@@ -102,6 +118,12 @@ def main():
     if args_cli.seed is not None:
         env_cfg.seed = args_cli.seed
         agent_cfg.seed = args_cli.seed
+    if args_cli.finetune:
+        agent_cfg.algorithm.learning_rate = 1.0e-4
+        # 迁移微调默认让 Actor 全程使用估计速度；可显式 --adaboot 覆盖。
+        agent_cfg.algorithm.adaboot_enabled = False
+    if args_cli.learning_rate is not None:
+        agent_cfg.algorithm.learning_rate = args_cli.learning_rate
     if args_cli.adaboot:
         agent_cfg.algorithm.adaboot_enabled = True
     if args_cli.disable_adaboot:
@@ -111,6 +133,7 @@ def main():
 
     # 课程开关在 __post_init__ 中接线，覆盖后需要重建内部配置。
     env_cfg.__post_init__()
+    env_cfg.seed = agent_cfg.seed
 
     if args_cli.max_iterations is not None:
         agent_cfg.max_iterations = args_cli.max_iterations
@@ -134,21 +157,46 @@ def main():
 
     train_cfg = agent_cfg.to_dict()
     train_cfg["true_vel_slice"] = tuple(agent_cfg.true_vel_slice)
+    actuator_cfg = env_cfg.scene.robot.actuators["legs"]
+    train_cfg["control_contract"] = {
+        "actuator": actuator_cfg.class_type.__name__,
+        "stiffness": actuator_cfg.stiffness, "damping": actuator_cfg.damping,
+        "torque_limit": actuator_cfg.effort_limit,
+        "velocity_limit_sim": actuator_cfg.velocity_limit_sim,
+        "action_scale": env_cfg.actions.joint_pos.scale, "physics_dt": env_cfg.sim.dt,
+        "decimation": env_cfg.decimation,
+    }
+    train_cfg["source_checkpoint"] = os.path.abspath(args_cli.checkpoint) if args_cli.checkpoint else None
+    train_cfg["load_mode"] = "finetune" if args_cli.finetune else "resume" if args_cli.resume else "new"
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), train_cfg)
     runner = DreamWaQRunner(env, train_cfg, log_dir=log_dir, device=agent_cfg.device)
 
-    if args_cli.resume:
-        ckpt = args_cli.checkpoint
-        if ckpt is None:
-            raise ValueError("--resume 需要同时指定 --checkpoint")
-        print(f"[train] 从 checkpoint 恢复: {ckpt}")
-        runner.load(ckpt, load_optimizer=True)
+    try:
+        if args_cli.finetune:
+            print(f"[train] 显式 PD 微调，加载权重/归一化，重建优化器: {args_cli.checkpoint}")
+            runner.load_for_finetuning(args_cli.checkpoint)
+        elif args_cli.resume:
+            print(f"[train] 从 checkpoint 恢复: {args_cli.checkpoint}")
+            runner.load(args_cli.checkpoint, load_optimizer=True)
 
-    print(f"[train] 日志目录: {log_dir}")
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
-
-    env.close()
+        print(f"[train] 日志目录: {log_dir}")
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+    finally:
+        if runner.writer is not None:
+            runner.writer.flush()
+            runner.writer.close()
+        env.close()
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        simulation_app.app.post_quit(1 if sys.exc_info()[0] is not None else 0)
+        simulation_app.close()

@@ -929,7 +929,7 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 
 ### 6.7 归一化与随机化升级后的训练 / 导出
 
-训练使用与 BPX_test 相同的隐式 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），
+训练使用与部署端相同形式的显式力矩 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm），
 不启用质量、质心、电机强度或延迟随机化。PLAY 配置关闭材质、增益随机化、推扰与观测噪声。Runner 从
 历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
 Critic 保留无噪声特权观测。
@@ -940,3 +940,49 @@ Critic 保留无噪声特权观测。
 
 功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
 与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。
+
+### 6.8 显式 PD 微调与确定性验收
+
+每个 5 ms 物理步执行 `tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`，
+策略每 20 ms 更新一次目标。训练中原有的 ±10% 增益随机化仍生效，PLAY/验收关闭它。
+部署显式 PD 没有实现硬速度制动，因此训练使用 `velocity_limit_sim=1e9` 避免 PhysX
+在 20 rad/s 处额外制动；`velocity_limit=20` 只是名义参数，IdealPDActuator 不据此裁剪速度。
+
+从当前隐式 PD checkpoint 开始微调：
+
+```bash
+bash scripts/training_python.sh scripts/train.py \
+  --headless --num_envs 512 --finetune \
+  --checkpoint outputs/training/20261027_113955/model_1200.pt \
+  --max_iterations 1000 --run_name explicit_pd
+```
+
+`--finetune` 加载全部网络权重与归一化统计，使用新优化器、从第 0 轮计数，默认初始
+学习率 `1e-4`，默认关闭 AdaBoot，使 Actor 在微调时全部使用 CENet 估计速度。
+Critic 和 CENet 的监督损失仍使用真实速度。可用 `--learning_rate` 和 `--adaboot`
+显式覆盖上述微调默认值。`--max_iterations` 是本次额外训练轮数。
+从头训练仍保留原有 AdaBoot 默认设置；`--resume` 保留优化器和轮次，适合继续同一显式 PD 训练。
+源 checkpoint 应使用与当前配置兼容的网络维度和归一化设置；形状/统计缺失会报错。
+每次运行在 `params/env.yaml`、`params/agent.yaml` 保存配置，checkpoint 元数据记录控制方式和源权重路径。
+
+微调结束后执行独立验收：
+
+```bash
+bash scripts/training_python.sh scripts/evaluate_policy.py \
+  --checkpoint outputs/training/bpx_dreamwaq/<新运行>/model_<轮次>.pt \
+  --num_envs 16 --duration 20 --output outputs/evaluation/explicit_pd.json
+```
+
+默认测试平地零指令和 `vx=0.3 m/s`，从默认站姿启动。输入为原始 450 维历史观测，
+内部归一化，CENet 使用确定性隐变量均值，Actor 输出动作均值；不使用 AdaBoot、真实速度替换
+或动作采样。验收与导出共享 checkpoint 加载器。Runner 的 `get_inference_policy()` 也接收
+`prop_history`，而不是 45 维单帧观测。
+
+每个环境都必须完成测试，且没有 terminated/truncated。前 1 秒只排除速度统计，
+其中的失败仍计入验收。之后逐环境计算平面速度向量误差和偏航角速度误差的 RMSE：
+站立默认门槛为 `0.05 m/s`、`0.10 rad/s`；移动为 `0.15 m/s`、`0.20 rad/s`。
+这些是可调整的工程验收门槛，不代表模型已经达标。JSON 同时记录每环境误差、失败次数、
+CENet 估计误差、checkpoint 哈希和控制参数。全部通过返回码为 0，未达标为 2。
+
+可重复 `--command VX VY WZ` 指定案例，或用 `--linear_tolerance`、`--yaw_tolerance`
+覆盖门槛。验收不覆盖起身、粗糙地形或 sim2sim；通过后仍需导出并在 MuJoCo 复核。
