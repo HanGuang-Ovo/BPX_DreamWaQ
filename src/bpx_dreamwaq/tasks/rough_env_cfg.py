@@ -12,8 +12,8 @@
   共 235 维。真实速度位于前 3 维（``true_vel_slice=(0, 3)``）。
 
 动作契约与部署一致：12 维动作，``q_target = q_default + 0.5 × a``。
-训练采用 PhysX 隐式 PD（stiffness 40，damping 1，力矩上限 30 Nm、速度上限
-20 rad/s），200 Hz 物理步（dt=0.005）× 4 分频 = 50 Hz 策略频率。
+训练与 sim2sim 均采用显式力矩 PD（stiffness 40，damping 1，力矩上限 30 Nm；
+20 rad/s 仅为名义速度，不施加求解器硬速度制动），200 Hz 物理步（dt=0.005）× 4 分频 = 50 Hz 策略频率。
 
 课程开关（模块 A / 模块 B，可独立启停）：
 
@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -109,10 +109,14 @@ BPX_USD_CFG = ArticulationCfg(
         joint_pos=dict(_BPX_JOINT_PATTERNS),
     ),
     actuators={
-        "legs": ImplicitActuatorCfg(
+        "legs": IdealPDActuatorCfg(
             joint_names_expr=[".*_hip_roll_joint", ".*_hip_pitch_joint", ".*_knee_joint"],
+            # 软件 PD 每个物理步计算并限幅；PhysX 不再使用位置驱动。
+            effort_limit=30.0,
             effort_limit_sim=30.0,
-            velocity_limit_sim=20.0,
+            velocity_limit=20.0,
+            # MuJoCo 无 20 rad/s 硬速度制动，训练也禁用该额外约束。
+            velocity_limit_sim=1.0e9,
             stiffness=40.0,
             damping=1.0,
         ),
@@ -390,12 +394,12 @@ class RewardsCfg:
     track_lin_vel_xy_stand_exp = RewTerm(
         func=bpx_rewards.track_lin_vel_xy_stand_exp,
         weight=2.5,
-        params={"command_name": "base_velocity", "std": 0.05, "command_threshold": 0.05},
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
     )
     track_ang_vel_z_stand_exp = RewTerm(
         func=bpx_rewards.track_ang_vel_z_stand_exp,
         weight=2.0,
-        params={"command_name": "base_velocity", "std": 0.05, "command_threshold": 0.05},
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
     )
     # 全零指令时惩罚触地足端水平滑动；两侧按相同足端顺序选择。
     feet_slip_stand = RewTerm(
@@ -466,7 +470,7 @@ class RewardsCfg:
     '''toe_link 原点相对脚下局部地形的目标高度，按足端水平速度加权。'''
     feet_clearance = RewTerm(
         func=bpx_rewards.feet_clearance,
-        weight=-0.01,
+        weight=-0.03,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*toe_link"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -500,10 +504,10 @@ class RewardsCfg:
             "minimum_distance": 0.30,
         },
     )
-    '''脚离地时间奖励'''
+    # 移动/转向时在落脚瞬间评价腾空时间；加大权重以抑制短促碎步。
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
-        weight=0.1,
+        weight=0.3,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
@@ -522,10 +526,10 @@ class RewardsCfg:
             "penalty_cap": 1.0,
         },
     )
-    '''脚部接触平衡奖励'''
+    # 惩罚长期触地占空比失衡；负权重绝对值增大以加强悬腿/偏载约束。
     feet_contact_balance = RewTerm(
         func=bpx_rewards.feet_contact_balance,
-        weight=-1.0,
+        weight=-3.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "time_constant": 1.0,

@@ -29,6 +29,7 @@ class DreamWaQActorCriticCfg:
     cenet_vel_head_hidden_dims: list = [128]
     cenet_vae_head_hidden_dims: list = [128]
     cenet_decoder_hidden_dims: list = [128, 128]
+    cenet_decoder_use_velocity: bool = True
     cenet_latent_dim: int = 16
     cenet_vel_dim: int = 3
     cenet_activation: str = "elu"
@@ -38,6 +39,9 @@ class DreamWaQActorCriticCfg:
     detach_cenet_from_actor: bool = True
     # Actor 使用确定性隐变量均值（保证 PPO 概率比一致性）；可选 "sample"。
     latent_actor_mode: str = "mean"
+    # Manaro 固定尺度内置于网络：原始环境/部署输入不变；新训练默认启用。
+    # 旧 checkpoint 恢复训练需设为 False，不能直接改变已训练策略的输入尺度。
+    fixed_observation_scaling: bool = True
 
 
 @configclass
@@ -61,14 +65,17 @@ class DreamWaQPpoAlgorithmCfg:
     normalize_advantage_per_mini_batch: bool = False
 
     # ---- CENet 辅助损失权重 ----
+    # 独立 Adam 与梯度裁剪；不受 PPO KL 学习率调节影响。
+    cenet_learning_rate: float = 1.0e-3
+    cenet_max_grad_norm: float = 1.0
     lambda_vel: float = 1.0
     lambda_pred: float = 1.0
     beta_kl: float = 1.0e-3
     # 是否允许 Actor 的 PPO 梯度回传 CENet（默认 False，见模块说明）。
     ppo_grad_to_cenet: bool = False
 
-    # ---- AdaBoot 训练引导（默认开启，论文 reward_cv 模式）----
-    adaboot_enabled: bool = True
+    # ---- AdaBoot 训练引导（默认关闭；启用时使用 reward_cv 模式）----
+    adaboot_enabled: bool = False
     # "error": 按速度估计误差过渡（任务伪代码风格）；
     # "reward_cv": 论文公式 p = 1 - tanh(CV(R))；
     # "linear": 线性爬升。
@@ -87,8 +94,7 @@ class BPXDreamWaQPPORunnerCfg:
     device: str = "cuda:0"
     num_steps_per_env: int = 24
     max_iterations: int = 1500
-    # 关闭经验观测归一化（默认关闭）：策略直接吃原始观测，checkpoint 不再保存
-    # obs_normalizer/critic_normalizer 统计，可与 2026-10-23 之前的旧 checkpoint 互相恢复。
+    # 固定缩放与经验归一化互斥；固定尺度由 policy 配置控制并保存到 checkpoint。
     empirical_normalization: bool = False
     policy: DreamWaQActorCriticCfg = DreamWaQActorCriticCfg()
     algorithm: DreamWaQPpoAlgorithmCfg = DreamWaQPpoAlgorithmCfg()

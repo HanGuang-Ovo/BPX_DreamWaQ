@@ -4,7 +4,7 @@
 用法示例（在仓库根目录；配置默认值见 tasks/rough_env_cfg.py 与
 tasks/agents/rsl_rl_ppo_cfg.py，命令行覆盖优先）：
 
-    # 默认配置训练（当前默认：双课程开 + AdaBoot 开 reward_cv 模式）
+    # 默认配置训练（当前默认：双课程开 + AdaBoot 关）
     bash scripts/training_python.sh scripts/train.py --headless --num_envs 512
 
     # 短时冒烟测试
@@ -161,7 +161,9 @@ def main():
     train_cfg["control_contract"] = {
         "actuator": actuator_cfg.class_type.__name__,
         "stiffness": actuator_cfg.stiffness, "damping": actuator_cfg.damping,
-        "torque_limit": actuator_cfg.effort_limit_sim,
+        "torque_limit": actuator_cfg.effort_limit,
+        "torque_limit_sim": actuator_cfg.effort_limit_sim,
+        "velocity_limit": actuator_cfg.velocity_limit,
         "velocity_limit_sim": actuator_cfg.velocity_limit_sim,
         "action_scale": env_cfg.actions.joint_pos.scale, "physics_dt": env_cfg.sim.dt,
         "decimation": env_cfg.decimation,

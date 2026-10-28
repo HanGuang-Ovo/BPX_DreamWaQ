@@ -12,6 +12,16 @@ def build_policy_from_checkpoint(path: str) -> tuple[DeployableDreamWaQPolicy, d
     train_cfg = (checkpoint.get("infos") or {}).get("train_cfg") or {}
     policy_cfg = dict(train_cfg.get("policy") or {})
     policy_cfg.pop("class_name", None)
+    decoder_input = state["cenet.decoder.0.weight"].shape[1]
+    latent_dim = policy_cfg.get("cenet_latent_dim", 16)
+    vel_dim = policy_cfg.get("cenet_vel_dim", 3)
+    if decoder_input not in (latent_dim, latent_dim + vel_dim):
+        raise ValueError("checkpoint decoder input dimension is invalid")
+    policy_cfg.setdefault("cenet_decoder_use_velocity", decoder_input == latent_dim + vel_dim)
+    fixed_in_state = "obs_normalizer.scale" in state
+    policy_cfg.setdefault("fixed_observation_scaling", fixed_in_state)
+    if policy_cfg["fixed_observation_scaling"] != fixed_in_state:
+        raise ValueError("checkpoint 固定缩放配置与权重不一致")
     policy_cfg["observation_normalization"] = train_cfg.get(
         "empirical_normalization", "obs_normalizer.mean" in state
     )
@@ -41,6 +51,7 @@ def build_policy_from_checkpoint(path: str) -> tuple[DeployableDreamWaQPolicy, d
         "history_dim": policy.num_history_obs,
         "actor_input_dim": single_obs_dim() + policy.cenet_vel_dim + policy.cenet_latent_dim,
         "latent_dim": policy.cenet_latent_dim,
+        "fixed_observation_scaling": policy.fixed_observation_scaling,
         "unused_checkpoint_keys": [key for key in unexpected],
     }
 

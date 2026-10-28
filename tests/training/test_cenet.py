@@ -36,8 +36,15 @@ class TestCENet(unittest.TestCase):
 
     def test_decoder_output_dim(self):
         z = torch.randn(4, self.net.latent_dim)
-        out = self.net.decode(z)
+        out = self.net.decode(z, torch.randn(4, 3))
         self.assertEqual(out.shape, (4, self.obs_dim))
+
+    def test_prediction_trains_velocity_head(self):
+        losses = self.net.compute_aux_losses(torch.randn(8, self.history_dim),
+                                             torch.randn(8, self.obs_dim), torch.randn(8, 3))
+        losses["pred_loss"].backward()
+        self.assertGreater(self.net.vel_head[0].weight.grad.abs().sum().item(), 0)
+        self.assertEqual(self.net.decoder[0].in_features, self.net.latent_dim + 3)
 
     def test_aux_losses_finite_and_grads_flow(self):
         history = torch.randn(16, self.history_dim)

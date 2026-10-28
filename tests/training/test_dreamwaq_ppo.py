@@ -110,12 +110,30 @@ class TestDreamWaQPPO(unittest.TestCase):
         self.assertEqual(storage.true_velocities.shape, (NUM_STEPS, NUM_ENVS, 3))
         self.assertEqual(storage.next_observations.shape, (NUM_STEPS, NUM_ENVS, single_obs_dim()))
 
-    def test_cenet_params_in_optimizer(self):
+    def test_optimizers_have_disjoint_complete_parameters(self):
         optimizer_cenet_params = {
-            id(p) for group in self.alg.optimizer.param_groups for p in group["params"]
+            id(p) for group in self.alg.cenet_optimizer.param_groups for p in group["params"]
         }
+        ppo_ids = {id(p) for group in self.alg.optimizer.param_groups for p in group["params"]}
+        self.assertFalse(ppo_ids & optimizer_cenet_params)
+        self.assertEqual(ppo_ids | optimizer_cenet_params, {id(p) for p in self.policy.parameters()})
         for param in self.policy.cenet.parameters():
             self.assertIn(id(param), optimizer_cenet_params, "CENet 参数未注册到优化器")
+
+    def test_auxiliary_weight_does_not_change_ppo_update(self):
+        actors = []
+        for weight in (1.0, 1000.0):
+            policy = make_policy()
+            alg = make_alg(policy, lambda_vel=weight, cenet_learning_rate=3e-4,
+                           schedule="adaptive", desired_kl=1e-8)
+            alg.init_storage("rl", NUM_ENVS, NUM_STEPS, [single_obs_dim()], [NUM_CRITIC_OBS], [ACTION_DIM])
+            torch.manual_seed(42)
+            rollout(alg)
+            alg.update()
+            actors.append([p.detach().clone() for p in policy.actor.parameters()])
+            self.assertEqual(alg.cenet_optimizer.param_groups[0]["lr"], 3e-4)
+        for a, b in zip(*actors):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     def test_update_runs_and_changes_params(self):
         rollout(self.alg)

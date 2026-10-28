@@ -210,7 +210,7 @@ python -m pip install -e .                # 基础：仅 NumPy
 CENet 共享编码器 ──► 速度估计头 ──► vel_hat (3)          ┐
         │                                                ├─► Actor 输入 (45+3+16=64) ──► 12 维动作
         └──────────────► VAE 头 ──► μ (16, 确定性) ──────┘
-                             └──► z (采样) ──► Decoder ──► 预测下一时刻 45 维观测
+                             └──► [vel_hat, z (采样)] ──► Decoder ──► 预测下一时刻 45 维观测
 
 Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 187] = 235 维
 辅助损失: L_CE = λ_vel·MSE(vel_hat, 真实线速度) + λ_pred·MSE(ô_{t+1}, o_{t+1}) + β·KL
@@ -224,11 +224,18 @@ Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 187] = 235 �
   隐变量均值 μ，不做二次采样。
 - **梯度连接**：默认 `detach_cenet_from_actor=True`——Actor 的 PPO 梯度不回传
   CENet，CENet 仅由辅助损失更新；可配置 `ppo_grad_to_cenet=True`。
-- **单一优化器**：CENet 是策略的子模块，与 Actor/Critic 共用一个 Adam 优化器；
-  每个 minibatch 的总损失 = PPO 损失 + CENet 辅助损失。
+- **独立优化器**：Actor/Critic 与 CENet 使用参数互不重叠的 Adam，分别裁剪梯度。
+  CENet 默认固定学习率 `cenet_learning_rate=1e-3`、`cenet_max_grad_norm=1.0`，
+  每个 minibatch 更新一次，不受 PPO 的 KL 学习率调节影响。
+- **速度条件解码器**：默认 `cenet_decoder_use_velocity=True`，输入 `[vel_hat, z]`（19 维）；
+  预测损失通过估计速度回传速度头，不使用真实速度或 AdaBoot 混合速度。
+  固定缩放开启时，估计速度保持与监督标签一致的缩放单位。
+- **模型兼容**：新 checkpoint 保存两套优化器状态。新解码器建议从头训练；
+  旧 checkpoint 导出自动识别原结构，旧权重微调需设置 `cenet_decoder_use_velocity=False`
+  并保持原缩放配置。旧联合优化器 checkpoint 不支持直接恢复为独立优化器。
 - **done 屏蔽**：episode 终止转移的“下一观测”是 reset 后的新 episode 观测，
   预测损失与 KL 损失按 done 掩码屏蔽。
-- **AdaBoot（默认开启，`reward_cv` 模式）**：训练期间按概率在真实速度与估计
+- **AdaBoot（默认关闭，启用时为 `reward_cv` 模式）**：训练期间按概率在真实速度与估计
   速度间切换 Actor 输入，缓解训练初期 CENet 估计不准的问题。支持 `error`
   （按速度估计误差过渡）、`reward_cv`（论文 p = 1 − tanh(CV(R))）、`linear`
   三种模式；实际送入 Actor 的速度被保存并在更新时原样复用；部署始终使用
@@ -240,7 +247,7 @@ Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 187] = 235 �
 # 短时冒烟测试（首次运行自动 URDF→USD 转换，需要几分钟）
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 16 --max_iterations 3
 
-# 默认配置正式训练（当前默认：双课程开 + AdaBoot 开 reward_cv 模式）
+# 默认配置正式训练（当前默认：双课程开 + AdaBoot 关）
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 512
 
 # 指定实验名、随机种子与环境数
@@ -283,12 +290,12 @@ outputs/training/bpx_dreamwaq/<YYYYMMDD_HHMMSS>[_<run_name>]/
 | `--disable_terrain_curriculum` | 关闭地形课程（默认开） | `enable_terrain_curriculum` |
 | `--enable_command_curriculum` / `--disable_command_curriculum` | 开/关指令课程 | `enable_grid_adaptive_command_curriculum` |
 | `--num_terrain_levels N` | 地形难度等级数（默认 10） | `num_terrain_levels` |
-| `--adaboot` / `--disable_adaboot` | 开/关 AdaBoot（默认开） | `adaboot_enabled` |
+| `--adaboot` / `--disable_adaboot` | 开/关 AdaBoot（默认关） | `adaboot_enabled` |
 | `--adaboot_mode error\|reward_cv\|linear` | AdaBoot 概率调度模式 | `adaboot_mode` |
 
 ```bash
-# 两套课程 + AdaBoot 全开（当前默认，等价于不加开关）
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512
+# 两套课程 + AdaBoot 全开（显式启用 AdaBoot）
+bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --adaboot
 
 # 只关指令课程
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --disable_command_curriculum
@@ -298,7 +305,7 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
     --disable_terrain_curriculum --disable_command_curriculum --disable_adaboot
 
 # AdaBoot 切换为按估计误差过渡
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --adaboot_mode error
+bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --adaboot --adaboot_mode error
 ```
 
 **配置文件默认值**分两处：
@@ -345,7 +352,7 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --ada
    `DreamWaQPpoAlgorithmCfg`：
 
    ```python
-   adaboot_enabled = True        # AdaBoot 总开关
+   adaboot_enabled = False       # AdaBoot 总开关，默认关闭
    adaboot_mode = "reward_cv"    # error / reward_cv / linear
    adaboot_error_threshold = 0.5 # error 模式：EMA 速度误差达到该值(m/s)时 p≈0
    adaboot_ema_alpha = 0.9       # 误差 EMA 平滑系数
@@ -873,7 +880,7 @@ PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
    单帧、历史各帧、下一帧预测目标共用本体统计，速度监督保留 m/s。
    标准差下限为 0.01，避免常量观测产生除零。统计保存在模型内并随 ONNX /
    TorchScript 导出，部署继续输入原始 450 维历史，无需外部归一化。
-6. **AdaBoot**：论文按回合奖励变异系数 p = 1 − tanh(CV(R))；本实现默认采用
+6. **AdaBoot**：论文按回合奖励变异系数 p = 1 − tanh(CV(R))；本实现默认关闭 AdaBoot，启用时采用
    该公式，并提供按速度估计误差过渡的 `error` 模式与 `linear` 线性爬升模式。
    回合奖励统计独立于日志目录；初始及无有效 CV 时使用 `p_min`（默认 0）。
 7. **Critic 特权信息**：论文含随机扰动力 d_t；本实现 Critic 为真实线速度 +
@@ -931,8 +938,9 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 
 ### 6.7 归一化与随机化升级后的训练 / 导出
 
-训练使用 PhysX 隐式 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm、速度上限 20 rad/s），
-MuJoCo 部署使用显式力矩 PD；两种执行器的动力学不完全相同。
+训练、PLAY/验收与 MuJoCo 部署统一使用显式力矩 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm）。
+20 rad/s 保留为名义速度参数；两端均不施加该硬速度制动，PhysX 的求解器速度上限设为 `1e9`。
+控制律一致仍不代表 PhysX 与 MuJoCo 的接触和积分动力学完全一致。
 不启用质量、质心、电机强度或延迟随机化。PLAY 配置关闭材质、增益随机化、推扰与观测噪声。Runner 从
 历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
 Critic 保留无噪声特权观测。
@@ -942,16 +950,17 @@ Critic 保留无噪声特权观测。
 继续训练；如需启用归一化训练，把配置改回 `True` 并开新运行，不要把旧权重
 直接视为已适配当前归一化、奖励和执行器配置。
 
-隐式执行器提供给奖励的力矩是近似值，不是 PhysX 关节驱动力矩的精确测量。
+显式执行器的 `applied_torque` 是限幅后的电机力矩指令，功率奖励使用该值，
+它不包含接触与关节限位等约束力矩。
 功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
 与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。
 
 ### 6.8 微调与显式 PD 确定性验收
 
-训练使用隐式 PD，策略每 20 ms 更新一次目标；训练中的 ±10% 增益随机化仍生效，
-PLAY/验收关闭它。验收脚本独立使用显式 PD，每个 5 ms 物理步执行
-`tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`；验收不施加
-20 rad/s 的 PhysX 硬速度制动，便于检查策略对显式力矩控制的适应性。
+训练、PLAY/验收和 sim2sim 均每 20 ms 更新一次目标，每个 5 ms 物理步重算
+`tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`。
+训练中的 ±10% 增益随机化仍生效，PLAY/验收关闭它；验收复用训练的执行器配置。
+旧隐式 PD 策略不能视为已适配新动力学，建议新结构从头训练并重新验收。
 
 使用与当前网络维度和归一化设置兼容的 checkpoint 开始微调：
 

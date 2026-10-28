@@ -10,7 +10,7 @@
    - ``next_observations``: 下一时刻本体观测（VAE Decoder 目标）。
 2. ``DreamWaQPPO``：每个 minibatch 在 PPO 损失上叠加
    ``lambda_vel * L_vel + lambda_pred * L_pred + beta_kl * L_kl``，
-   与 PPO 共用同一优化器（CENet 是策略的子模块，参数已注册）。
+   CENet 与 PPO 使用独立 Adam、学习率和梯度裁剪；默认 PPO 不回传 CENet。
 3. ``DreamWaQRunner``：适配 ``OnPolicyRunner``——解析自定义策略/算法类，
    在 rollout 中传递历史观测与真实速度标签，记录 CENet、AdaBoot、课程指标。
 
@@ -194,6 +194,8 @@ class DreamWaQPPO(PPO):
         lambda_vel: float = 1.0,
         lambda_pred: float = 1.0,
         beta_kl: float = 1.0e-3,
+        cenet_learning_rate: float = 1.0e-3,
+        cenet_max_grad_norm: float = 1.0,
         # ---- 梯度连接 ----
         ppo_grad_to_cenet: bool = False,
         # ---- AdaBoot ----
@@ -207,6 +209,14 @@ class DreamWaQPPO(PPO):
         **kwargs,
     ):
         super().__init__(policy=policy, **kwargs)
+        if cenet_learning_rate <= 0 or cenet_max_grad_norm <= 0:
+            raise ValueError("CENet learning rate and gradient norm must be positive")
+        self.cenet_parameters = list(policy.cenet.parameters())
+        cenet_ids = {id(p) for p in self.cenet_parameters}
+        self.ppo_parameters = [p for p in policy.parameters() if id(p) not in cenet_ids]
+        self.optimizer = torch.optim.Adam(self.ppo_parameters, lr=self.learning_rate)
+        self.cenet_optimizer = torch.optim.Adam(self.cenet_parameters, lr=cenet_learning_rate)
+        self.cenet_max_grad_norm = cenet_max_grad_norm
         self.lambda_vel = lambda_vel
         self.lambda_pred = lambda_pred
         self.beta_kl = beta_kl
@@ -266,7 +276,7 @@ class DreamWaQPPO(PPO):
             # 每个环境独立抽样是否使用估计速度；真实速度仅用于构造 Actor 输入
             # （detached，不进入部署路径）。
             use_est = torch.rand(true_vel.shape[0], 1, device=true_vel.device) < self.adaboot_p
-            vel_actor = torch.where(use_est, features[:, :vel_dim], true_vel.detach())
+            vel_actor = torch.where(use_est, features[:, :vel_dim], self.policy.scale_velocity(true_vel.detach()))
             features_actor = torch.cat([vel_actor, features[:, vel_dim:]], dim=-1)
             self._use_est_total += use_est.numel()
             self._use_est_count += use_est.sum().item()
@@ -384,7 +394,7 @@ class DreamWaQPPO(PPO):
             if self.ppo_grad_to_cenet:
                 vel_hat, mu, _, _ = self.policy.cenet(self.policy.normalize_history(history_batch))
                 vel_dim = self.policy.cenet_vel_dim
-                vel_actor = torch.where(use_estimated_velocity_batch, vel_hat, true_vel_batch)
+                vel_actor = torch.where(use_estimated_velocity_batch, vel_hat, self.policy.scale_velocity(true_vel_batch))
                 cenet_features_batch = torch.cat([vel_actor, mu], dim=-1)
                 self.policy.set_cenet_features(cenet_features_batch, detach=False)
                 self.policy.update_distribution(obs_batch)
@@ -436,7 +446,7 @@ class DreamWaQPPO(PPO):
             valid_mask = 1.0 - dones_batch.float()
             aux = self.policy.cenet.compute_aux_losses(
                 self.policy.normalize_history(history_batch),
-                self.policy.obs_normalizer(next_obs_batch), true_vel_batch, valid_mask
+                self.policy.obs_normalizer(next_obs_batch), self.policy.scale_velocity(true_vel_batch), valid_mask
             )
             vel_loss = aux["vel_loss"]
             pred_loss = aux["pred_loss"]
@@ -450,10 +460,13 @@ class DreamWaQPPO(PPO):
                 + aux_loss
             )
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.cenet_optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.ppo_parameters, self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.cenet_parameters, self.cenet_max_grad_norm)
             self.optimizer.step()
+            self.cenet_optimizer.step()
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -461,8 +474,10 @@ class DreamWaQPPO(PPO):
             mean_vel_loss += vel_loss.item()
             mean_pred_loss += pred_loss.item()
             mean_kl_loss += kl_loss.item()
-            mean_vel_mse += (aux["vel_error"] ** 2).mean().item()
-            vel_err_axis += aux["vel_error"].mean(dim=0)
+            # Keep diagnostic metrics and AdaBoot error thresholds in physical m/s.
+            physical_vel_error = aux["vel_error"] / self.policy.velocity_scale
+            mean_vel_mse += (physical_vel_error ** 2).mean().item()
+            vel_err_axis += physical_vel_error.mean(dim=0)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -486,6 +501,7 @@ class DreamWaQPPO(PPO):
         self.storage.clear()
 
         self.cenet_metrics = {
+            "cenet/learning_rate": self.cenet_optimizer.param_groups[0]["lr"],
             "cenet/velocity_mse": mean_vel_mse,
             "cenet/velocity_error_x": float(vel_err_axis[0]),
             "cenet/velocity_error_y": float(vel_err_axis[1]),
@@ -625,15 +641,33 @@ class DreamWaQRunner(OnPolicyRunner):
         Fine-tuning starts iteration numbering and AdaBoot state from this run's
         configuration. Use load() for an optimizer-preserving resume instead.
         """
-        if self.current_learning_iteration != 0 or self.alg.optimizer.state:
+        if self.current_learning_iteration != 0 or self.alg.optimizer.state or self.alg.cenet_optimizer.state:
             raise RuntimeError("微调权重必须加载到尚未训练的新 Runner")
         infos = self.load(path, load_optimizer=False)
         self.current_learning_iteration = 0
         return infos
 
+    def load(self, path, load_optimizer=True):
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        fixed = "obs_normalizer.scale" in checkpoint["model_state_dict"]
+        if fixed != self.policy.fixed_observation_scaling:
+            raise ValueError("checkpoint 固定缩放模式与当前配置不一致；旧权重请关闭 fixed_observation_scaling，新模式请从头训练")
+        decoder_input = checkpoint["model_state_dict"]["cenet.decoder.0.weight"].shape[1]
+        if decoder_input != self.policy.cenet.decoder[0].in_features:
+            raise ValueError("checkpoint 解码器结构不同；旧权重需设置 cenet_decoder_use_velocity=False，新结构请从头训练")
+        aux_state = (checkpoint.get("infos") or {}).get("cenet_optimizer_state_dict")
+        if load_optimizer and aux_state is None:
+            raise ValueError("旧 checkpoint 没有独立 CENet 优化器；请使用权重微调模式或从头训练")
+        infos = super().load(path, load_optimizer=load_optimizer)
+        if load_optimizer:
+            self.alg.cenet_optimizer.load_state_dict(aux_state)
+            self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
+        return infos
+
     def save(self, path: str, infos=None):
         infos = dict(infos or {})
         infos["train_cfg"] = self.cfg
+        infos["cenet_optimizer_state_dict"] = self.alg.cenet_optimizer.state_dict()
         super().save(path, infos=infos)
 
     def _check_rollout_finite(self, iteration: int, **tensors):

@@ -81,12 +81,14 @@ class TestNormalization(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         for enabled in (False, True):
-            cfg = dict(actor_hidden_dims=[32], critic_hidden_dims=[32], observation_normalization=enabled)
+            cfg = dict(actor_hidden_dims=[32], critic_hidden_dims=[32], observation_normalization=enabled,
+                       cenet_decoder_use_velocity=enabled)
             from bpx_dreamwaq.tasks.agents.dreamwaq_actor_critic import DreamWaQActorCritic
             p = DreamWaQActorCritic(45, 71, 12, **cfg)
             history = torch.randn(4, 450) * 3 + 10
             p.update_normalization(history, torch.randn(4, 71))
-            train_cfg = {'policy': cfg, 'empirical_normalization': enabled}
+            train_cfg = {'policy': {k: v for k, v in cfg.items() if k != 'cenet_decoder_use_velocity'},
+                         'empirical_normalization': enabled}
             with tempfile.TemporaryDirectory() as directory:
                 path = str(Path(directory) / 'model.pt')
                 torch.save({'model_state_dict': p.state_dict(), 'infos': {'train_cfg': train_cfg}}, path)
@@ -116,6 +118,14 @@ class TestNoLogAdaBoot(unittest.TestCase):
             runner.save(checkpoint)
             restored = DreamWaQRunner(env, cfg, log_dir=None)
             restored.load(checkpoint)
+            for source_opt, target_opt in ((runner.alg.optimizer, restored.alg.optimizer),
+                                            (runner.alg.cenet_optimizer, restored.alg.cenet_optimizer)):
+                source_state, target_state = source_opt.state_dict(), target_opt.state_dict()
+                self.assertEqual(source_state["param_groups"], target_state["param_groups"])
+                self.assertTrue(source_state["state"])
+                for index, state in source_state["state"].items():
+                    for key, value in state.items():
+                        torch.testing.assert_close(value, target_state["state"][index][key])
             torch.testing.assert_close(
                 DeployableDreamWaQPolicy(restored.policy)(history),
                 DeployableDreamWaQPolicy(runner.policy)(history),

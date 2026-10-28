@@ -4,6 +4,21 @@ import torch
 from torch import nn
 
 
+class FixedObservationScaler(nn.Module):
+    """Manaro observation scales, stored in checkpoints and exported graphs."""
+
+    def __init__(self, scales):
+        super().__init__()
+        self.register_buffer("scale", torch.tensor(scales, dtype=torch.float32))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values * self.scale
+
+
+# [angular velocity, gravity, commands(vx, vy, wz), q-relative, qdot, action].
+MANARO_POLICY_SCALES = [0.25] * 3 + [1.0] * 3 + [2.0, 2.0, 0.25] + [1.0] * 12 + [0.05] * 12 + [1.0] * 12
+
+
 class ObservationNormalizer(nn.Module):
     def __init__(self, width: int):
         super().__init__()

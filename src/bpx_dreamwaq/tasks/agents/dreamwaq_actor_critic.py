@@ -28,7 +28,7 @@ from rsl_rl.modules import ActorCritic
 
 from ..obs_contract import DEFAULT_HISTORY_LENGTH, history_obs_dim, newest_frame_slices, single_obs_dim
 from .cenet import CENet
-from .normalization import ObservationNormalizer
+from .normalization import ObservationNormalizer, FixedObservationScaler, MANARO_POLICY_SCALES
 from ..obs_contract import POLICY_OBS_TERM_WIDTHS
 
 
@@ -46,12 +46,14 @@ class DreamWaQActorCritic(ActorCritic):
         cenet_vel_head_hidden_dims: Tuple[int, ...] = (128,),
         cenet_vae_head_hidden_dims: Tuple[int, ...] = (128,),
         cenet_decoder_hidden_dims: Tuple[int, ...] = (128, 128),
+        cenet_decoder_use_velocity: bool = True,
         cenet_latent_dim: int = 16,
         cenet_vel_dim: int = 3,
         cenet_activation: str = "elu",
         # ---- 梯度与特征策略 ----
         detach_cenet_from_actor: bool = True,
         observation_normalization: bool = False,
+        fixed_observation_scaling: bool = False,
         latent_actor_mode: str = "mean",  # "mean" | "sample"
         # ---- 基类参数 ----
         actor_hidden_dims=(512, 256, 128),
@@ -66,6 +68,10 @@ class DreamWaQActorCritic(ActorCritic):
         self.history_length = history_length
         self.latent_actor_mode = latent_actor_mode
         self.detach_cenet_from_actor = detach_cenet_from_actor
+        if fixed_observation_scaling and observation_normalization:
+            raise ValueError("固定缩放与经验归一化不能同时启用")
+        self.fixed_observation_scaling = fixed_observation_scaling
+        self.velocity_scale = 2.0 if fixed_observation_scaling else 1.0
 
         self.num_history_obs = history_obs_dim(history_length)
         # 单帧历史 = 下一时刻观测目标维度。
@@ -89,6 +95,14 @@ class DreamWaQActorCritic(ActorCritic):
         self.observation_normalization = observation_normalization
         self.obs_normalizer = ObservationNormalizer(num_actor_obs) if observation_normalization else nn.Identity()
         self.critic_normalizer = ObservationNormalizer(num_critic_obs) if observation_normalization else nn.Identity()
+        if fixed_observation_scaling:
+            if num_actor_obs != 45 or num_critic_obs not in (1, 235):
+                raise ValueError("固定缩放要求 45 维 Actor、235 维 Critic（导出占位维度 1 除外）")
+            self.obs_normalizer = FixedObservationScaler(MANARO_POLICY_SCALES)
+            if num_critic_obs != 1:
+                self.critic_normalizer = FixedObservationScaler(
+                    [2.0] * 3 + MANARO_POLICY_SCALES + [5.0] * 187
+                )
         self._frame_slices = newest_frame_slices(history_length)
         self.cenet = CENet(
             num_history_obs=self.num_history_obs,
@@ -98,6 +112,7 @@ class DreamWaQActorCritic(ActorCritic):
             vel_head_hidden_dims=tuple(cenet_vel_head_hidden_dims),
             vae_head_hidden_dims=tuple(cenet_vae_head_hidden_dims),
             decoder_hidden_dims=tuple(cenet_decoder_hidden_dims),
+            decoder_use_velocity=cenet_decoder_use_velocity,
             latent_dim=cenet_latent_dim,
             vel_dim=cenet_vel_dim,
             activation=cenet_activation,
@@ -117,10 +132,14 @@ class DreamWaQActorCritic(ActorCritic):
         return torch.cat([b.reshape(-1, self.history_length, w) for b, w in zip(blocks, POLICY_OBS_TERM_WIDTHS)], dim=-1)
 
     def normalize_history(self, history_obs: torch.Tensor) -> torch.Tensor:
-        if not self.observation_normalization:
+        if not (self.observation_normalization or self.fixed_observation_scaling):
             return history_obs
         frames = self.obs_normalizer(self.history_frames(history_obs))
         return torch.cat([b.flatten(1) for b in torch.split(frames, POLICY_OBS_TERM_WIDTHS, dim=-1)], dim=-1)
+
+    def scale_velocity(self, velocity: torch.Tensor) -> torch.Tensor:
+        """Raw m/s -> CENet supervision and Actor velocity feature units."""
+        return velocity * self.velocity_scale
 
     @torch.no_grad()
     def update_normalization(self, history_obs: torch.Tensor, critic_obs: torch.Tensor):

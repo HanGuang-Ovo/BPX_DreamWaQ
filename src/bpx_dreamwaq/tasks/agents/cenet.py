@@ -7,7 +7,7 @@ arXiv:2301.10602)：
 - 单个共享编码器读取历史本体观测 ``o^H_t``；
 - 速度估计头输出当前机体线速度估计 ``v̂_t``（3 维，机体坐标系）；
 - β-VAE 头输出潜在分布 ``(μ, log σ²)``，经重参数化得到隐变量 ``z_t``；
-- Decoder 仅根据 ``z_t`` 预测下一时刻本体观测 ``o_{t+1}``（不是重构当前观测）；
+- Decoder 根据 ``[v̂_t, z_t]`` 预测下一时刻本体观测 ``o_{t+1}``（不是重构当前观测）；
 - 辅助损失 ``L_CE = L_est + L_VAE``，其中
   ``L_est = MSE(v̂_t, v_t)``，``L_VAE = MSE(ô_{t+1}, o_{t+1}) + β·KL``。
 
@@ -49,6 +49,7 @@ class CENet(nn.Module):
         latent_dim: int = 16,
         vel_dim: int = BASE_LIN_VEL_DIM,
         activation: str = "elu",
+        decoder_use_velocity: bool = True,
         logvar_bounds: Tuple[float, float] = (-10.0, 10.0),
     ):
         super().__init__()
@@ -61,6 +62,7 @@ class CENet(nn.Module):
         self.history_length = history_length
         self.latent_dim = latent_dim
         self.vel_dim = vel_dim
+        self.decoder_use_velocity = decoder_use_velocity
         self.logvar_bounds = logvar_bounds
 
         act = {"elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh, "silu": nn.SiLU}.get(activation, nn.ELU)
@@ -81,8 +83,8 @@ class CENet(nn.Module):
         self.vel_head = mlp(shared_out, vel_head_hidden_dims, vel_dim)
         # VAE 编码头：输出 2*latent_dim（均值与 log variance）。
         self.vae_head = mlp(shared_out, vae_head_hidden_dims, 2 * latent_dim)
-        # Decoder：仅根据隐变量预测下一时刻本体观测。
-        self.decoder = mlp(latent_dim, decoder_hidden_dims, num_next_obs)
+        # Decoder：使用估计速度和隐变量预测下一时刻本体观测。
+        self.decoder = mlp(latent_dim + (vel_dim if decoder_use_velocity else 0), decoder_hidden_dims, num_next_obs)
 
     def forward(self, history_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         features = self.encoder(history_obs)
@@ -114,8 +116,12 @@ class CENet(nn.Module):
         logvar = torch.clamp(logvar, self.logvar_bounds[0], self.logvar_bounds[1])
         return vel_hat, mu
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """根据隐变量预测下一时刻本体观测。"""
+    def decode(self, z: torch.Tensor, vel_hat: torch.Tensor | None = None) -> torch.Tensor:
+        """以估计速度（保留梯度）和隐变量预测下一帧；不输入真实速度。"""
+        if self.decoder_use_velocity:
+            if vel_hat is None:
+                raise ValueError("decoder requires estimated velocity")
+            z = torch.cat([vel_hat, z], dim=-1)
         return self.decoder(z)
 
     def compute_aux_losses(
@@ -150,7 +156,7 @@ class CENet(nn.Module):
         vel_loss = ((vel_hat - true_vel.detach()) ** 2 * valid_mask).sum() / mask_sum
 
         # 未来观测预测损失：屏蔽 episode 边界。
-        next_obs_hat = self.decode(z)
+        next_obs_hat = self.decode(z, vel_hat)
         pred_loss = (((next_obs_hat - next_obs.detach()) ** 2).mean(dim=-1, keepdim=True) * valid_mask).sum() / mask_sum
 
         # KL(q(z|o) || N(0,I))，同样按有效样本归一化。
