@@ -77,6 +77,60 @@ class TestStandFootSlip(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([7., 0., 0., 0.]))
 
 
+class TestStandFootContact(unittest.TestCase):
+    def penalty(self, contact_times, commands=None, body_ids=slice(None), **kwargs):
+        if commands is None:
+            commands = [[0., 0., 0.]] * len(contact_times)
+        command = torch.tensor(commands, dtype=torch.float32)
+        env = SimpleNamespace(
+            scene=_Scene(contact_forces=SimpleNamespace(data=SimpleNamespace(
+                current_contact_time=torch.tensor(contact_times, dtype=torch.float32),
+            ))),
+            command_manager=SimpleNamespace(get_command=lambda _name: command),
+        )
+        return rewards.feet_contact_stand(
+            env, "base_velocity", SimpleNamespace(name="contact_forces", body_ids=body_ids),
+            **kwargs,
+        )
+
+    def test_each_missing_foot_is_penalized_from_first_airborne_step(self):
+        result = self.penalty([
+            [.005, .1, .2, .3], [.005, 0., .2, .3],
+            [0., 0., .2, .3], [0., 0., 0., .3], [0., 0., 0., 0.],
+        ])
+        # 不需要 current_air_time、足端速度或落地事件；每只未触地足立即计费。
+        torch.testing.assert_close(result, torch.arange(5, dtype=torch.float32))
+        torch.testing.assert_close(result * -1.0 * .02, torch.tensor([0., -.02, -.04, -.06, -.08]))
+
+    def test_gate_requires_every_command_axis_strictly_inside_threshold(self):
+        commands = [[0., 0., 0.], [.099, -.099, .099]]
+        for axis in range(3):
+            for value in (-.2, -.1, .1, .2):
+                command = [0., 0., 0.]
+                command[axis] = value
+                commands.append(command)
+        result = self.penalty([[.1, 0., .1, .1]] * len(commands), commands)
+        torch.testing.assert_close(result, torch.tensor([1., 1.] + [0.] * 12))
+
+    def test_body_selection_excludes_nonfoot_contacts(self):
+        result = self.penalty(
+            [[0., .1, .1, .1, .1, 0.], [.1, .1, 0., .1, .1, .1]],
+            body_ids=[4, 2, 1, 3],
+        )
+        torch.testing.assert_close(result, torch.tensor([0., 1.]))
+
+    def test_threshold_is_configurable_and_invalid_values_are_rejected(self):
+        contacts = [[0., .1, .1, .1]]
+        commands = [[.075, 0., 0.]]
+        torch.testing.assert_close(self.penalty(contacts, commands), torch.ones(1))
+        torch.testing.assert_close(
+            self.penalty(contacts, commands, command_threshold=.05), torch.zeros(1),
+        )
+        for threshold in (0., -1., float("nan"), float("inf")):
+            with self.subTest(threshold=threshold), self.assertRaises(ValueError):
+                self.penalty(contacts, command_threshold=threshold)
+
+
 class TestStandingJointReference(unittest.TestCase):
     def penalty(self, positions, references, commands, joint_ids=slice(None)):
         data = SimpleNamespace(

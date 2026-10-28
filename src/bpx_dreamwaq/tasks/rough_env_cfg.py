@@ -412,11 +412,26 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"], preserve_order=True),
         },
     )
+    # 三轴指令绝对值均 < 0.1 时，每只未触地足从离地首步贡献 -1/s。
+    # 四足触地代价为零，无腾空宽限期；门限内的慢走/转向同样受约束。
+    feet_contact_stand = RewTerm(
+        func=bpx_rewards.feet_contact_stand,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"],
+                preserve_order=True,
+            ),
+            "command_threshold": 0.1,
+        },
+    )
     # 精确全零指令时软约束默认站姿：hip_roll=0、hip_pitch=0.7、knee=-1.4 rad。
     # 12 个关节各偏离 0.1 rad 时，奖励率为 -0.06；运动/转向指令不启用。
     joint_pos_stand_l2 = RewTerm(
         func=bpx_rewards.joint_pos_stand_l2,
-        weight=-0.5,
+        weight=-1.5,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg(
@@ -520,11 +535,11 @@ class RewardsCfg:
     # 移动/转向时在落脚瞬间评价腾空时间；加大权重以抑制短促碎步。
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
-        weight=0.5,
+        weight=0.75,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
-            "threshold": 0.3,
+            "threshold": 0.4,
             "command_threshold": 0.1,
             "yaw_command_threshold": 0.1,
         },
@@ -545,7 +560,7 @@ class RewardsCfg:
         weight=-3.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
-            "time_constant": 1.0,
+            "time_constant": 0.7,
         },
     )
     '''不希望的接触惩罚'''

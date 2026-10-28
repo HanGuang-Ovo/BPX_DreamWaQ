@@ -4,6 +4,7 @@
 （``isaaclab.envs.mdp``，见 ``tasks/rough_env_cfg.py`` 的 RewardsCfg）。
 零指令站立另有一对窄核跟踪项（``track_*_stand_exp``），只在三轴指令都
 接近零时生效，使"把残速压到零"有实际梯度；非站立环境该项为 0。
+``feet_contact_stand`` 在近零指令时按未触地足数计费，从离地首步约束悬腿。
 机身高度、足端净空与二阶动作平滑项采用 DreamWaQ 风格的误差平方惩罚。
 关节加速度平方和设有可配置上限，异常加速度按最大惩罚处理。
 ``feet_air_time`` 与上游
@@ -141,6 +142,29 @@ def feet_slip_stand(
     command = env.command_manager.get_command(command_name)
     standing = (command == 0).all(dim=1)
     return torch.where(standing, torch.where(contact, speed, 0.0).sum(dim=1), 0.0)
+
+
+def feet_contact_stand(
+    env: "ManagerBasedRLEnv",
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """近零指令时返回未触地足数，配负权重鼓励四足同时触地。
+
+    三轴指令绝对值均严格小于 command_threshold 时启用，与站立窄核
+    跟踪项共用门控。接触判据与 feet_slip_stand 一致：当前接触时间 > 0。
+    四足触地代价为 0，每缺一足代价加 1；从检测到离地的首步开始逐步
+    计费，不等待落地或腾空超时，也不依赖足端速度。RewardManager 负责
+    乘负权重和 dt。该门控也覆盖门限内的非零低速/转向指令。
+    """
+    command = env.command_manager.get_command(command_name)
+    standing = _standing_command_mask(command, command_threshold)
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact_time = sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    contact = contact_time > 0
+    penalty = (~contact).to(contact_time.dtype).sum(dim=1)
+    return torch.where(standing, penalty, torch.zeros_like(penalty))
 
 
 def joint_pos_stand_l2(
