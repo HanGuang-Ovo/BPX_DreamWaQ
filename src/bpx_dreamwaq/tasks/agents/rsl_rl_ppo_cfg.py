@@ -29,7 +29,10 @@ class DreamWaQActorCriticCfg:
     cenet_vel_head_hidden_dims: list = [128]
     cenet_vae_head_hidden_dims: list = [128]
     cenet_decoder_hidden_dims: list = [128, 128]
-    cenet_decoder_use_velocity: bool = True
+    # False：Decoder 只用 z 预测下一帧，迫使隐变量承载更多信息。依据
+    # 20261027/28 run（decoder 输入 19）相对旧 run（输入 16）的 KL 从 ~37
+    # 降至 ~5.8 nat——vel_hat 捷径显著削弱了 z 的信息量。A/B 对比可恢复 True。
+    cenet_decoder_use_velocity: bool = False
     cenet_latent_dim: int = 16
     cenet_vel_dim: int = 3
     cenet_activation: str = "elu"
@@ -75,11 +78,11 @@ class DreamWaQPpoAlgorithmCfg:
     ppo_grad_to_cenet: bool = False
 
     # ---- AdaBoot 训练引导（默认关闭；启用时使用 reward_cv 模式）----
-    adaboot_enabled: bool = False
+    adaboot_enabled: bool = True
     # "error": 按速度估计误差过渡（任务伪代码风格）；
     # "reward_cv": 论文公式 p = 1 - tanh(CV(R))；
     # "linear": 线性爬升。
-    adaboot_mode: str = "reward_cv"
+    adaboot_mode: str = "error"
     adaboot_error_threshold: float = 0.5
     adaboot_ema_alpha: float = 0.9
     adaboot_ramp_iterations: int = 500

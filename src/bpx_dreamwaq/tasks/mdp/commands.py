@@ -197,6 +197,9 @@ class GridAdaptiveVelocityCommand(_TerrainMetricsMixin, CommandTerm):
         # 1) 结算刚结束的指令区间（episode 内重采样或 episode 结束）。
         if self.interval_steps.numel() > 0 and int(self.interval_steps.sum().item()) > 0:
             finished = env_ids_t[self.interval_steps[env_ids_t] > 0]
+            invalid = getattr(self._env, "_numerical_invalid", None)
+            if invalid is not None:
+                finished = finished[~invalid[finished]]
             if finished.numel() > 0:
                 steps = self.interval_steps[finished].float()
                 self.grid.record_interval(

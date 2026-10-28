@@ -262,6 +262,18 @@ bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 256 --max_iterations 250
 ```
 
+若更新阶段出现 CUDA OOM，可降低环境数并增加每个 epoch 的小批次数，例如：
+
+```bash
+bash scripts/training_python.sh scripts/train.py --headless --num_envs 2048 \
+  --num_mini_batches 8 --max_iterations 3000 --run_name explicit_pd_cenet
+```
+
+这会降低仿真/rollout 占用及单次网络更新峰值；不能保证所有显存环境都足够。
+小批次数增加也会增加每个 epoch 的优化器步数，属于训练超参数调整。
+PPO 与 CENet 依次反向传播，再裁剪梯度并分别更新，避免同时保留两套前向激活。
+数值隔离日志与 CUDA OOM 是不同问题；不要通过放宽数值保护阈值处理显存不足。
+
 **日志与 checkpoint 目录**：
 
 ```text
@@ -516,7 +528,7 @@ MuJoCo 不因高度、倾角、躯干触地或 Init 超时自动退出；策略�
 运行到设定时长、关闭窗口或 Ctrl+C 时结束。
 
 `--terrain flat|three_level|stairs|mixed` 可覆盖地形；综合场地包含 ±2/±4 cm
-崎岖路面和 3/8/10/15 cm 四档上下楼梯。楼梯采用 box 碰撞体，踏面深 20 cm，
+崎岖路面和 3/8/10/15 cm 四档上下楼梯。楼梯采用 box 碰撞体，踏面深 15 cm，
 每侧 5 级高差，含顶部平台。详见 [sim2sim 操作与验证](docs/SIM2SIM.md)。
 
 | 配置 | 用途 | 策略输入 |
@@ -1000,3 +1012,5 @@ CENet 估计误差、checkpoint 哈希和控制参数。全部通过返回码为
 
 可重复 `--command VX VY WZ` 指定案例，或用 `--linear_tolerance`、`--yaw_tolerance`
 覆盖门槛。验收不覆盖起身、粗糙地形或 sim2sim；通过后仍需导出并在 MuJoCo 复核。
+
+偶发仿真数值异常的隔离、重置与训练样本排除机制见 [数值异常隔离](docs/NUMERICAL_QUARANTINE.md)。

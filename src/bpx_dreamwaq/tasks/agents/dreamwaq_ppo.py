@@ -77,6 +77,7 @@ class DreamWaQRolloutStorage(RolloutStorage):
             self.true_velocities = None
             self.next_observations = None
             self.use_estimated_velocity = None
+            self.numerical_invalid = None
 
     def __init__(
         self,
@@ -107,6 +108,7 @@ class DreamWaQRolloutStorage(RolloutStorage):
         self.true_velocities = torch.zeros(num_transitions_per_env, num_envs, *true_vel_shape, device=device)
         self.use_estimated_velocity = torch.ones(num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=device)
         self.next_observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=device)
+        self.valid_transitions = torch.ones(num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=device)
 
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
@@ -130,15 +132,47 @@ class DreamWaQRolloutStorage(RolloutStorage):
         self.next_observations[self.step].copy_(transition.next_observations)
         if transition.use_estimated_velocity is not None:
             self.use_estimated_velocity[self.step].copy_(transition.use_estimated_velocity)
+        self.valid_transitions[self.step] = True
+        if transition.numerical_invalid is not None:
+            affected = transition.numerical_invalid.reshape(-1, 1).bool().clone()
+            self.valid_transitions[self.step] &= ~affected
+            # Drop this episode's prefix still in the rollout, stopping at real episode boundaries.
+            for t in reversed(range(self.step)):
+                affected &= ~self.dones[t].bool()
+                self.valid_transitions[t] &= ~affected
         self.step += 1
+
+    def compute_returns(self, last_values, gamma, lam, normalize_advantage=True):
+        advantage = torch.zeros_like(last_values)
+        for step in reversed(range(self.num_transitions_per_env)):
+            valid = self.valid_transitions[step]
+            next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
+            # Avoid NaN * 0: invalid transitions are excluded before arithmetic.
+            value = torch.where(valid, self.values[step], 0.0)
+            reward = torch.where(valid, self.rewards[step], 0.0)
+            continuing = valid & ~self.dones[step].bool()
+            next_value = torch.where(continuing, next_values, 0.0)
+            delta = reward + gamma * next_value - value
+            advantage = delta + gamma * lam * torch.where(continuing, advantage, 0.0)
+            self.returns[step] = advantage + value
+            self.advantages[step] = advantage
+        if normalize_advantage:
+            good = self.advantages[self.valid_transitions]
+            if good.numel():
+                # Match the original sample std, but keep singleton batches finite.
+                std = good.std() if good.numel() > 1 else good.new_zeros(())
+                self.advantages[self.valid_transitions] = (good - good.mean()) / (std + 1e-8)
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         """与基类相同的抽样逻辑，额外产出 CENet 相关字段。"""
         if self.training_type != "rl":
             raise ValueError("该函数仅用于强化学习训练。")
-        batch_size = self.num_envs * self.num_transitions_per_env
-        mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+        valid_indices = self.valid_transitions.flatten().nonzero(as_tuple=False).flatten()
+        batch_size = valid_indices.numel()
+        if batch_size == 0:
+            return
+        indices = valid_indices[torch.randperm(batch_size, device=self.device)]
+        batches = torch.tensor_split(indices, min(num_mini_batches, batch_size))
 
         observations = self.observations.flatten(0, 1)
         if self.privileged_observations is not None:
@@ -160,8 +194,7 @@ class DreamWaQRolloutStorage(RolloutStorage):
         dones = self.dones.flatten(0, 1)
 
         for _ in range(num_epochs):
-            for i in range(num_mini_batches):
-                batch_idx = indices[i * mini_batch_size : (i + 1) * mini_batch_size]
+            for batch_idx in batches:
                 yield (
                     observations[batch_idx],
                     privileged_observations[batch_idx],
@@ -303,11 +336,14 @@ class DreamWaQPPO(PPO):
     def process_env_step(self, rewards, dones, infos, next_obs: torch.Tensor):
         """记录转移；``next_obs`` 为执行动作后的下一时刻策略观测。"""
         self.transition.rewards = rewards.clone()
-        self.transition.dones = dones
+        invalid = infos.get("numerical_invalid", torch.zeros_like(dones, dtype=torch.bool)).to(self.device).bool()
+        self.transition.numerical_invalid = invalid
+        self.transition.dones = dones.bool() | invalid
+        self.transition.rewards[invalid] = 0.0
         # 无限时域任务的 timeout 自举（沿用基类逻辑）。
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
+                self.transition.values * (infos["time_outs"].to(self.device).bool() & ~invalid).unsqueeze(1), 1
             )
         self.transition.next_observations = next_obs
         self.storage.add_transitions(self.transition)
@@ -363,7 +399,15 @@ class DreamWaQPPO(PPO):
         mean_kl_loss = 0.0
         mean_vel_mse = 0.0
         vel_err_axis = torch.zeros(self.policy.cenet_vel_dim, device=self.device)
+        # 分速度档与隐变量诊断（见 update 末尾的 cenet_metrics）。
+        vel_err_low_sum = 0.0
+        vel_err_low_count = 0
+        vel_err_high_sum = 0.0
+        vel_err_high_count = 0
+        latent_std_sum = 0.0
 
+        num_updates = 0
+        excluded_fraction = 1.0 - self.storage.valid_transitions.float().mean().item()
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
             obs_batch,
@@ -385,9 +429,10 @@ class DreamWaQPPO(PPO):
             dones_batch,
             use_estimated_velocity_batch,
         ) in generator:
+            num_updates += 1
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / ((advantages_batch.std() if advantages_batch.numel() > 1 else 0.0) + 1e-8)
 
             # Actor：默认复用 rollout 保存的 CENet 特征，保证新旧策略概率比
             # 在相同输入上计算。可选 ppo_grad_to_cenet=True 时改为带梯度重算。
@@ -442,6 +487,18 @@ class DreamWaQPPO(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # Release PPO saved activations before building the auxiliary graph.
+            # Even when PPO trains CENet, these are separate forward graphs:
+            # accumulate both gradients before clipping or stepping either optimizer.
+            self.optimizer.zero_grad(set_to_none=True)
+            self.cenet_optimizer.zero_grad(set_to_none=True)
+            ppo_loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                - self.entropy_coef * entropy_batch.mean()
+            )
+            ppo_loss.backward()
+
             # CENet 辅助损失：done 转移的下一观测属于新 episode，必须屏蔽。
             valid_mask = 1.0 - dones_batch.float()
             aux = self.policy.cenet.compute_aux_losses(
@@ -453,16 +510,7 @@ class DreamWaQPPO(PPO):
             kl_loss = aux["kl_loss"]
             aux_loss = self.lambda_vel * vel_loss + self.lambda_pred * pred_loss + self.beta_kl * kl_loss
 
-            loss = (
-                surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-                + aux_loss
-            )
-
-            self.optimizer.zero_grad(set_to_none=True)
-            self.cenet_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            aux_loss.backward()
             nn.utils.clip_grad_norm_(self.ppo_parameters, self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.cenet_parameters, self.cenet_max_grad_norm)
             self.optimizer.step()
@@ -478,8 +526,22 @@ class DreamWaQPPO(PPO):
             physical_vel_error = aux["vel_error"] / self.policy.velocity_scale
             mean_vel_mse += (physical_vel_error ** 2).mean().item()
             vel_err_axis += physical_vel_error.mean(dim=0)
+            # 按 |vx 指令| 分桶的平均估计误差（观测为原始 m/s，指令位于第 7 维），
+            # 验证“低速段估计相对误差更高”的假设；同时监控 latent μ 的平均
+            # 标准差——若趋零说明隐变量对 Actor 不再携带信息。
+            vx_cmd = obs_batch[:, 6].abs()
+            low_mask = vx_cmd < 0.3
+            if low_mask.any():
+                vel_err_low_sum += physical_vel_error[low_mask].mean().item()
+                vel_err_low_count += 1
+            high_mask = vx_cmd >= 0.5
+            if high_mask.any():
+                vel_err_high_sum += physical_vel_error[high_mask].mean().item()
+                vel_err_high_count += 1
+            latent_std_sum += cenet_features_batch[:, self.policy.cenet_vel_dim:].std(dim=0).mean().item()
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
+        # Entirely quarantined rollouts do not step either optimizer.
+        num_updates = max(num_updates, 1)
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
@@ -491,7 +553,9 @@ class DreamWaQPPO(PPO):
 
         # AdaBoot 误差 EMA（按 m/s 计的平均绝对误差）。
         vel_mae = float(vel_err_axis.mean())
-        if self._vel_error_ema is None:
+        if excluded_fraction == 1.0:
+            pass
+        elif self._vel_error_ema is None:
             self._vel_error_ema = vel_mae
         else:
             self._vel_error_ema = (
@@ -501,12 +565,16 @@ class DreamWaQPPO(PPO):
         self.storage.clear()
 
         self.cenet_metrics = {
+            "numerical/excluded_transition_fraction": excluded_fraction,
             "cenet/learning_rate": self.cenet_optimizer.param_groups[0]["lr"],
             "cenet/velocity_mse": mean_vel_mse,
             "cenet/velocity_error_x": float(vel_err_axis[0]),
             "cenet/velocity_error_y": float(vel_err_axis[1]),
             "cenet/velocity_error_z": float(vel_err_axis[2]),
             "cenet/velocity_mae": vel_mae,
+            "cenet/velocity_error_low_vx": vel_err_low_sum / max(vel_err_low_count, 1),
+            "cenet/velocity_error_high_vx": vel_err_high_sum / max(vel_err_high_count, 1),
+            "cenet/latent_mu_std": latent_std_sum / num_updates,
             "cenet/prediction_loss": mean_pred_loss,
             "cenet/kl_loss": mean_kl_loss,
             "cenet/vel_loss_weighted": mean_vel_loss,
@@ -726,6 +794,7 @@ class DreamWaQRunner(OnPolicyRunner):
                 for _ in range(self.num_steps_per_env):
                     true_vel = self._extract_true_vel(privileged_obs)
                     actions = self.alg.act(obs, history_obs, privileged_obs, true_vel)
+                    self._check_rollout_finite(it, actions=actions)
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
@@ -746,11 +815,13 @@ class DreamWaQRunner(OnPolicyRunner):
                             ep_infos.append(infos["log"])
                     cur_reward_sum += rewards
                     cur_episode_length += 1
-                    new_ids = (dones > 0).nonzero(as_tuple=False)
+                    invalid = infos.get("numerical_invalid", torch.zeros_like(dones, dtype=torch.bool)).to(self.device).bool()
+                    new_ids = ((dones > 0) & ~invalid).nonzero(as_tuple=False)
                     rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                     lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                    cur_reward_sum[new_ids] = 0
-                    cur_episode_length[new_ids] = 0
+                    ended = (dones > 0) | invalid
+                    cur_reward_sum[ended] = 0
+                    cur_episode_length[ended] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -766,10 +837,12 @@ class DreamWaQRunner(OnPolicyRunner):
             # clear() only resets the storage cursor. Update moments from the completed
             # rollout after optimization, so the next rollout uses one frozen transform.
             # The first rollout uses identity statistics instead of reset-only variance.
-            self.alg.policy.update_normalization(
-                self.alg.storage.history_observations.flatten(0, 1),
-                self.alg.storage.privileged_observations.flatten(0, 1),
-            )
+            valid = self.alg.storage.valid_transitions.flatten()
+            if self.alg.policy.observation_normalization and valid.any():
+                self.alg.policy.update_normalization(
+                    self.alg.storage.history_observations.flatten(0, 1)[valid],
+                    self.alg.storage.privileged_observations.flatten(0, 1)[valid],
+                )
 
             stop = time.time()
             learn_time = stop - start

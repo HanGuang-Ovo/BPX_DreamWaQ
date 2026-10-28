@@ -50,6 +50,7 @@ import isaaclab.envs.mdp as lab_mdp
 
 from .. import assets as bpx_assets
 from ..runtime.joints import POLICY_JOINT_NAMES
+from .mdp import numerical_guard as bpx_numerical_guard
 from .mdp import commands as bpx_commands
 from .mdp import curriculums as bpx_curriculums
 from .mdp import rewards as bpx_rewards
@@ -192,7 +193,7 @@ def _make_bpx_terrain_generator(num_levels: int):
             "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
                 proportion=0.2,
                 step_height_range=(0.03, 0.15),
-                step_width=0.10,  # 踏面深度 10 cm。
+                step_width=0.15,  # 踏面深度 15 cm。
                 platform_width=3.0,
                 border_width=1.0,
                 holes=False,
@@ -200,7 +201,7 @@ def _make_bpx_terrain_generator(num_levels: int):
             "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
                 proportion=0.2,
                 step_height_range=(0.03, 0.15),
-                step_width=0.10,  # 踏面深度 10 cm。
+                step_width=0.15,  # 踏面深度 15 cm。
                 platform_width=3.0,
                 border_width=1.0,
                 holes=False,
@@ -394,12 +395,12 @@ class RewardsCfg:
     track_lin_vel_xy_stand_exp = RewTerm(
         func=bpx_rewards.track_lin_vel_xy_stand_exp,
         weight=2.5,
-        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.1},
     )
     track_ang_vel_z_stand_exp = RewTerm(
         func=bpx_rewards.track_ang_vel_z_stand_exp,
         weight=2.0,
-        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.05},
+        params={"command_name": "base_velocity", "std": 0.1, "command_threshold": 0.1},
     )
     # 全零指令时惩罚触地足端水平滑动；两侧按相同足端顺序选择。
     feet_slip_stand = RewTerm(
@@ -481,7 +482,7 @@ class RewardsCfg:
     '''脚间距惩罚：前、后左右足横向间距为 0.26–0.42 m，同侧前后纵向间距不小于 0.30 m。'''
     feet_lateral_distance = RewTerm(
         func=bpx_rewards.feet_lateral_distance,
-        weight=-0.3,
+        weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -494,7 +495,7 @@ class RewardsCfg:
     )
     feet_longitudinal_distance = RewTerm(
         func=bpx_rewards.feet_longitudinal_distance,
-        weight=-0.3,
+        weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -507,12 +508,12 @@ class RewardsCfg:
     # 移动/转向时在落脚瞬间评价腾空时间；加大权重以抑制短促碎步。
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
-        weight=0.3,
+        weight=0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
             "threshold": 0.3,
-            "command_threshold": 0.05,
+            "command_threshold": 0.1,
             "yaw_command_threshold": 0.1,
         },
     )
@@ -544,7 +545,7 @@ class RewardsCfg:
     '''姿态水平惩罚（惩罚 roll/pitch 偏离水平，基于投影重力）'''
     flat_orientation_l2 = RewTerm(
         func=lab_mdp.flat_orientation_l2,
-        weight=-0.3
+        weight=-1.0
     )
     '''关节位置越界惩罚'''
     joint_pos_limits = RewTerm(
@@ -557,12 +558,14 @@ class RewardsCfg:
 class TerminationsCfg:
     """终止条件：超时、机身接触、过倾（1.0 rad）。"""
 
+    # 终止计算早于奖励与自动 reset；异常环境重置，转移从训练中隔离。
+    numerical_guard = DoneTerm(func=bpx_numerical_guard.check_robot_state)
     time_out = DoneTerm(func=lab_mdp.time_out, time_out=True)
     base_contact = DoneTerm(
         func=lab_mdp.illegal_contact,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso"), "threshold": 1.0},
     )
-    base_tilt = DoneTerm(func=bpx_terminations.base_tilt_above_maximum, params={"maximum_tilt_rad": 1.0})
+    base_tilt = DoneTerm(func=bpx_terminations.base_tilt_above_maximum, params={"maximum_tilt_rad": 0.5})
 
 
 @configclass

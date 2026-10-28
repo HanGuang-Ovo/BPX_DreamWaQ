@@ -171,6 +171,12 @@ def terrain_levels_vel(
     else:
         env_ids = torch.as_tensor(env_ids, device=terrain.device, dtype=torch.long)
 
+    invalid = getattr(env, "_numerical_invalid", None)
+    if invalid is not None:
+        env_ids = env_ids[~invalid[env_ids]]
+    if env_ids.numel() == 0:
+        return {}
+
     command_term = env.command_manager.get_term(command_name)
     metrics = command_term.terrain_metrics
     # ManagerBasedRLEnv 的 terminal step 在 CommandTerm.compute 前 reset，必须在这里补采。

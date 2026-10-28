@@ -81,7 +81,7 @@ TOML `[terrain]` 可设置 `step_heights`、`step_count`、`step_width`、`stair
 Init 轨迹面向水平趴卧状态，出生区安排在平地；侧翻/仰翻或 Init 超时不再自动结束仿真。
 
 楼梯已统一并入综合场地，使用同一个配置即可测试崎岖地面和四档楼梯。
-例如，选择单级高 10 cm、踏面深 20 cm 的路线：
+例如，选择单级高 10 cm、踏面深 15 cm 的路线：
 
 ```bash
 python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
@@ -89,7 +89,7 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 ```
 
 改用 `--stair-level 4` 可选择单级高 15 cm 的路线；不指定该参数时，
-仍在崎岖路线前的平地出生。`step_width=0.20` 指沿行走方向的单级踏面深度，
+仍在崎岖路线前的平地出生。`step_width=0.15` 指沿行走方向的单级踏面深度，
 `stair_width=2.0` 指整条楼梯的横向宽度。
 
 ## 关节与控制契约
@@ -133,7 +133,7 @@ bash scripts/training_python.sh scripts/export_policy.py \
 ```
 
 使用该 ONNX 策略、自动起身、固定 vx，在综合场地完成以下实际推理冒烟。
-以下为当时 30 cm 踏面、3/8/15 cm 三档楼梯的历史记录，未验证当前 20 cm 踏面场地：
+以下为当时 30 cm 踏面、3/8/15 cm 三档楼梯的历史记录，未验证当前 15 cm 踏面场地：
 
 | 路线 | 指令 | 结果 |
 | --- | --- | --- |

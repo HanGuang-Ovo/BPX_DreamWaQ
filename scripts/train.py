@@ -14,6 +14,7 @@ tasks/agents/rsl_rl_ppo_cfg.py，命令行覆盖优先）：
     #   地形课程:  --disable_terrain_curriculum
     #   指令课程:  --enable_command_curriculum / --disable_command_curriculum
     #   AdaBoot:   --adaboot / --disable_adaboot [--adaboot_mode error|reward_cv|linear]
+    #   CENet 梯度: --ppo_grad_to_cenet（PPO 损失端到端回传 CENet，默认关闭）
     bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
         --disable_command_curriculum --disable_adaboot
 
@@ -42,6 +43,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Train the BPX DreamWaQ policy with RSL-RL PPO.")
 parser.add_argument("--task", type=str, default="BPX-Velocity-Rough-DreamWaQ-v0", help="Registered task id.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments.")
+parser.add_argument("--num_mini_batches", type=int, default=None, help="PPO minibatches per epoch; increase to reduce update memory.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--max_iterations", type=int, default=None, help="Number of PPO iterations.")
 parser.add_argument("--disable_terrain_curriculum", action="store_true", help="Turn off terrain curriculum.")
@@ -51,6 +53,8 @@ parser.add_argument("--num_terrain_levels", type=int, default=None, help="Terrai
 parser.add_argument("--adaboot", action="store_true", help="Enable AdaBoot velocity bootstrapping.")
 parser.add_argument("--disable_adaboot", action="store_true", help="Disable AdaBoot velocity bootstrapping.")
 parser.add_argument("--adaboot_mode", type=str, default=None, choices=["error", "reward_cv", "linear"])
+parser.add_argument("--ppo_grad_to_cenet", action="store_true", help="Let PPO gradient shape CENet end-to-end.")
+parser.add_argument("--disable_ppo_grad_to_cenet", action="store_true", help="Keep CENet trained only by auxiliary losses.")
 loading = parser.add_mutually_exclusive_group()
 loading.add_argument("--resume", action="store_true", help="Resume model, optimizer and iteration from a checkpoint.")
 loading.add_argument("--finetune", action="store_true", help="Load weights/normalization with a fresh optimizer and iteration counter.")
@@ -61,6 +65,8 @@ parser.add_argument("--run_name", type=str, default="", help="Sub-directory name
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(headless=True)
 args_cli, _ = parser.parse_known_args()
+if args_cli.num_mini_batches is not None and args_cli.num_mini_batches <= 0:
+    parser.error("--num_mini_batches 必须为正整数")
 if bool(args_cli.checkpoint) != bool(args_cli.resume or args_cli.finetune):
     parser.error("--checkpoint 必须与 --resume 或 --finetune 一起使用")
 if args_cli.checkpoint and not os.path.isfile(args_cli.checkpoint):
@@ -107,6 +113,8 @@ def main():
         agent_cfg.device = args_cli.device
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.num_mini_batches is not None:
+        agent_cfg.algorithm.num_mini_batches = args_cli.num_mini_batches
     if args_cli.num_terrain_levels is not None:
         env_cfg.num_terrain_levels = args_cli.num_terrain_levels
     if args_cli.disable_terrain_curriculum:
@@ -130,6 +138,10 @@ def main():
         agent_cfg.algorithm.adaboot_enabled = False
     if args_cli.adaboot_mode is not None:
         agent_cfg.algorithm.adaboot_mode = args_cli.adaboot_mode
+    if args_cli.ppo_grad_to_cenet:
+        agent_cfg.algorithm.ppo_grad_to_cenet = True
+    if args_cli.disable_ppo_grad_to_cenet:
+        agent_cfg.algorithm.ppo_grad_to_cenet = False
 
     # 课程开关在 __post_init__ 中接线，覆盖后需要重建内部配置。
     env_cfg.__post_init__()

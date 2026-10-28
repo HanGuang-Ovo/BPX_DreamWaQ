@@ -1,10 +1,10 @@
-# DreamWaQ 450 维历史观测；崎岖路面 + 20 cm 踏面的分级上下楼梯，平地趴卧起身。
+# DreamWaQ 450 维历史观测；崎岖路面 + 15 cm 踏面的分级上下楼梯，平地趴卧起身。
 # Term-major, oldest-to-newest; first frame fills history; updated at 50 Hz.
 [paths]
 mjcf = "assets/robots/bpx/mjcf/bpx.xml"
 
 # 统一策略路径；推理后端显式选择，默认 Zero 后端不加载权重。
-policy = "policies/bpx_explicit_pd_cenet_2750.onnx"
+policy = "policies/policy_20261028_iter2999.onnx"
 
 [simulation]
 # 沿用 BPX_test 的部署时序：200 Hz 物理仿真、50 Hz 策略。
@@ -143,9 +143,9 @@ kind = "mixed"
 seed = 20260918
 
 # --stair-level 1/2/3/4 对应单级高 3/8/10/15 cm。
-# 每条路线为上楼 → 顶部平台 → 下楼，踏面沿前进方向深 20 cm。
+# 每条路线为上楼 → 顶部平台 → 下楼，踏面沿前进方向深 15 cm。
 step_heights = [0.03, 0.08, 0.10, 0.15]
 step_count = 5
-step_width = 0.20
+step_width = 0.15
 stair_width = 2.0
 platform_width = 1.20
