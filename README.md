@@ -770,6 +770,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | `base_height_l2` | −1.0 | 本工程 | `((机身高度 − 扫描地面均值 − 0.42) / 0.10)²`；无有效射线时跳过该环境 |
 | `flat_orientation_l2` | −0.3 | 内置 | 惩罚 roll/pitch 偏离水平（投影重力） |
 | `joint_pos_limits` | −0.2 | 内置 | 关节位置越界 |
+| `joint_pos_stand_l2` | −0.5 | 本工程 | 仅三轴指令精确为零时，惩罚12个受控关节相对默认站姿的角度偏差平方和 |
 | `dof_torques_l2` | −1.0e-4 | 内置 | 关节力矩平方和 |
 | `dof_acc_l2` | −2.5e-7 | 本工程 | 关节加速度平方和；单环境上限 1e8，异常加速度按上限计 |
 | `joint_power` | −2e−5 | 本工程 | `sum(abs(applied_torque * joint_vel))`，正负功率不抵消 |
@@ -786,7 +787,7 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 | `feet_contact_balance` | −1.0 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
 | `feet_clearance` | −0.01 | 本工程 | `toe_link` 距局部地面 0.10 m 的误差平方 × 足端水平速度 |
 | `feet_lateral_distance` | −0.3 | 本工程 | 前、后左右足横向间距超出 0.26–0.42 m 时，偏差除以 0.26 m 后平方求和 |
-| `feet_longitudinal_distance` | −0.3 | 本工程 | 同侧前后足纵向间距不足 0.30 m 的归一化缺口平方 |
+| `feet_longitudinal_distance` | −0.4 | 本工程 | 同侧前后足纵向间距不足 0.40 m 的归一化缺口平方 |
 | `undesired_contacts` | −1.0 | 内置 | torso 接触力 > 1 N |
 
 所有权重都在 `tasks/rough_env_cfg.py` 的 `RewardsCfg` 中调整；修改奖励后需要
@@ -794,6 +795,11 @@ python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
 
 **设计说明**
 
+- `joint_pos_stand_l2` 使用机器人 `default_joint_pos` 作为站立参考：髋外展0、
+  髋俯仰0.7、膝关节−1.4 rad，与复位及动作中心共用配置。它是软约束，仍允许
+  高度、足距与地形适应；任一轴指令非零即关闭，不使用0.1 m/s门限判断站立。
+  默认权重−0.5，12个关节各偏离0.1 rad时，奖励率为−0.06（每策略步−0.0012）。
+  TensorBoard 对应 `Episode_Reward/joint_pos_stand_l2`，设权重为0可关闭。
 - 高度项使用高度扫描的**平均地面**作参考，避免在坡面/台阶上按世界系高度误罚；
   扫描均值是局部支撑面的近似，跨台阶时仍有地形估计误差。
 - 净空项的 `target_height=0.10 m` 指 `toe_link` 原点高度，不是鞋底净空；

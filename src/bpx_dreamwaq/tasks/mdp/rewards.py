@@ -143,6 +143,26 @@ def feet_slip_stand(
     return torch.where(standing, torch.where(contact, speed, 0.0).sum(dim=1), 0.0)
 
 
+def joint_pos_stand_l2(
+    env,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """精确零指令时，惩罚受控关节偏离机器人默认站姿的角度平方和。
+
+    参考角来自 ``default_joint_pos``，与动作中心和复位参考共用配置。
+    按关节名解析后的索引同时选择实际角和参考角；不硬锁关节，允许高度、
+    足距和地形适应项共同决定站姿。任一轴有非零指令时返回零，避免约束慢走
+    或原地转向；启停过渡由已有速度、动作平滑项处理。
+    """
+    data = env.scene[asset_cfg.name].data
+    deviation = data.joint_pos[:, asset_cfg.joint_ids] - data.default_joint_pos[:, asset_cfg.joint_ids]
+    penalty = deviation.square().sum(dim=1)
+    command = env.command_manager.get_command(command_name)
+    standing = (command == 0).all(dim=1)
+    return torch.where(standing, penalty, torch.zeros_like(penalty))
+
+
 def joint_acc_l2(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,

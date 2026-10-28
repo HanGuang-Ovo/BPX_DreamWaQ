@@ -412,6 +412,18 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"], preserve_order=True),
         },
     )
+    # 精确全零指令时软约束默认站姿：hip_roll=0、hip_pitch=0.7、knee=-1.4 rad。
+    # 12 个关节各偏离 0.1 rad 时，奖励率为 -0.06；运动/转向指令不启用。
+    joint_pos_stand_l2 = RewTerm(
+        func=bpx_rewards.joint_pos_stand_l2,
+        weight=-0.5,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True,
+            ),
+        },
+    )
     # -- 正则
     '''z轴抖动惩罚'''
     lin_vel_z_l2 = RewTerm(
@@ -436,11 +448,11 @@ class RewardsCfg:
     )
     # 机械功率总量与电机功率分布（DreamWaQ Table I）。
     joint_power = RewTerm(
-        func=bpx_rewards.joint_power, weight=-2.0e-5,
+        func=bpx_rewards.joint_power, weight=-4.0e-5,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
     )
     power_distribution = RewTerm(
-        func=bpx_rewards.power_distribution, weight=-1.0e-8,
+        func=bpx_rewards.power_distribution, weight=-5.0e-8,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True),
             "penalty_cap": 1.0e8,
@@ -479,7 +491,7 @@ class RewardsCfg:
             "max_ray_distance": 0.15,
         },
     )
-    '''脚间距惩罚：前、后左右足横向间距为 0.26–0.42 m，同侧前后纵向间距不小于 0.30 m。'''
+    '''脚间距惩罚：前、后左右足横向间距为 0.26–0.42 m，同侧前后纵向间距不小于 0.40 m。'''
     feet_lateral_distance = RewTerm(
         func=bpx_rewards.feet_lateral_distance,
         weight=-1.0,
@@ -502,7 +514,7 @@ class RewardsCfg:
                 body_names=["fl_toe_link", "fr_toe_link", "hl_toe_link", "hr_toe_link"],
                 preserve_order=True,
             ),
-            "minimum_distance": 0.30,
+            "minimum_distance": 0.40,
         },
     )
     # 移动/转向时在落脚瞬间评价腾空时间；加大权重以抑制短促碎步。

@@ -77,6 +77,50 @@ class TestStandFootSlip(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([7., 0., 0., 0.]))
 
 
+class TestStandingJointReference(unittest.TestCase):
+    def penalty(self, positions, references, commands, joint_ids=slice(None)):
+        data = SimpleNamespace(
+            joint_pos=positions, default_joint_pos=references,
+            joint_vel=torch.zeros_like(positions),
+        )
+        env = SimpleNamespace(
+            scene=_Scene(robot=SimpleNamespace(data=data)),
+            command_manager=SimpleNamespace(get_command=lambda _name: commands),
+        )
+        return rewards.joint_pos_stand_l2(
+            env, "base_velocity", SimpleNamespace(name="robot", joint_ids=joint_ids),
+        )
+
+    def test_nonzero_reference_angles_have_zero_cost_at_the_target(self):
+        reference = torch.tensor([[0., .7, -1.4], [.1, .6, -1.3]])
+        result = self.penalty(reference.clone(), reference, torch.zeros(2, 3))
+        torch.testing.assert_close(result, torch.zeros(2))
+
+    def test_stationary_deviation_is_penalized_without_modifying_robot_state(self):
+        reference = torch.tensor([[0., .7, -1.4]])
+        position = reference + torch.tensor([[.1, 0., -.2]])
+        before_position, before_reference = position.clone(), reference.clone()
+        result = self.penalty(position, reference, torch.zeros(1, 3))
+        torch.testing.assert_close(result, torch.tensor([.05]))
+        torch.testing.assert_close(position, before_position)
+        torch.testing.assert_close(reference, before_reference)
+
+    def test_any_nonzero_command_disables_reference_even_when_robot_is_stationary(self):
+        commands = torch.tensor([
+            [0., 0., 0.], [.01, 0., 0.], [0., -.01, 0.], [0., 0., .01],
+            [.1, 0., 0.], [.2, 0., 0.], [0., 0., -.2],
+        ])
+        reference = torch.tensor([[0., .7, -1.4]]).repeat(len(commands), 1)
+        result = self.penalty(reference + .2, reference, commands)
+        torch.testing.assert_close(result, torch.tensor([.12, 0., 0., 0., 0., 0., 0.]))
+
+    def test_joint_selection_uses_each_environments_corresponding_reference(self):
+        reference = torch.tensor([[0., .7, -1.4], [.1, .6, -1.3]])
+        position = reference + torch.tensor([[.2, 99., -.1], [0., -99., 0.]])
+        result = self.penalty(position, reference, torch.zeros(2, 3), joint_ids=[2, 0])
+        torch.testing.assert_close(result, torch.tensor([.05, 0.]))
+
+
 def make_clearance_env(positions, velocities, hits):
     data = SimpleNamespace(
         body_link_pos_w=torch.tensor(positions, dtype=torch.float32),
