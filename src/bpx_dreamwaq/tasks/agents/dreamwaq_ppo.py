@@ -500,10 +500,11 @@ class DreamWaQPPO(PPO):
             ppo_loss.backward()
 
             # CENet 辅助损失：done 转移的下一观测属于新 episode，必须屏蔽。
-            valid_mask = 1.0 - dones_batch.float()
+            # 数值异常转移已由 mini_batch_generator 排除；当前样本均有效。
+            next_obs_mask = ~dones_batch.bool()
             aux = self.policy.cenet.compute_aux_losses(
                 self.policy.normalize_history(history_batch),
-                self.policy.obs_normalizer(next_obs_batch), self.policy.scale_velocity(true_vel_batch), valid_mask
+                self.policy.obs_normalizer(next_obs_batch), self.policy.scale_velocity(true_vel_batch), next_obs_mask
             )
             vel_loss = aux["vel_loss"]
             pred_loss = aux["pred_loss"]

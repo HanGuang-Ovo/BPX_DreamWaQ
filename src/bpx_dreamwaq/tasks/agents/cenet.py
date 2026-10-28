@@ -129,7 +129,8 @@ class CENet(nn.Module):
         history_obs: torch.Tensor,
         next_obs: torch.Tensor,
         true_vel: torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
+        next_obs_mask: torch.Tensor | None = None,
+        current_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """计算 CENet 辅助损失。
 
@@ -137,31 +138,38 @@ class CENet(nn.Module):
             history_obs: (B, num_history_obs) 当前时刻历史本体观测。
             next_obs: (B, num_next_obs) 下一时刻本体观测（VAE Decoder 目标）。
             true_vel: (B, vel_dim) 仿真器真实机体线速度（与估计同坐标系、同时刻）。
-            valid_mask: (B,) 或 (B,1) 的 0/1 掩码；0 表示该转移无效
-                （episode 终止或 reset 后的下一观测），其预测损失与 KL 损失被屏蔽。
+            next_obs_mask: (B,) 或 (B,1)，标记真实连续后继观测。
+            current_mask: (B,) 或 (B,1)，标记有效的当前观测和速度标签。
 
         Returns:
             字典：``vel_loss``（MSE）、``pred_loss``（未来观测预测 MSE）、
             ``kl_loss``（KL 散度）、``vel_error``（未加权平均误差，用于日志）。
         """
-        if valid_mask is None:
-            valid_mask = torch.ones(history_obs.shape[0], 1, device=history_obs.device)
-        else:
-            valid_mask = valid_mask.to(history_obs.device).reshape(-1, 1)
-        mask_sum = valid_mask.sum().clamp_min(1.0)
+        def prepare_mask(mask):
+            if mask is None:
+                return history_obs.new_ones((history_obs.shape[0], 1))
+            if mask.shape not in ((history_obs.shape[0],), (history_obs.shape[0], 1)):
+                raise ValueError("mask 必须为 (B,) 或 (B, 1)")
+            return mask.to(device=history_obs.device, dtype=history_obs.dtype).reshape(-1, 1)
+
+        current_mask = prepare_mask(current_mask)
+        next_obs_mask = prepare_mask(next_obs_mask) * current_mask
+        current_count = current_mask.sum().clamp_min(1.0)
+        next_count = next_obs_mask.sum().clamp_min(1.0)
 
         vel_hat, mu, logvar, z = self.forward(history_obs)
 
         # 速度监督：真实速度仅在训练中使用（标签，detached）。
-        vel_loss = ((vel_hat - true_vel.detach()) ** 2 * valid_mask).sum() / mask_sum
+        vel_per_sample = ((vel_hat - true_vel.detach()) ** 2).sum(dim=-1, keepdim=True)
+        vel_loss = (vel_per_sample * current_mask).sum() / current_count
 
         # 未来观测预测损失：屏蔽 episode 边界。
         next_obs_hat = self.decode(z, vel_hat)
-        pred_loss = (((next_obs_hat - next_obs.detach()) ** 2).mean(dim=-1, keepdim=True) * valid_mask).sum() / mask_sum
+        pred_loss = (((next_obs_hat - next_obs.detach()) ** 2).mean(dim=-1, keepdim=True) * next_obs_mask).sum() / next_count
 
         # KL(q(z|o) || N(0,I))，同样按有效样本归一化。
         kl_per_sample = -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=-1, keepdim=True)
-        kl_loss = (kl_per_sample * valid_mask).sum() / mask_sum
+        kl_loss = (kl_per_sample * current_mask).sum() / current_count
 
         vel_error = (vel_hat - true_vel).abs().detach()
 

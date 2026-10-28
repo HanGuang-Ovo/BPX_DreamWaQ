@@ -78,6 +78,54 @@ class TestCENet(unittest.TestCase):
         losses_all_masked = self.net.compute_aux_losses(history, next_obs, true_vel, torch.zeros(6))
         self.assertTrue(torch.isfinite(losses_all_masked["pred_loss"]).item())
 
+    def test_independent_masks_and_original_reductions(self):
+        history = torch.randn(4, self.history_dim)
+        target = torch.randn(4, self.obs_dim)
+        velocity = torch.randn(4, 3)
+        torch.manual_seed(12)
+        vel, mu, logvar, z = self.net(history)
+        prediction = self.net.decode(z, vel)
+        vel_each = (vel - velocity).square().sum(-1)
+        pred_each = (prediction - target).square().mean(-1)
+        kl_each = -0.5 * (1 + logvar - mu.square() - logvar.exp()).sum(-1)
+        for mask in (torch.ones(4), torch.tensor([1, 0, 1, 0])):
+            torch.manual_seed(12)
+            losses = self.net.compute_aux_losses(history, target, velocity, mask)
+            torch.testing.assert_close(losses["vel_loss"], vel_each.mean())
+            torch.testing.assert_close(losses["kl_loss"], kl_each.mean())
+            torch.testing.assert_close(losses["pred_loss"], (pred_each * mask).sum() / mask.sum())
+        # A real terminal observation can be included when the caller knows it is continuous.
+        torch.manual_seed(12)
+        terminal = self.net.compute_aux_losses(history, target, velocity, torch.ones(4, 1))
+        torch.testing.assert_close(terminal["pred_loss"], pred_each.mean())
+
+        current = torch.tensor([1, 0, 1, 0])
+        torch.manual_seed(12)
+        masked = self.net.compute_aux_losses(history, target, velocity, torch.ones(4), current)
+        torch.testing.assert_close(masked["vel_loss"], (vel_each * current).sum() / current.sum())
+        torch.testing.assert_close(masked["kl_loss"], (kl_each * current).sum() / current.sum())
+        torch.testing.assert_close(masked["pred_loss"], (pred_each * current).sum() / current.sum())
+
+    def test_mask_shapes_and_zero_prediction_gradient(self):
+        for batch in (1, 3, 7):
+            for column in (False, True):
+                self.net.zero_grad(set_to_none=True)
+                mask = torch.zeros(batch, 1) if column else torch.zeros(batch)
+                losses = self.net.compute_aux_losses(
+                    torch.randn(batch, self.history_dim), torch.randn(batch, self.obs_dim),
+                    torch.randn(batch, 3), mask,
+                )
+                self.assertEqual(losses["pred_loss"].item(), 0.0)
+                losses["pred_loss"].backward()
+                for param in self.net.parameters():
+                    if param.grad is not None:
+                        self.assertTrue(torch.isfinite(param.grad).all())
+                        self.assertEqual(param.grad.count_nonzero().item(), 0)
+                self.assertTrue(all(torch.isfinite(losses[k]) for k in ("vel_loss", "pred_loss", "kl_loss")))
+        with self.assertRaises(ValueError):
+            self.net.compute_aux_losses(torch.randn(3, self.history_dim), torch.randn(3, self.obs_dim),
+                                        torch.randn(3, 3), torch.ones(3, 3))
+
     def test_latent_dim_configurable(self):
         net = CENet(num_history_obs=32, num_next_obs=8, latent_dim=5, vel_dim=2)
         vel_hat, mu, logvar, z = net(torch.randn(3, 32))
