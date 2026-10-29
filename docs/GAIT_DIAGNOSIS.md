@@ -1,5 +1,9 @@
 # 左后腿长期悬空的诊断（2026-10-21）
 
+本文保留 2026-10-21 的模型、参数和验证结果，不代表当前模型表现。
+当前奖励已继续调整：`feet_contact_balance` 权重 −3.0、时间常数 0.7 s，
+并增加站立足端滑动与接触项；完整默认值见 [训练设计](TRAINING.md)。
+
 ## 复现结果
 
 权重为用户从服务器训练后拷回的 `policies/policy.onnx` / `policies/policy.pt`，
@@ -60,8 +64,8 @@ MuJoCo 的 12 维策略顺序逐项一致：roll / pitch / knee，每组 FL / FR
 
 ## 训练与验收
 
-将 `rough_env_cfg.py`、`mdp/rewards.py`、`agents/dreamwaq_ppo.py` 三个修改文件
-同步到服务器，并保证服务器的 `runtime/joints.py` 与本机一致。
+该次修复涉及环境、奖励、Runner 和共用关节契约。复现或开始新训练时应同步
+同一版本的完整源码与配置，避免仅拷贝当时的三个文件遗漏后续依赖。
 建议独立开始一轮训练，避免把旧权重已有的三足步态作为初始解：
 
 ```bash

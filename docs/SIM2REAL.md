@@ -39,8 +39,9 @@ cp -n configs/sim2real/joint_calibration.template.toml configs/sim2real/local.ca
 `[network]` 的机器人地址和端口。默认沿用参考工程的 `10.21.20.1`、状态
 UDP 9873、关节 UDP 7895。本机配置已被 `.gitignore` 排除。
 
-默认模型与当前 `configs/sim2sim/bpx_mixed.toml` 一致：
-`policies/policy_20261023_iter2250_stable.onnx`。模型文件不纳入 Git；
+实机模板默认模型为 `policies/policy_20261023_iter2250_stable.onnx`；
+当前 `configs/sim2sim/bpx_mixed.toml` 引用 `policy_20261029_iter5349.onnx`，两者不同。
+部署前应通过 `--policy` 或本机配置选择实际已验收的同一模型。模型文件不纳入 Git；
 其他机器需复制该文件，或使用本工程的 `scripts/export_policy.py` 导出模型。
 选用其他权重时，可修改 `[policy].model`，或在命令行中覆盖：
 
@@ -65,7 +66,7 @@ TOML 中的模型和标定路径相对于配置文件；命令行 `--policy` 路
 | 手柄最大指令 | vx=±0.7 m/s、vy=±0.4 m/s、wz=±0.7 rad/s |
 
 Actor 不读取真实机体线速度、里程计高度或地形扫描，速度估计在 CENet
-内部完成。IMU 默认使用 SDK 的 xyzw 四元数、body-to-world 方向、单位
+内部完成；模型内部执行训练时保存的缩放/归一化，反馈不应在外部重复缩放。IMU 默认使用 SDK 的 xyzw 四元数、body-to-world 方向、单位
 安装旋转和零陀螺仪偏置；标定可覆盖通道、符号、偏移和 IMU 变换。
 
 ## 离线检查与只读预览

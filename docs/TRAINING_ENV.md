@@ -1,7 +1,8 @@
 # 训练环境配置与检查
 
-检查日期：2026-10-20。工作区复用本机已有安装，训练依赖不复制进源码。
-`rsl_rl` 已作为外部 Python 包安装；BPX 工程尚未实现其训练接线。
+环境实测快照日期：2026-10-20；流程说明按 2026-10-29 代码更新。
+工作区复用本机已有安装，训练依赖不复制进源码。BPX 训练、验收与导出接线已实现。
+下表是当时本机环境，不代表其他机器或当前依赖探测结果；请运行检查脚本确认。
 
 ## 本机版本
 
@@ -70,11 +71,11 @@ Conda 中已有的 Warp 1.16.0 虽可使用 CUDA，却移除了 Isaac Sim 5.0 �
 系统 `nvcc` 为 CUDA Toolkit 13.2；PyTorch 使用其随包提供的 CUDA 12.8 运行库。
 当前检查不编译 CUDA 扩展，不需要把系统 Toolkit 降级或重新安装 PyTorch。
 
-## 检查范围与剩余缺项
+## 环境检查范围与训练接线
 
 GPU 矩阵运算、`rsl_rl.runners.OnPolicyRunner` 与 `isaaclab.app.AppLauncher` 导入已通过。
 修复 Warp 后，Isaac Sim 无界面启动、立方体十步 CUDA 物理仿真，以及
-`isaaclab_rl.rsl_rl.RslRlVecEnvWrapper` 导入均已通过；未运行 BPX 训练。
+`isaaclab_rl.rsl_rl.RslRlVecEnvWrapper` 导入均已通过；该环境检查本身不运行 BPX 训练。后续训练记录见 [验证记录](VALIDATION.md)。
 GPU 在受限沙箱内不可见时应在主机终端复查，不应仅凭该沙箱的 `nvidia-smi` 失败重装驱动。
 仿真检查结果记录在 `outputs/training/environment_report.json` 的 `simulation` 字段。
 `tested=false` 或 `result=running` 表示未完成，不能当作物理仿真通过。
@@ -87,9 +88,9 @@ Kit 自带 `pxr`，不要为消除元数据提示直接覆盖它的 USD 库；�
 启动本工程 BPX 强化学习训练的原缺项（2026-10-20 已全部实现）：
 
 1. BPX USD：`tasks/rough_env_cfg.py` 在首次训练启动时通过 UrdfConverter 从 URDF
-   自动转换（沿用 `assets/robots/bpx/usd/config.yaml` 的参数），结果缓存复用；
+   自动转换（转换参数由 `_ensure_bpx_usd()` 定义，`usd/config.yaml` 为生成记录），结果缓存复用；
    可用环境变量 `BPX_FORCE_USD_CONVERSION=1` 强制重转。
-2. Isaac Lab 向量环境、观测（45 维单帧 + 450 维历史 + 71 维特权）、动作、指令、
+2. Isaac Lab 向量环境、观测（45 维单帧 + 450 维历史 + 235 维特权）、动作、指令、
    复位、终止与 Gymnasium 注册：`tasks/rough_env_cfg.py`、`tasks/__init__.py`。
 3. 奖励（复用 Isaac Lab 内置 + 任务层 feet_air_time）与 PPO 超参数：
    `tasks/mdp/rewards.py`、`tasks/agents/rsl_rl_ppo_cfg.py`。
@@ -98,9 +99,9 @@ Kit 自带 `pxr`，不要为消除元数据提示直接覆盖它的 USD 库；�
 5. 训练与导出入口：`scripts/train.py`、`scripts/export_policy.py`。
 
 课程学习（地形 + Grid-Adaptive 指令）已实现且可独立启停；
-域随机化（摩擦、质量、推挤）沿用量级适中的默认配置。
+当前启用材质、PD 增益、复位位姿/关节、观测噪声与推扰；不启用质量/质心随机化。
 训练不需要已训练权重，也不需要机器人 SDK、实机网络或 ROS。
-当前尚未完成长时间收敛训练与实机部署闭环，见 [VALIDATION.md](VALIDATION.md)。
+具体模型的收敛和部署结论应查看对应运行与验收报告，不能由环境检查推断；见 [VALIDATION.md](VALIDATION.md)。
 
 本机 16 GB RAM / 8 GB VRAM 低于该版本文档推荐的 32 GB / 16 GB。
 初次任务调试建议无界面、无相机，从 16 个环境开始测量占用，再逐步增加，

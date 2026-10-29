@@ -4,7 +4,7 @@
 mjcf = "assets/robots/bpx/mjcf/bpx.xml"
 
 # 统一策略路径；推理后端显式选择，默认 Zero 后端不加载权重。
-policy = "policies/policy_20261028_iter3998.onnx"
+policy = "policies/policy_20261029_iter5349.onnx"
 
 [simulation]
 # 沿用 BPX_test 的部署时序：200 Hz 物理仿真、50 Hz 策略。

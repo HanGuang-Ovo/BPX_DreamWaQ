@@ -1,6 +1,21 @@
 # 验证记录
 
-日期：2026-10-20。所有测试在本机离线执行，未连接机器人。
+本页按日期保留历史验证，测试数量、权重路径和参数只对对应记录有效。
+以下既有记录未连接机器人；不能据此认定当前模型已通过实机验收。
+当前流程见 [README](../README.md)，当前默认配置见 [训练设计](TRAINING.md)。
+
+## 文档同步检查（2026-10-29）
+
+本次仅更新文档，按工作区现有代码/配置核对，未重新训练或连接机器人。
+
+- `python scripts/check_project.py`：通过，资源引用、关节契约与五份 sim2sim 配置无错误。
+- 15 份 Markdown 的相对链接、代码围栏检查通过；训练文档的 25 项奖励权重与 `RewardsCfg` 逐项一致。
+- sim2sim / sim2real CLI 帮助入口可运行，`git diff --check` 通过。
+- `PYTHONPATH=src python -m unittest discover -s tests/project -v`：9 项中 8 通过、1 失败。
+  `test_simulation_and_hardware_default_history_contract_matches` 在模型路径相等断言失败：
+  综合仿真配置指向 `policy_20261029_iter5349.onnx`，实机模板指向
+  `policy_20261023_iter2250_stable.onnx`。这项失败反映当前配置差异；本次未修改模型选择或测试断言。
+  使用同一已验收模型时，在两端显式传入 `--policy`；这不会改写默认配置或让上述断言自动通过。
 
 ## 显式 PD 训练与确定性验收（2026-10-27）
 
@@ -20,12 +35,12 @@
   微调冒烟核验位于 `outputs/evaluation/finetune_smoke_verification.json`。
   本轮只验证训练/验收软件链路，未完成充分微调，不代表新策略已经通过迁移或实机验收。
 
-以上为当时的验证记录；当前训练默认已恢复隐式 PD，验收仍使用显式 PD。
-复现命令和验收门槛见 [README：微调与显式 PD 确定性验收](../README.md#68-微调与显式-pd-确定性验收)。
+以上为当时的验证记录；截至 2026-10-29，训练与 PLAY/验收均使用显式 PD。
+复现命令和验收门槛见 [README](../README.md)。
 
 ## sim2real 部署验证（2026-10-23）
 
-- 当前实机默认模型与 `configs/sim2sim/bpx_mixed.toml` 一致：
+- 当时实机默认模型与 `configs/sim2sim/bpx_mixed.toml` 一致：
   `policy_20261023_iter2250_stable.onnx`；SHA256 为
   `fd3ee9395d99653fddd3891c81f447c3473dd3c04cc6e7eb0e4b9b23150407c4`。
 - `bpx-real` 环境中的 `check` 和默认 `run` 离线预检均返回 `ready: true`，
@@ -78,16 +93,16 @@ PYTHONPATH=src ~/miniconda3/envs/bpx-real/bin/python -m unittest discover \
   `bpx_training_ready: true`。
 - `tests/project` 新增入口回归：从工程外调用 `setup_env.py` 返回 0 且报告通过。
 
-## 资源与项目边界
+## 初始迁移时的资源与项目边界（2026-10-20）
 
 - 29 个模型、网格、许可证和说明文件与 BPX_test 原文件的 SHA-256 一致。
 - URDF 和 MJCF 的全部网格引用存在，12 个受控关节与策略契约一致。
 - 四份 MuJoCo TOML 和实机 TOML 均可解析；默认仿真/实机的观测、历史、关节顺序、
   默认角、动作缩放和策略周期一致。
 - 源码无 BPX_test 或旧运行时包的导入，也没有旧工程绝对路径和训练日志路径。
-- 奖励与课程模块只有说明字符串，没有函数、配置、权重或调度逻辑。
+- 初始迁移只保留奖励/课程占位模块；随后已实现完整奖励与双课程，当前不再是占位实现。
 
-## 回归测试
+## 早期回归测试（2026-10-20）
 
 | 测试组 | 运行解释器 | 结果 |
 | --- | --- | --- |
@@ -175,7 +190,7 @@ bash scripts/training_python.sh -m unittest discover -s tests/training -v
 远小于 PPO 损失；如需更强正则可增大 `beta_kl`）。地形课程在 250 迭代内
 未触发升级——episode 尚短，属预期行为，收敛训练（1000+ 迭代）中才会爬级。
 
-## 尚未验证的部分
+## 2026-10-20 当时未覆盖的部分
 
 - 未进行千迭代量级的收敛训练与步态质量/地形爬级评估（需数小时 GPU 时间）。
 - 没有启动图形窗口做视觉检查；窗口逻辑与采样线程通过离线测试验证。
@@ -188,4 +203,5 @@ RSL-RL 2.3.3 / PyTorch 2.7.0+cu128，并在工作区内安装 Warp 1.8.1 兼容�
 CUDA 矩阵运算、RSL-RL Runner 导入、Isaac Sim 无界面启动及十步 GPU 物理仿真通过。
 本机 VS Code 终端激活、从工作区外调用包装脚本、错误 Python 环境诊断均已验证；
 `tests/project` 七项通过，项目资源检查无错误。
-详细结果与限制见 [TRAINING_ENV.md](TRAINING_ENV.md)，本工程仍未实现 BPX 训练任务。
+详细结果与限制见 [TRAINING_ENV.md](TRAINING_ENV.md)。此处仅为环境验证；
+BPX 训练任务后来已实现，训练/导出实测见本页对应日期记录。

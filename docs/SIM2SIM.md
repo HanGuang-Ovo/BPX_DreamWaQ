@@ -1,5 +1,7 @@
 # MuJoCo sim2sim
 
+按 2026-10-29 代码核对；文末有日期的结果保留为历史记录。
+
 ## 运行
 
 在项目根目录执行，Python 环境需要 `mujoco` 和 `onnxruntime`。
@@ -34,6 +36,9 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 
 `--auto-init` 可让手柄模式也自动起身。`--direct-policy` 跳过状态机，供站姿接口对拍使用。
 默认 `zero` 后端只检查 PD 和流程，不产生策略步态。
+CLI 默认读取 `bpx_history.toml`（平地，450 维）；综合场地需显式传 `--config`。
+`bpx_mixed.toml` 当前引用 `policy_20261029_iter5349.onnx`，
+而导出脚本默认生成 `policy.onnx`，使用新导出时请显式传 `--policy`。
 
 MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导致的自动退出。
 策略接管后持续响应手柄；起身未完成时继续执行 Init 控制，直到满足接管条件。
@@ -52,7 +57,7 @@ MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导�
 | `mixed` | 同时包含崎岖路线和楼梯路线 |
 
 综合场地出生点为 `(0, 0)`，面向 +X。崎岖路线位于 `x=2..10 m`、`y=-2..2 m`，
-边缘平滑过渡。`bpx_mixed.toml` 中楼梯起点均为 `x=2 m`，终点为 `x=4.8 m`，路线如下：
+边缘平滑过渡。`bpx_mixed.toml` 中楼梯起点均为 `x=2 m`，终点为 `x=4.4 m`，路线如下：
 
 | 等级 | 单级高度 | 顶部高度 | 中心线 y | 颜色 |
 | --- | --- | --- | --- | --- |
@@ -61,7 +66,7 @@ MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导�
 | 3 | 10 cm | 50 cm | -10.5 m | 橙 |
 | 4 | 15 cm | 75 cm | -13.5 m | 绿 |
 
-每条楼梯宽 2 m，踏面深 0.2 m，上升 5 个高差，顶部平台长 1.2 m，再下降 5 个高差。
+每条楼梯宽 2 m，踏面深 0.15 m，上升 5 个高差，顶部平台长 1.2 m，再下降 5 个高差。
 各楼梯为独立 box 碰撞体，保留竖直踢面；崎岖路面采用连续高度场，保留负高度谷地。
 地形标签显示在 viewer 内，CSV 记录 `terrain_region`、`ground_z`、`base_clearance`。
 高度判定使用机身正下方地面，跨台阶边缘时不是四足支撑面的平均高度。
@@ -111,6 +116,22 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 输入不含真实线速度和地形扫描。Init 和等待阶段仍累计实际观测/实际施加动作历史；
 切换时动作与 PD 增益在 0.3 秒内过渡。旧的 48 维配置只适用于相应的旧策略。
 
+## 配置选择与曲线
+
+| 配置 | 接口 | 场地 |
+| --- | --- | --- |
+| `bpx_history.toml` | 450 维历史 | 平地，CLI 默认 |
+| `bpx_terrain_history.toml` | 450 维历史 | 三段固定测试地形 |
+| `bpx_mixed.toml` | 450 维历史 | 崎岖 + 四档上下楼梯 |
+| `bpx_flat.toml` | 48 维单帧，含真实线速度 | 旧接口平地参考 |
+| `bpx_terrain_standing.toml` | 48 维单帧，含真实线速度 | 旧接口测试地形参考 |
+
+当前 DreamWaQ 导出模型应配合 450 维配置，不能直接使用旧 48 维配置。
+`--velocity-plot` 对照指令与实际速度，`--torque-plot` 查看 12 关节输出力矩；
+`--velocity-window` / `--torque-window` 设置 1–30 秒窗口，默认 10 秒。
+`--log` 保存策略频率 CSV；`--no-realtime` 取消实时限速，便于离线仿真。
+训练和 MuJoCo 使用相同名义 PD，但物理引擎、接触与初始状态不同，不能只凭参数一致判断迁移成功。
+
 ## 验证记录（2026-10-21）
 
 ```bash
@@ -143,5 +164,5 @@ bash scripts/training_python.sh scripts/export_policy.py \
 | 15 cm 楼梯 | 0.3 m/s，32 s | 首级附近受阻并侧移，未完成楼梯路线 |
 
 日志在 `outputs/sim2sim/policy3100_*.csv`，场地离屏渲染在 `outputs/sim2sim/course.png`。
-这些结果验证了加载、起身、策略接管和地形交互；现有策略尚不能稳定通过较高楼梯。
-当前未检测到实体 Linux 手柄，RB/摇杆流程通过模拟输入和接线测试验证，仍需连接手柄实测。
+这些结果验证了加载、起身、策略接管和地形交互；该次测试的策略未稳定通过较高楼梯。
+当时未检测到实体 Linux 手柄，RB/摇杆流程通过模拟输入和接线测试验证，仍需连接手柄实测。

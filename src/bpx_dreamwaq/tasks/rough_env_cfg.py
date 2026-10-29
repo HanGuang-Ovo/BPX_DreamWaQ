@@ -463,7 +463,7 @@ class RewardsCfg:
     )
     # 机械功率总量与电机功率分布（DreamWaQ Table I）。
     joint_power = RewTerm(
-        func=bpx_rewards.joint_power, weight=-4.0e-5,
+        func=bpx_rewards.joint_power, weight=-2.0e-5,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=list(POLICY_JOINT_NAMES), preserve_order=True)},
     )
     power_distribution = RewTerm(
@@ -539,7 +539,7 @@ class RewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
-            "threshold": 0.4,
+            "threshold": 0.3,
             "command_threshold": 0.1,
             "yaw_command_threshold": 0.1,
         },
@@ -572,7 +572,7 @@ class RewardsCfg:
     '''姿态水平惩罚（惩罚 roll/pitch 偏离水平，基于投影重力）'''
     flat_orientation_l2 = RewTerm(
         func=lab_mdp.flat_orientation_l2,
-        weight=-1.0
+        weight=-0.75
     )
     '''关节位置越界惩罚'''
     joint_pos_limits = RewTerm(

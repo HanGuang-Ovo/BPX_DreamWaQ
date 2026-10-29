@@ -1,3 +1,6 @@
+> 历史需求文档：保留初始任务背景和实现目标，不作为当前默认参数或功能状态说明。
+> 当前工作流程见 [README](README.md)，算法与奖励配置见 [训练设计](docs/TRAINING.md)。
+
 # 任务1：在现有 Isaac Lab 四足机器人强化学习工程中实现 DreamWaQ 风格的 CENet
 
 你是一名熟悉 NVIDIA Isaac Lab、RSL-RL、PPO、PyTorch 和四足机器人强化学习的高级算法工程师。

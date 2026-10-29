@@ -1,6 +1,6 @@
 # BPX Robot Model Assets
 
-This repository contains open-source robot description assets for the `BPX` platform.
+This directory contains open-source robot description assets for the `BPX` platform.
 
 It is intended for developers who need model files for visualization, simulation setup, and integration research.
 
@@ -10,14 +10,14 @@ It is intended for developers who need model files for visualization, simulation
 - `bpx/meshes/`: mesh assets referenced by the URDF model
 - `mjcf/bpx.xml`: MuJoCo MJCF model entry
 - `mjcf/meshes/`: mesh assets referenced by the MJCF model
-- `usd/bpx.usd`: main USD model entry
+- `usd/bpx.usd`: generated/cached USD model entry (may be absent in a fresh checkout)
 - `usd/configuration/`: USD model, physics, and sensor layers
 - `usd/config.yaml`: USD conversion configuration used for asset generation workflows
 
 ## Directory Layout
 
 ```text
-BPX/
+assets/robots/bpx/
 ├── bpx/
 │   ├── meshes/
 │   └── urdf/
@@ -46,9 +46,11 @@ The model references meshes from the local `mjcf/meshes/` directory.
 
 ### USD
 
-Use `usd/bpx.usd` as the primary entry when loading the robot in USD-compatible tools.
+Training generates `usd/bpx.usd` from the URDF when it is missing. The converter settings are defined in
+`src/bpx_dreamwaq/tasks/rough_env_cfg.py::_ensure_bpx_usd()`; `usd/config.yaml` records generated settings.
+Set `BPX_FORCE_USD_CONVERSION=1` to regenerate after changing the source model or conversion settings.
 
-Keep the `usd/configuration/` directory beside `bpx.usd`, because the main stage composes the model from those USD layers. The `usd/config.yaml` file records the URDF-to-USD conversion settings used to generate the published assets.
+Keep the `usd/configuration/` directory beside `bpx.usd`, because the main stage composes the model from those USD layers. The `usd/config.yaml` file records the URDF-to-USD conversion settings used to generate the generated assets.
 
 ## Notes
 
@@ -58,5 +60,5 @@ Keep the `usd/configuration/` directory beside `bpx.usd`, because the main stage
 
 ## License And Usage
 
-This repository is released under the `BSD-3-Clause` license. See `LICENSE`
+These robot assets are distributed under the `BSD-3-Clause` license. See `LICENSE`
 for the full license text.

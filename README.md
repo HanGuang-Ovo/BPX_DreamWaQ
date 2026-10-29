@@ -1,1022 +1,312 @@
 # BPX_DreamWaQ
 
-BPX 四足机器人强化学习工程：基于 Isaac Lab 2.2.1 + RSL-RL 2.3.3 的
-DreamWaQ 训练框架（CENet 状态估计 + PPO + 双课程学习），以及配套的
-MuJoCo sim2sim 与官方 SDK sim2real 部署运行时。
+BPX 四足机器人的 DreamWaQ 工程：在 Isaac Lab 中用 CENet + PPO 训练速度跟踪策略，
+导出融合 CENet 与 Actor 的模型，在 MuJoCo 中验证，再通过官方 SDK 部署到机器人。
+站立、行走和减速共用一份策略；趴卧起身由足端轨迹、逆运动学和 PD 控制完成。
 
-| 能力 | 说明 |
-| --- | --- |
-| 统一策略 | 450 维历史观测 → 12 维关节位置动作；站立、行走、减速共用一个模型 |
-| CENet | 从本体历史中估计机体线速度与 VAE 隐变量；Actor 不读取真实速度 |
-| PPO | 扩展 Rollout 存储、辅助损失、AdaBoot 与部署导出 |
-| 课程 | 地形难度课程（模块 A）+ Grid-Adaptive 指令课程（模块 B），可独立启停 |
-| 运行时 | Isaac Lab 训练、MuJoCo sim2sim、官方 SDK sim2real、只读 Tk 启动检查 |
+本文按实际使用顺序说明工程流程。默认值按 **2026-10-29 工作区代码**核对；
+已有 checkpoint 的实际配置以其元数据及运行目录 `params/` 为准，修改源码不会改变已导出的模型。
 
----
-
-## 1. 工程结构
+## 1. 整个工程如何运行
 
 ```text
-BPX_DreamWaQ/
-├── assets/robots/bpx/              # URDF、MJCF、网格与 USD；USD 缺失时首次训练自动转换
-├── configs/
-│   ├── sim2sim/                    # MuJoCo 场景：平地、历史观测、固定测试地形、综合场地
-│   ├── sim2real/                   # SDK 网络、控制参数与标定模板
-│   └── training/versions.toml      # 训练栈期望版本（运行时核对，不作 pip 安装请求）
-├── docs/                           # 架构、训练环境、sim2sim / sim2real、验证记录
-├── policies/                       # 导出的 ONNX / TorchScript 放置说明；权重不入 Git
-├── scripts/
-│   ├── setup_env.py                # 一键环境验证与可编辑安装
-│   ├── train.py                    # 训练入口（Isaac Sim headless）
-│   ├── export_policy.py            # checkpoint → ONNX / TorchScript
-│   ├── sim2sim.py                  # MuJoCo sim2sim 入口
-│   ├── sim2real.py                 # 实机预检、录制、分析、回放与显式控制
-│   ├── monitor.py / visualize.py   # 只读反馈与启动前检查窗口（同一入口）
-│   ├── check_project.py            # 离线资源与配置检查（无需 Isaac / MuJoCo）
-│   ├── check_training_env.py       # 训练栈检查与十步 GPU 物理冒烟
-│   ├── activate_training.sh        # 激活现有 Isaac Lab 训练环境
-│   ├── training_python.sh          # 在训练环境中执行任意 Python
-│   └── training_bootstrap/         # 工作区 Warp 1.8.1 兼容引导
-├── src/bpx_dreamwaq/
-│   ├── assets.py、paths.py         # 机器人资源与工作区路径
-│   ├── runtime/                    # 共用关节、观测、历史、推理、路由与状态机
-│   ├── sim2sim/                    # MuJoCo 配置、地形、运行器与速度/力矩曲线
-│   ├── sim2real/                   # SDK 适配、标定、控制、预检、监控、录制与回放
-│   ├── tasks/
-│   │   ├── obs_contract.py         # 训练/部署共用：45 维单帧、450 维历史
-│   │   ├── rough_env_cfg.py        # 崎岖地形速度跟踪环境、奖励/终止/事件与课程接线
-│   │   ├── rough_env.py            # 奖励总和下限扩展环境
-│   │   ├── mdp/
-│   │   │   ├── rewards.py          # 本工程奖励项
-│   │   │   ├── terminations.py     # 过倾终止
-│   │   │   ├── curriculums.py      # 模块 A：整回合地形难度课程
-│   │   │   ├── command_grid.py     # 模块 B：Grid-Adaptive 指令课程（纯 torch）
-│   │   │   └── commands.py         # GridAdaptiveVelocityCommand（CommandTerm）
-│   │   └── agents/
-│   │       ├── cenet.py            # 共享编码器 + 速度头 + VAE + Decoder
-│   │       ├── dreamwaq_actor_critic.py  # 非对称 Actor-Critic 与部署导出模块
-│   │       ├── dreamwaq_ppo.py     # 扩展 Rollout、辅助损失 PPO、Runner、AdaBoot
-│   │       └── rsl_rl_ppo_cfg.py   # 全部训练超参数与课程/AdaBoot 开关
-│   └── validation.py               # 离线资源、配置与模块检查
-├── tests/
-│   ├── training/                   # CENet、PPO、奖励、课程离线单元测试（136 项）
-│   ├── sim2sim/                    # MuJoCo 与配置测试（42 项）
-│   ├── sim2real/                   # SDK 模拟、部署、监控测试（80 项）
-│   └── project/                    # 工作区边界与入口测试（9 项）
-└── outputs/                        # 训练、仿真、录制与诊断输出
+机器人 URDF ──首次训练转换/缓存 USD──► Isaac Lab 并行环境
+                                           │ 本体历史、特权观测、奖励
+                                           ▼
+                                     CENet + PPO 训练
+                                           │
+                           checkpoint + params + TensorBoard
+                                           │
+                          evaluate_policy.py 平地确定性验收
+                                           │
+                          export_policy.py 导出 ONNX / TorchScript
+                                           │
+机器人 MJCF + sim2sim TOML ────────────────► MuJoCo 验证
+                                           │ 起身、站立、速度跟踪、地形
+                                           ▼
+                         实机配置/标定 + ONNX + 官方 bpx_sdk
+                                           │
+                           离线预检 → 只读反馈 → run --live
 ```
 
-**模块职责**
+训练环境提供真实速度作为监督标签和 Critic 输入；部署模型从历史观测估计速度，
+不需要真实线速度或地形扫描。默认训练启用 AdaBoot，采样时可能用真实速度替换
+Actor 的估计速度，因此训练奖励不能代替纯 CENet 策略的独立验收。
 
-| 模块 | 职责 |
-| --- | --- |
-| `tasks/obs_contract.py` | 定义训练与部署共用的观测顺序、维度与历史布局 |
-| `tasks/agents/cenet.py` | CENet：历史编码、速度估计、β-VAE 与下一帧观测预测 |
-| `tasks/agents/dreamwaq_actor_critic.py` | Actor-Critic、CENet 接入、部署导出模块 |
-| `tasks/agents/dreamwaq_ppo.py` | Rollout 存储扩展、辅助损失、AdaBoot、训练 Runner |
-| `tasks/mdp/command_grid.py` | 在 (vx, wz) 网格上维护采样概率与跟踪统计 |
-| `tasks/mdp/curriculums.py` | 逐环境整回合地形升降级判定 |
-| `runtime/` | sim2sim 与 sim2real 共用的观测历史、ONNX 推理、指令路由与起身状态机 |
+| 阶段 | 入口 | 输入 | 产物/用途 |
+| --- | --- | --- | --- |
+| 环境检查 | `scripts/setup_env.py` | 当前 Python、资源、配置 | 依赖与工作区检查报告 |
+| 训练 | `scripts/train.py` | Python 环境/算法配置 | 训练 checkpoint `.pt`、日志 |
+| 验收 | `scripts/evaluate_policy.py` | 训练 checkpoint | 逐环境速度误差及通过状态 JSON |
+| 导出 | `scripts/export_policy.py` | 训练 checkpoint | ONNX 或 TorchScript 部署模型 |
+| sim2sim | `scripts/sim2sim.py` | MJCF、TOML、部署模型 | MuJoCo 仿真、CSV、曲线 |
+| sim2real | `scripts/sim2real.py` | ONNX、runtime、标定、SDK | 预检、录制、回放或实机控制 |
+| 只读窗口 | `scripts/monitor.py` / `visualize.py` | 模拟/SDK/录制反馈 | 启动检查、姿态与策略目标预览 |
 
----
+## 2. 环境准备
 
-## 2. 环境验证与安装
+在项目根目录执行下面的命令。部署脚本可从外部目录调用；本文相对路径命令统一以项目根目录为基准。
 
-### 2.1 一键检查 / 安装
+| 环境 | 用途 | 依赖 |
+| --- | --- | --- |
+| 训练环境（本机 `isaaclab`） | 训练、验收、导出 | Isaac Lab 2.2.1、Isaac Sim 5.0、RSL-RL 2.3.3、PyTorch |
+| 仿真环境（本机 `bpx-sim2sim`） | MuJoCo 与 ONNX 推理 | Python 3.11+、NumPy、MuJoCo、ONNX Runtime |
+| 实机环境（本机 `bpx-real`） | SDK 控制和只读窗口 | Python 3.11+、NumPy、ONNX Runtime、官方 SDK；窗口需 Tkinter |
 
-工程入口脚本会自动定位工作区，不依赖当前目录。先运行检查：
+环境名是本机约定，不是强制名称。无需把三套依赖都装在同一个解释器中。
 
 ```bash
-cd ~/BPX_DreamWaQ
-
-# 当前解释器 + 机器人资源、配置、训练模块
+# 只检查，不安装
 python scripts/setup_env.py
-
-# 同时探测本机已知的 bpx-sim2sim / bpx-real / isaaclab 环境
 python scripts/setup_env.py --all-envs
 
-# 额外运行当前解释器可执行的离线测试；缺少依赖的套件会跳过并说明原因
-python scripts/setup_env.py --tests
-
-# 通过 training_python.sh 检查 Isaac Lab 训练栈（含 GPU 与版本）
-python scripts/setup_env.py --train-check
-
-# 机器可读报告
-python scripts/setup_env.py --json
-
-# 也可用指定环境的解释器运行（检查会针对该环境）
-~/miniconda3/envs/bpx-sim2sim/bin/python scripts/setup_env.py --tests
-~/miniconda3/envs/bpx-real/bin/python scripts/setup_env.py --tests
-```
-
-安装本工程与 pip 可选依赖：
-
-```bash
-# 可编辑安装，默认 extras=deploy（MuJoCo + ONNX Runtime）
+# 安装到当前解释器：可编辑安装 + deploy extras
 python scripts/setup_env.py --install
-
-# 一键：安装 + 检查 + 当前解释器可执行的离线测试
-python scripts/setup_env.py --install --tests
-
-# 只装仿真 / 推理，或只装基础依赖
+# 按需选择依赖，也可用 python -m pip install -e '.[deploy]'
 python scripts/setup_env.py --install --extras sim,inference
-python scripts/setup_env.py --install --extras ""
+
+# 资源/配置检查与当前解释器可执行的离线测试
+python scripts/check_project.py
+python scripts/setup_env.py --tests
 ```
 
-脚本只处理本工程和 pip extras；**不会安装 Isaac Lab、Isaac Sim 或机器人 SDK**，
-也不会修改已有 Conda 环境的包。训练栈通过现有 Isaac 环境检查。
+`--install` 会调用当前解释器的 pip，可能安装或调整该环境的依赖；不加此参数仅做检查。
+它不安装 Isaac Lab、Isaac Sim 或机器人 SDK。权重不随 Git 分发，缺少权重时需先训练导出或复制匹配模型。
 
-检查内容：
-
-| 检查项 | 内容 |
-| --- | --- |
-| Python 与必需依赖 | 版本、NumPy 是否可用 |
-| 机器人资源 | URDF/MJCF 网格引用是否完整、12 个受控关节集合是否一致 |
-| sim2sim 配置 | 5 份 TOML 可解析、模型路径与观测维度正确 |
-| 训练模块 | CENet、PPO、课程、环境配置与训练入口是否存在 |
-| 可选依赖矩阵 | MuJoCo、ONNX Runtime、Tkinter、SDK、PyTorch、RSL-RL、TensorBoard |
-| 离线测试（`--tests`） | 按当前解释器能力运行 project / sim2sim / sim2real / training 套件 |
-| 训练栈（`--train-check`） | Isaac Lab 2.2.1、Isaac Sim 5.0、rsl-rl 2.3.3、CUDA 与版本核对 |
-
-退出码 `0` 表示通过，`1` 表示工作区错误、必需依赖缺失或任一测试失败。
-
-### 2.2 三套运行环境
-
-| 环境 | 用途 | 关键依赖 | 入口 |
-| --- | --- | --- | --- |
-| `bpx-sim2sim` | MuJoCo sim2sim、离线测试 | `mujoco`、`onnxruntime` | `python scripts/sim2sim.py` |
-| `bpx-real` | 实机 SDK 与只读窗口 | `bpx_sdk`、`onnxruntime`、Tkinter | `python scripts/sim2real.py` |
-| `isaaclab` | 训练与导出 | Isaac Lab 2.2.1、Isaac Sim 5.0、`rsl-rl-lib==2.3.3`、PyTorch 2.7 | `bash scripts/training_python.sh` |
-
-三套环境互不复制依赖；源码通过 `PYTHONPATH` 加载，不要求预先安装本工程。
-
-### 2.3 训练环境
-
-本机工作区已配置为复用 Conda `isaaclab`：Python 3.11、Isaac Lab 2.2.1、
-Isaac Sim 5.0、`rsl-rl-lib==2.3.3`、PyTorch 2.7.0 + CUDA 12.8。
-工作区内的 Warp 1.8.1 兼容补丁通过 `.training-deps/` 提供，不修改共享 Conda 包。
+训练复用已有 Isaac 环境：
 
 ```bash
-# 激活当前终端；新建 VS Code 终端也会自动选择这套环境
 source scripts/activate_training.sh
 python scripts/check_training_env.py --require-gpu
 
-# 从任意 Conda 环境调用，也可直接使用项目包装入口
+# 无需激活当前终端的等价包装入口
 bash scripts/training_python.sh scripts/check_training_env.py --smoke-test \
     --report outputs/training/environment_report.json
 ```
 
-其他机器可通过 `BPX_CONDA_ROOT`、`BPX_TRAIN_ENV`、`BPX_ISAACLAB_ROOT`、
-`BPX_ISAACSIM_ROOT` 覆盖路径。完整版本、验证结果与 Warp 兼容问题见
-[训练环境说明](docs/TRAINING_ENV.md)。本机 16 GB RAM / 8 GB VRAM：
-建议从 16 环境冒烟、512–1024 环境正式训练。
+训练栈版本记录在 `configs/training/versions.toml`。其他机器可用
+`BPX_CONDA_ROOT`、`BPX_TRAIN_ENV`、`BPX_ISAACLAB_ROOT`、`BPX_ISAACSIM_ROOT`
+覆盖路径；Warp 兼容补丁和安装细节见 [训练环境](docs/TRAINING_ENV.md)。
 
-### 2.4 其他机器安装
+## 3. 训练：从配置到 checkpoint
 
-需要 Python 3.11+，在工程根目录执行：
+训练参数来自 Python 配置，**不读取 sim2sim TOML**：
 
-```bash
-python -m pip install -e '.[deploy]'      # NumPy + MuJoCo + ONNX Runtime
-python -m pip install -e '.[sim]'         # 仅 MuJoCo
-python -m pip install -e '.[inference]'   # 仅 ONNX Runtime
-python -m pip install -e '.[torchscript]' # 可选 PyTorch 后端
-python -m pip install -e .                # 基础：仅 NumPy
-```
+| 要修改的内容 | 文件 |
+| --- | --- |
+| 地形、奖励、终止、随机化、指令、环境数量 | `src/bpx_dreamwaq/tasks/rough_env_cfg.py` |
+| 网络、PPO、CENet、AdaBoot、缩放、保存间隔 | `src/bpx_dreamwaq/tasks/agents/rsl_rl_ppo_cfg.py` |
+| 训练启动、命令行覆盖、恢复与微调 | `scripts/train.py` |
 
-训练还需要按 [Isaac Lab v2.2.1 安装说明](https://github.com/isaac-sim/IsaacLab/blob/v2.2.1/docs/source/setup/installation/index.rst)
-准备 Isaac Lab 与 Isaac Sim，并安装与本工程匹配的 `rsl-rl-lib==2.3.3`。
-实机部署还需要安装与固件匹配的官方 `bpx_sdk` wheel。
-
-本工程按**源码工作区**使用：模型、配置和输出保留在项目目录，采用可编辑安装。
-安装后可选用命令行入口 `bpx-dreamwaq-sim`、`bpx-dreamwaq-real`、
-`bpx-dreamwaq-monitor` 和 `bpx-dreamwaq-check`，它们与 `scripts/` 下同名入口等价。
-
-### 2.5 机器人 SDK
-
-`bpx-real` 环境已包含官方 SDK。参考工程的离线 wheel 位于
-`../BPX_test/bpx_sdk_open-master/wheelhouse/`；本工程运行时不导入
-`BPX_test`，也不复制 SDK 二进制。训练与 sim2sim 不依赖 SDK。
-
----
-
-## 3. 训练
-
-### 3.1 算法数据流
-
-```text
-历史本体观测 prop_history (450 = 6 项 × 10 帧, term-major, 项内旧→新)
-        │
-        ▼
-CENet 共享编码器 ──► 速度估计头 ──► vel_hat (3)          ┐
-        │                                                ├─► Actor 输入 (45+3+16=64) ──► 12 维动作
-        └──────────────► VAE 头 ──► μ (16, 确定性) ──────┘
-                             └──► [vel_hat, z (采样)] ──► Decoder ──► 预测下一时刻 45 维观测
-
-Critic（特权）: [真实线速度 3, 45 维单帧, 高度扫描 187] = 235 维
-辅助损失: L_CE = λ_vel·MSE(vel_hat, 真实线速度) + λ_pred·MSE(ô_{t+1}, o_{t+1}) + β·KL
-```
-
-关键设计：
-
-- **Actor 不读取真实机体线速度**；真实速度仅作为 CENet 训练标签与 Critic 特权输入。
-- **PPO 概率比一致性**：rollout 时实际送入 Actor 的 CENet 特征（含 AdaBoot
-  混合速度）被保存到扩展 Rollout 存储，更新阶段原样复用；Actor 使用确定性
-  隐变量均值 μ，不做二次采样。
-- **梯度连接**：默认 `detach_cenet_from_actor=True`——Actor 的 PPO 梯度不回传
-  CENet，CENet 仅由辅助损失更新；可配置 `ppo_grad_to_cenet=True`。
-- **独立优化器**：Actor/Critic 与 CENet 使用参数互不重叠的 Adam，分别裁剪梯度。
-  CENet 默认固定学习率 `cenet_learning_rate=1e-3`、`cenet_max_grad_norm=1.0`，
-  每个 minibatch 更新一次，不受 PPO 的 KL 学习率调节影响。
-- **速度条件解码器**：默认 `cenet_decoder_use_velocity=True`，输入 `[vel_hat, z]`（19 维）；
-  预测损失通过估计速度回传速度头，不使用真实速度或 AdaBoot 混合速度。
-  固定缩放开启时，估计速度保持与监督标签一致的缩放单位。
-- **模型兼容**：新 checkpoint 保存两套优化器状态。新解码器建议从头训练；
-  旧 checkpoint 导出自动识别原结构，旧权重微调需设置 `cenet_decoder_use_velocity=False`
-  并保持原缩放配置。旧联合优化器 checkpoint 不支持直接恢复为独立优化器。
-- **done 屏蔽**：episode 终止转移的“下一观测”是 reset 后的新 episode 观测，
-  预测损失与 KL 损失按 done 掩码屏蔽。
-- **AdaBoot（默认关闭，启用时为 `reward_cv` 模式）**：训练期间按概率在真实速度与估计
-  速度间切换 Actor 输入，缓解训练初期 CENet 估计不准的问题。支持 `error`
-  （按速度估计误差过渡）、`reward_cv`（论文 p = 1 − tanh(CV(R))）、`linear`
-  三种模式；实际送入 Actor 的速度被保存并在更新时原样复用；部署始终使用
-  估计速度。
-
-### 3.2 训练命令
+当前默认：1024 个环境、1500 次迭代、每次采样 24 步；两套课程开启；
+AdaBoot 开启且为 `error` 模式；固定观测缩放开启、经验归一化关闭；
+Decoder 只用 16 维隐变量。训练从约 0.42 m 默认站姿复位，
+MuJoCo 历史配置从约 0.13 m 趴卧姿态起身，两者初始状态不同。
 
 ```bash
-# 短时冒烟测试（首次运行自动 URDF→USD 转换，需要几分钟）
+# 先确认仿真、奖励和反向更新链路
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 16 --max_iterations 3
 
-# 默认配置正式训练（当前默认：双课程开 + AdaBoot 关）
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512
-
-# 指定实验名、随机种子与环境数
+# 正式训练示例；环境数按显存调整
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
-    --run_name history_cv --seed 42
+    --max_iterations 3000 --seed 42 --run_name bpx_rough
 
-# 恢复训练
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
-    --resume --checkpoint outputs/training/bpx_dreamwaq/<run>/model_100.pt
-
-# 只训练较短迭代数（调试）
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 256 --max_iterations 250
-```
-
-若更新阶段出现 CUDA OOM，可降低环境数并增加每个 epoch 的小批次数，例如：
-
-```bash
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 2048 \
-  --num_mini_batches 8 --max_iterations 3000 --run_name explicit_pd_cenet
-```
-
-这会降低仿真/rollout 占用及单次网络更新峰值；不能保证所有显存环境都足够。
-小批次数增加也会增加每个 epoch 的优化器步数，属于训练超参数调整。
-PPO 与 CENet 依次反向传播，再裁剪梯度并分别更新，避免同时保留两套前向激活。
-数值隔离日志与 CUDA OOM 是不同问题；不要通过放宽数值保护阈值处理显存不足。
-
-**日志与 checkpoint 目录**：
-
-```text
-outputs/training/bpx_dreamwaq/<YYYYMMDD_HHMMSS>[_<run_name>]/
-├── model_50.pt          # 每 save_interval=50 次迭代保存一次
-├── model_100.pt
-├── ...
-├── model_<iter>.pt      # 训练结束时再保存一次
-└── events.out.tfevents.*
-```
-
-`BPX_LOG_DIR` 可改日志根目录（默认 `outputs/training`）。每个 checkpoint
-包含模型权重、优化器状态和训练配置，可直接用于恢复或导出。
-
-### 3.3 配置方式：命令行与配置文件
-
-所有课程/AdaBoot 开关都有**命令行**（临时实验）和**配置文件**（改默认值）
-两种用法；命令行优先级更高。开关在训练启动时读取，不能中途切换；`--resume`
-时换开关会从该点改变行为，对照实验建议独立开跑。
-
-**命令行开关**（`scripts/train.py`，常用参数还包括 `--num_envs`、
-`--max_iterations`、`--seed`、`--run_name`、`--num_terrain_levels`）：
-
-| 参数 | 作用 | 覆盖的配置项 |
-| --- | --- | --- |
-| `--disable_terrain_curriculum` | 关闭地形课程（默认开） | `enable_terrain_curriculum` |
-| `--enable_command_curriculum` / `--disable_command_curriculum` | 开/关指令课程 | `enable_grid_adaptive_command_curriculum` |
-| `--num_terrain_levels N` | 地形难度等级数（默认 10） | `num_terrain_levels` |
-| `--adaboot` / `--disable_adaboot` | 开/关 AdaBoot（默认关） | `adaboot_enabled` |
-| `--adaboot_mode error\|reward_cv\|linear` | AdaBoot 概率调度模式 | `adaboot_mode` |
-
-```bash
-# 两套课程 + AdaBoot 全开（显式启用 AdaBoot）
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --adaboot
-
-# 只关指令课程
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --disable_command_curriculum
-
-# 关闭全部课程与 AdaBoot（原始 PPO + CENet 基线）
+# 消融：关闭课程与 AdaBoot，仍然保留 CENet + PPO
 bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
     --disable_terrain_curriculum --disable_command_curriculum --disable_adaboot
-
-# AdaBoot 切换为按估计误差过渡
-bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 --adaboot --adaboot_mode error
 ```
 
-**配置文件默认值**分两处：
+首次训练若缺少 USD，会从工程内 URDF 转换并缓存。需要重转时设置
+`BPX_FORCE_USD_CONVERSION=1`。显存不足可减少 `--num_envs` 或增加
+`--num_mini_batches`；后者同时改变每轮优化器更新次数。
 
-1. 环境侧（课程开关与网格参数）——`tasks/rough_env_cfg.py` 的
-   `BPXRoughEnvCfg` 类属性：
+默认输出目录：
 
-   ```python
-   enable_terrain_curriculum = True        # 地形课程总开关
-   num_terrain_levels = 10                 # 难度等级数（地形网格行数）
-   terrain_curriculum_mode = "standard"    # "standard" 升降级 / "upgrade_only" 只升不降
-   terrain_curriculum_debug = False        # 逐等级环境数、整回合统计等调试日志
-   terrain_curriculum_min_command_speed = 0.1       # 平移指令评价下限 (m/s)
-   terrain_curriculum_min_command_distance = 1.0    # 最小累计指令路程 (m)
-   terrain_curriculum_min_tracking_duration_s = 2.0 # 最小移动评价时长 (s)
-   terrain_curriculum_min_moving_fraction = 0.5     # 明确移动任务：移动时间占比 ≥ 50%
-   terrain_curriculum_lin_vel_tolerance = 0.1       # 仅降级/日志使用：平面误差容限 (m/s)
-   terrain_curriculum_yaw_tolerance = 0.5           # 仅降级/日志使用：偏航误差容限 (rad/s)
-   terrain_curriculum_failure_ratio = 0.5           # 持续失败：≥ 50% 移动采样跟踪不良
-   terrain_curriculum_coverage_ratio = 0.25         # 轴向空间覆盖门槛 = 地形边长 × 0.25
+```text
+outputs/training/bpx_dreamwaq/<时间戳>[_<run_name>]/
+├── params/env.yaml             # 本次环境配置
+├── params/agent.yaml           # 算法与控制契约、加载模式、源 checkpoint
+├── model_<iter>.pt             # 网络、优化器、迭代与配置；默认每 50 轮保存
+├── curriculum_<iter>.npz       # 指令网格快照（启用相应课程时）
+└── events.out.tfevents.*        # TensorBoard 日志
+```
 
-   enable_grid_adaptive_command_curriculum = True    # 指令课程总开关
-   command_rel_standing_envs = 0.2        # 20% 精确全零站立指令，保持到回合结束
-   command_grid_resolution_vx = 0.5        # vx 网格分辨率 (m/s)
-   command_grid_resolution_yaw = 0.5       # wz 网格分辨率 (rad/s)
-   command_curriculum_initial_vx_range = (-0.5, 0.5)  # 初始激活范围
-   command_curriculum_initial_yaw_range = (-0.5, 0.5)
-   command_grid_continuous_sampling = True          # 选格后在格内连续采样
-   command_low_speed_sampling_prob = 0.3            # 30% 额外低速样本
-   command_low_speed_vx_range = (0.05, 0.25)         # 无符号幅值 (m/s)，避开零点
-   command_low_speed_random_sign = True              # 正负两侧按长度加权对称采样
-   command_low_speed_vy_range = (-0.1, 0.1)          # m/s
-   command_low_speed_yaw_range = (-0.25, 0.25)       # rad/s
-   # 最大扩展范围从 command_lin_vel_x_range / command_ang_vel_z_range（±1.0）读取
-   ```
-
-   更细的门控参数（成功阈值、`min_samples`、EMA 系数、探索下限）在
-   `tasks/mdp/commands.py` 的 `GridAdaptiveVelocityCommandCfg`，由
-   `command_grid.py` 的 `GridAdaptiveCommandScheduler` 使用。连续模式按各轴
-   半格宽与任务量程的交集均匀采样，边界格直接在截断区间采样。旧式
-   `command_jitter` 仅在关闭连续模式时生效。
-
-2. 算法侧（AdaBoot 与损失权重）——`tasks/agents/rsl_rl_ppo_cfg.py` 的
-   `DreamWaQPpoAlgorithmCfg`：
-
-   ```python
-   adaboot_enabled = False       # AdaBoot 总开关，默认关闭
-   adaboot_mode = "reward_cv"    # error / reward_cv / linear
-   adaboot_error_threshold = 0.5 # error 模式：EMA 速度误差达到该值(m/s)时 p≈0
-   adaboot_ema_alpha = 0.9       # 误差 EMA 平滑系数
-   adaboot_ramp_iterations = 500 # linear 模式爬升迭代数
-   adaboot_p_min = 0.0           # p 下限
-   ```
-
-### 3.4 TensorBoard
+`BPX_LOG_DIR` 可覆盖日志根目录。监控训练：
 
 ```bash
-# 使用训练环境自带的 TensorBoard
 bash scripts/training_python.sh -m tensorboard.main --logdir outputs/training/bpx_dreamwaq
-
-# 或直接调用环境内可执行文件
-~/miniconda3/envs/isaaclab/bin/tensorboard --logdir outputs/training/bpx_dreamwaq
 ```
 
-浏览器打开 `http://localhost:6006`。全部曲线按迭代（约每 24×N 步）记录一次；
-括号里的数值是本机 256 环境 × 250 迭代实测训练的参考形态（完整记录见
-[验证记录](docs/VALIDATION.md)）。
+重点观察回合奖励/长度、终止原因、CENet 速度误差、逐脚触地率、站立漂移、
+课程进展和数值隔离比例。详细奖励权重、课程规则与日志指标见 [训练设计](docs/TRAINING.md)。
 
-**① 策略学习进度——`policy/*`、`Episode Reward/*`、`Episode Termination/*`**
-
-| 曲线 | 含义 | 健康形态（实测） |
-| --- | --- | --- |
-| `policy/mean_reward` | 最近 100 个回合的平均总奖励，最核心的学习指标 | 持续上升（−1.24→−0.40） |
-| `policy/episode_length` | 平均回合步数（满 20 s = 1000 步） | 先跌后回升（20→9→25） |
-| `Episode Reward/track_*` | 速度跟踪奖励分项 | 随总奖励上升 |
-| `Episode Reward/*_l2` | 力矩/加速度/动作变化率等罚项 | 负值、量级小；暴涨=动作抖动加剧 |
-| `Episode Termination/*` | 终止原因占比 | `base_contact/base_tilt` 下降、`time_out` 上升 |
-
-`Train/mean_reward` 与 `policy/mean_reward` 同源，看一个即可。回合长度长期
-个位数 = 机器人秒倒；`time_out` 占比是最直接的“站稳了吗”指标。
-
-**② CENet 状态估计质量——`cenet/*`（任务 1 的验收指标）**
-
-| 曲线 | 含义 | 健康形态（实测） |
-| --- | --- | --- |
-| `cenet/velocity_mse` | 速度估计 MSE。**判断 CENet 成败的首要指标** | 单调下降后趋平（0.091→0.017） |
-| `cenet/velocity_error_x/y/z` | 三轴平均绝对误差（m/s） | 0.18/0.17/0.33 → 0.09/0.08/0.11；`velocity_mae` < 0.1 即相当准 |
-| `cenet/prediction_loss` | Decoder 预测下一时刻观测的 MSE | 缓慢下降（22.9→10.5） |
-| `cenet/kl_loss` | VAE KL 散度 | 不发散即可（β=1e-3 下加权贡献很小） |
-| `cenet/total_auxiliary_loss` | 三项辅助损失加权和 | 平稳有限 |
-| `cenet/adaboot_p_boot` / `adaboot_est_fraction` | AdaBoot 概率 / 实际使用估计速度的占比 | 两者联动（reward_cv 约 0.5–0.65） |
-
-警告信号：`velocity_mse` 居高不下（检查历史观测输入）、NaN（学习率过大）、
-`kl_loss` 无界增长（调大 `beta_kl`）。
-
-**③ 地形课程进展——`curriculum/terrain/*`（模块 A）**
-
-- `mean_level`：平均地形难度（0–9），**步态稳定后阶梯式爬升**；早期恒 0 属预期。
-- `level_XX_frac`：各难度环境比例，健康时整体向高等级迁移。
-- `move_up_total` / `move_down_total`：累计升降级次数，早期 down 为主、中后期 up 反超。
-- `level_XX_mean_reward/length`：各难度回合表现——爬级后先回落再恢复是课程起作用的正常表现。
-
-**④ 指令课程进展——`curriculum/command/*`（模块 B）**
-
-- `activated_cells`：激活指令单元数（初始 9=3×3），策略掌握当前区域后增加。
-- `vx_range` / `yaw_range`：激活区域覆盖范围（初始 0.75）。
-- `expansions`：累计激活数，单调不减。
-- `Metrics/base_velocity/error_vel_xy、error_vel_yaw`：指令跟踪误差。
-
-**⑤ PPO 内部状态——`Loss/*`、`Policy/mean_noise_std`**
-
-- `Loss/surrogate`：clipped 代理损失，**不需要单调下降**。
-- `Loss/value_function`：Critic 回归损失，下降趋稳。
-- `Loss/entropy` / `Policy/mean_noise_std`：中后期缓慢下降；接近 0 会失去探索。
-- `Loss/learning_rate`：自适应学习率，锯齿波动正常。
-
-**⑥ 性能——`Perf/*`**：`total_fps`（实测 ≈2900 @256 env）、
-`collection time` / `learning time` 占比。
-
-**快速看板（按优先级）**：① `policy/mean_reward` ↑ 且 `time_out` 占比 ↑
-→ 策略在学；② `cenet/velocity_mse` ↓ → 估计器在学；③ `curriculum/*` 阶梯
-上升 → 课程在推进；④ 无 NaN、`value_function` 收敛、熵缓降 → 训练稳定。
-
-### 3.5 导出部署策略
-
-训练完成后导出不含特权信息的部署策略（输入 450 维历史观测 → 输出 12 维动作，
-内部执行 CENet 确定性前向 + Actor）：
+恢复同一训练与开始微调的区别：
 
 ```bash
-# 同时导出 ONNX 和 TorchScript
+# 替换为实际训练 checkpoint；下文验收和导出沿用此变量
+CHECKPOINT=outputs/training/bpx_dreamwaq/你的运行目录/model_100.pt
+
+# 恢复网络、优化器及轮次；max_iterations 是本次继续训练的轮数
+bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
+    --resume --checkpoint "$CHECKPOINT" --max_iterations 500
+
+# 加载权重和缩放/归一化状态，重建优化器，从第 0 轮开始
+bash scripts/training_python.sh scripts/train.py --headless --num_envs 512 \
+    --finetune --checkpoint "$CHECKPOINT" --max_iterations 500 --run_name finetune
+```
+
+微调默认 PPO 学习率 `1e-4`、关闭 AdaBoot，可用 `--learning_rate` / `--adaboot` 覆盖。
+`--resume` 与 `--finetune` 互斥，`--checkpoint` 必须配合其中之一。
+恢复/微调仍使用当前环境与算法配置；网络结构、Decoder 输入和缩放模式必须与源权重匹配，
+不应把历史策略直接当作已经适配当前奖励和显式 PD。导出加载器则按 checkpoint 恢复模型结构。
+
+## 4. 独立验收与导出
+
+先选定实际 checkpoint（若刚完成微调，更新上面的 `CHECKPOINT`）：
+
+```bash
+bash scripts/training_python.sh scripts/evaluate_policy.py \
+    --checkpoint "$CHECKPOINT" --num_envs 16 --duration 20 \
+    --output outputs/evaluation/acceptance.json
+```
+
+验收从默认站姿出发，在平地测试全零指令和 `vx=0.3 m/s`，关闭噪声、材质/增益随机化与推扰。
+使用确定性 CENet + Actor，不采样动作，也不使用 AdaBoot 真值替换。
+每个环境都必须完成案例且没有终止；前 1 秒只排除速度评分，失败仍计入。
+默认平面速度/偏航角速度 RMSE 门槛：站立 `0.05 m/s / 0.10 rad/s`，
+运动 `0.15 m/s / 0.20 rad/s`。全部通过返回 `0`，未达标返回 `2`。
+可重复 `--command VX VY WZ` 增加案例，并用 `--linear_tolerance`、`--yaw_tolerance` 覆盖门槛。
+这一步不覆盖起身和复杂地形，之后还需做 MuJoCo 验证。
+
+```bash
+# --out 是文件前缀；生成 policies/policy.onnx 和 policies/policy.pt
 bash scripts/training_python.sh scripts/export_policy.py \
-    --checkpoint outputs/training/bpx_dreamwaq/<run>/model_<iter>.pt --format both
-
-# 只导出 ONNX，并指定输出前缀
-bash scripts/training_python.sh scripts/export_policy.py \
-    --checkpoint outputs/training/bpx_dreamwaq/<run>/model_<iter>.pt \
-    --format onnx --out policies/policy_history_cv
+    --checkpoint "$CHECKPOINT" --format both --out policies/policy
 ```
 
-默认输出 `policies/policy.onnx` 与 `policies/policy.pt`。导出模型不依赖
-Critic、真实速度、高度扫描或 VAE Decoder。
+导出不启动 Isaac Sim。训练 checkpoint `.pt` 与 TorchScript `.pt` 用途不同：
+训练 checkpoint 交给验收/导出脚本，部署只接收导出的 ONNX/TorchScript。
+导出模型内部包含缩放或归一化，部署端继续输入原始观测。详见 [策略文件](policies/README.md)。
 
-**手工推理验证**（不用特权信息）：
+## 5. MuJoCo sim2sim 验证
 
-```python
-import torch
-
-model = torch.jit.load("policies/policy.pt")
-model.eval()
-history = torch.zeros(1, 450)   # 部署端 ObservationHistory 的输出布局
-action = model(history)         # (1, 12) 关节位置动作
-print(action.shape)
-```
-
-也可从 checkpoint 直接构建：
-
-```python
-from scripts_path import build_policy_from_checkpoint  # scripts/export_policy.py
-deployable, info = build_policy_from_checkpoint("outputs/training/.../model_100.pt")
-action = deployable(history_450)
-```
-
-导出接口与部署运行时一致：
-
-- 输入：展平历史观测 `(B, 450)`，term-major、项内从最旧到最新
-  （`[角速度×10, 投影重力×10, 指令×10, 关节角×10, 关节速度×10, 上一步动作×10]`）；
-- 内部：最新一帧 45 维 → CENet（速度估计 3 + 隐变量均值 16）→ 拼接为 64 维 Actor 输入；
-- 输出：12 维关节位置动作，部署侧执行 `q = q_default + 0.5 × a`。
-
-### 3.6 训练测试
+在安装了 MuJoCo 与 ONNX Runtime 的解释器下运行。显式指定刚导出的模型，确保测试对象一致：
 
 ```bash
-# 离线单元测试（无需 Isaac Sim，136 项：维度/梯度/存储/课程/奖励）
-bash scripts/training_python.sh -m unittest discover -s tests/training -v
-```
+# 平地、无手柄：自动起身后执行固定指令
+python scripts/sim2sim.py --config configs/sim2sim/bpx_history.toml \
+    --backend onnx --policy policies/policy.onnx --vx 0.2 --duration 30 --viewer \
+    --log outputs/sim2sim/flat.csv
 
-已验证内容见 [验证记录](docs/VALIDATION.md)。短时训练冒烟命令见 3.2。
-
----
-
-## 4. sim2sim（MuJoCo）
-
-无需策略权重即可运行模型与 PD 框架检查：
-
-```bash
-# 默认 zero 后端：只验证 PD、起身状态机与控制流程
-python scripts/sim2sim.py --duration 2 --no-realtime
-python scripts/sim2sim.py --viewer --duration 20
-```
-
-放入导出权重后显式选择推理后端：
-
-```bash
-python scripts/sim2sim.py --backend onnx --policy policies/policy_20261023_iter2250_stable.onnx --viewer
+# 综合场地、手柄：按 RB 起身，摇杆控制运动，松杆减速站立
+python scripts/sim2sim.py --list-gamepads
 python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
-    --backend onnx --gamepad --viewer \
-    --velocity-plot --torque-plot --log outputs/sim2sim/run.csv
+    --backend onnx --policy policies/policy.onnx --gamepad --viewer \
+    --velocity-plot --torque-plot --log outputs/sim2sim/mixed.csv
 
-# 在第 2 档（8 cm）楼梯前的平地趴卧出生
+# 直接出生在第 3 条楼梯前：级高 10 cm、踏面深 15 cm
 python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
-    --backend onnx --gamepad --viewer --stair-level 2
+    --backend onnx --policy policies/policy.onnx --gamepad --viewer --stair-level 3
 ```
 
-默认启用起身状态机：手柄模式以趴姿等待 RB 起身；无手柄时自动 Init。
-起身采用足端五次轨迹 + PD，确认站稳后平滑接入策略。左摇杆控制前后/横移，
-右摇杆水平控制转向，松杆后减速站立。`--direct-policy` 可跳过 Init 做接口对拍。
-MuJoCo 不因高度、倾角、躯干触地或 Init 超时自动退出；策略接管后持续执行，
-运行到设定时长、关闭窗口或 Ctrl+C 时结束。
+不指定 `--backend` 时使用 `zero`，只验证 PD/流程，不加载模型。
+CLI 默认配置是 `bpx_history.toml`；`bpx_mixed.toml` 当前配置路径为
+`policies/policy_20261029_iter5349.onnx`，不等于通用导出文件 `policies/policy.onnx`。
+因此换模型后应明确使用 `--policy` 或修改 TOML 的 `[paths].policy`。
 
-`--terrain flat|three_level|stairs|mixed` 可覆盖地形；综合场地包含 ±2/±4 cm
-崎岖路面和 3/8/10/15 cm 四档上下楼梯。楼梯采用 box 碰撞体，踏面深 15 cm，
-每侧 5 级高差，含顶部平台。详见 [sim2sim 操作与验证](docs/SIM2SIM.md)。
+先检查零指令站定，再检查前进、后退、侧移、转向和松杆，最后测试崎岖地形与楼梯。
+MuJoCo 当前不会因跌倒、低高度或 Init 超时自动退出；持续运行不等于策略通过验收。
+场地、手柄、状态机与日志说明见 [sim2sim](docs/SIM2SIM.md)。
 
-| 配置 | 用途 | 策略输入 |
-| --- | --- | --- |
-| `bpx_history.toml` | 默认平地，保留历史观测接口 | 450 |
-| `bpx_flat.toml` | 旧单帧接口参考，包含机体线速度 | 48 |
-| `bpx_terrain_history.toml` | 固定三段测试地形，趴姿起步 | 450 |
-| `bpx_mixed.toml` | 崎岖 + 分级上下楼梯，趴姿起步，300 秒手柄测试 | 450 |
-| `bpx_terrain_standing.toml` | 旧单帧接口参考，固定测试地形、站姿起步 | 48 |
+## 6. 实机部署
 
-常用参数：`--viewer`（MuJoCo 窗口）、`--velocity-plot` / `--torque-plot`
-（速度与力矩曲线）、`--gamepad`（Linux 手柄）、`--no-realtime`（尽快跑完）、
-`--duration`、`--log`、`--supervisor` / `--direct-policy`、`--auto-init`。
-
----
-
-## 5. sim2real（官方 SDK）
-
-复用 `BPX_test` 的官方 SDK 部署流程，当前默认加载与 `bpx_mixed.toml`
-一致的 DreamWaQ 模型。可直接使用本机已有的 `bpx-real` 环境：
-
-```bash
-conda activate bpx-real
-python scripts/sim2real.py check
-python scripts/sim2real.py run
-python scripts/monitor.py --demo
-```
-
-以上不连接机器人。预检校验模型、试推理、SDK 依赖和关节映射；
-`ready: true` 表示软件资源可用。监控窗口需要 Tkinter 和图形桌面。
-
-### 5.1 实机控制
-
-完成现场网络、支撑和坐标核对后，执行：
-
-```bash
-python scripts/sim2real.py run --live
-
-# 多手柄时指定设备；可设置运行时长和日志路径
-python scripts/sim2real.py run --live --gamepad-index 0 --duration 20 \
-    --output outputs/sim2real/live-01.jsonl
-
-# 可临时覆盖模型：--policy 放在子命令之前
-python scripts/sim2real.py --policy policies/other.onnx run --live
-```
-
-1. 启动时读取完整关节与 IMU 反馈。趴卧时保持当前关节姿态，等待 RB/R1。
-   已处于 SDK `Motion` 状态时从实测关节姿态平滑接管。
-2. 按 RB/R1 后执行 4 秒足端五次轨迹与解析 IK：前 1 秒建立支撑，随后抬升。
-3. 起身结束进入 Stand，平滑切换增益和策略目标；左摇杆控制 vx/vy，
-   右摇杆水平控制 wz，持续推杆经防抖进入 Walk。
-4. 松杆后指令逐渐归零，经 STOPPING 回到 Stand。同一模型与历史始终连续。
-5. Ctrl+C、指定时长结束或运行异常时退出，尝试发送三次 kp=0、kd=1 阻尼
-   并断开 SDK。阻尼发送属于尽力处理，不能保证网络故障时送达。
-
-策略以 50 Hz 更新、目标以 100 Hz 发送，自动保存日志，可离线分析与回放。
-权重文件不纳入 Git，其他机器需复制模型或重新导出。
-
-### 5.2 只读可视化启动检查
-
-启动前可使用从 `BPX_test` 迁入的只读可视化界面，核对模型、12 关节反馈、
-IMU 姿态、手柄输入与未执行的策略目标：
-
-```bash
-python scripts/visualize.py          # 先检查模型，再手动连接只读反馈
-python scripts/visualize.py --demo   # 模拟反馈，不连接机器人
-python scripts/visualize.py --demo --no-policy   # 只看反馈与姿态
-python scripts/visualize.py --recording outputs/sim2real/preflight-01.jsonl
-python scripts/visualize.py --list-gamepads
-```
-
-界面包含三页：
-
-| 页面 | 内容 |
-| --- | --- |
-| 启动前检查 | 模型文件/SHA256、输入输出尺寸、试推理与预热、SDK 依赖、观测契约、关节映射、反馈新鲜度、手柄、策略预览状态 |
-| 实时反馈与姿态 | 12 关节表、SDK/官方/模型三套角度、action 与未发送目标、四元数与 RPY、三维骨架、10 秒曲线 |
-| 官方定义 / 当前配置 | 官方示例参数与当前 kp/kd、关节范围、标定通道逐项对照 |
-
-VS Code 可直接选择 **BPX: 只读启动前检查** 调试配置启动，使用 `bpx-real`。
-详见 [只读窗口说明](docs/SIM2REAL_WINDOW.md)。
-
-### 5.3 配置与日志
-
-控制与监控入口均优先读取 `configs/sim2real/local.runtime.toml`，不存在时读取
-`configs/sim2real/runtime.toml`。需要修改网络或标定时创建本机配置：
+实机使用 ONNX 与官方 `bpx_sdk`。控制和监控优先读取
+`configs/sim2real/local.runtime.toml`，不存在时使用 `runtime.toml`。
+先复制并核对本机网络和关节/IMU 标定：
 
 ```bash
 cp -n configs/sim2real/runtime.toml configs/sim2real/local.runtime.toml
 cp -n configs/sim2real/joint_calibration.template.toml configs/sim2real/local.calibration.toml
 ```
 
-TOML 中的模型和标定路径相对于配置文件；命令行 `--policy` 路径相对于调用目录。
-本机配置已被 `.gitignore` 排除。
-
-日志分析与回放（均不连接 SDK）：
+将本机 runtime 的 `calibration_file` 指向 `local.calibration.toml`。
+实机模板仍引用 `policy_20261023_iter2250_stable.onnx`，与当前综合仿真配置不同；
+使用已验收模型时通过 `--policy` 明确选择，避免误用旧权重。
 
 ```bash
-python scripts/sim2real.py inspect --output outputs/sim2real/state-01.jsonl --duration 10
-python scripts/sim2real.py analyze outputs/sim2real/live-01.jsonl
-python scripts/sim2real.py replay outputs/sim2real/live-01.jsonl \
-    --output outputs/sim2real/replay-01.jsonl
-python scripts/monitor.py --recording outputs/sim2real/live-01.jsonl
+# 离线预检，不创建 SDK 连接；run 不加 --live 同样仅预检
+python scripts/sim2real.py --policy policies/policy.onnx check
+
+# 模拟反馈预览；随后只读连接实际反馈，核对通道、方向和 IMU
+python scripts/monitor.py --policy policies/policy.onnx --demo
+python scripts/monitor.py --policy policies/policy.onnx
+
+# 完成现场核对并关闭占用端口的只读窗口后，显式启动实机控制
+python scripts/sim2real.py --policy policies/policy.onnx run --live
 ```
 
-完整接口、标定与安全边界见 [实机部署说明](docs/SIM2REAL.md)。
+`ready: true` 只说明软件预检通过。实机策略 50 Hz，目标发送 100 Hz；
+RB 起身，左摇杆控制 vx/vy，右摇杆控制 wz，松杆后经 STOPPING 返回站立。
+窗口只预览目标，不发送运动指令。实机配置、退出阻尼、录制与回放见
+[实机部署](docs/SIM2REAL.md) 和 [只读窗口](docs/SIM2REAL_WINDOW.md)。
 
----
+## 7. 训练与部署共用的契约
 
-## 6. 工程逻辑与设计
-
-### 6.1 观测、动作与频率契约
-
-| 项目 | 训练 | 部署 |
-| --- | --- | --- |
-| 策略频率 | 50 Hz（200 Hz 物理 × decimation 4） | 50 Hz 策略 / 100 Hz 发送 |
-| 单帧观测 | 45 维：角速度 3、投影重力 3、指令 3、相对关节角 12、关节速度 12、上一步动作 12 | 同左 |
-| 历史观测 | H=10，term-major、项内旧→新，共 450 维 | 同左 |
-| Critic 观测 | 235 维：真实线速度 3 + 45 维单帧 + 高度扫描 187 | 不使用 |
-| 动作 | 12 维关节位置目标，`q = q_default + 0.5 × a` | 同左 |
-| 关节顺序 | FL/FR/HL/HR roll → pitch → knee | 同左；SDK 通道 `[0,3,6,9,1,4,7,10,2,5,8,11]` |
-| 默认角 | 每腿 `[0, 0.7, -1.4]` rad | 同左 |
-| 增益 | 策略 kp=40、kd=1；起身 kp=80、kd=2 | 同左 |
-
-观测布局由 `tasks/obs_contract.py` 唯一定义，训练端 Isaac Lab 的
-`history_length=10, flatten_history_dim=True` 与部署端
-`runtime/history.py` 的输出逐项一致。
-
-### 6.2 CENet 与 PPO 训练逻辑
-
-- **CENet 输入**：450 维历史观测；共享编码器 `[256, 128]`。
-- **速度头**：`[128] → 3`，输出 `vel_hat`，回归仿真真实线速度。
-- **VAE 头**：`[128] → μ/σ (16)`；训练时采样 `z` 送入 Decoder，Actor 使用 μ。
-- **Decoder**：`[128, 128] → 45`，预测下一时刻单帧观测。
-- **Actor**：`[45 + 3 + 16 = 64] → [512, 256, 128] → 12`。
-- **Critic**：235 维特权观测 → `[512, 256, 128] → 1`。
-- **PPO**：lr 1e-3（自适应 KL 0.01）、γ 0.99、λ 0.95、clip 0.2、熵系数 0.01；
-  每迭代 24 步 × 5 epoch × 4 minibatch；`max_iterations=1500`，
-  `save_interval=50`。
-- **辅助损失**：`λ_vel=1.0`、`λ_pred=1.0`、`β_KL=1e-3`；done 掩码屏蔽
-  终止转移。
-- **部署导出**：只保留 `cenet.*` 与 `actor.*`；确定性 μ 前向，不依赖
-  Critic、真实速度、高度扫描或 Decoder。
-
-**关键超参数**（`tasks/agents/rsl_rl_ppo_cfg.py`，均可配置）：
-
-| 类别 | 参数 | 默认值 |
-| --- | --- | --- |
-| 网络 | Actor/Critic MLP | `[512, 256, 128]`，ELU |
-| 网络 | CENet 编码器 / 速度头 / VAE 头 / Decoder | `[256,128]` / `[128]` / `[128]` / `[128,128]` |
-| 网络 | 隐变量 / 速度 / 历史长度 | 16 / 3 / 10 |
-| PPO | 学习率 / 自适应 KL | 1e-3 / 0.01 |
-| PPO | γ / λ / clip / 熵系数 / 值损失系数 | 0.99 / 0.95 / 0.2 / 0.01 / 1.0 |
-| PPO | 每迭代步数 × epoch × minibatch | 24 × 5 × 4 |
-| PPO | 最大迭代 / 保存间隔 | 1500 / 50 |
-| PPO | 梯度裁剪 / 噪声初始化 | 1.0 / 1.0（scalar） |
-| 辅助损失 | λ_vel / λ_pred / β_KL | 1.0 / 1.0 / 1e-3 |
-| 特征策略 | CENet 梯度 / Actor 隐变量 | detach / 确定性 μ |
-
-### 6.3 环境设计
-
-**场景**（`BPXSceneCfg`）
-
-| 组件 | 配置 |
+| 项目 | 当前约定 |
 | --- | --- |
-| 地形 | 生成器网格：`8 m × 8 m` 地块，`num_rows=num_terrain_levels`（默认 10），`num_cols=10`，边界 20 m |
-| 机器人 | BPX USD（缺失时首次训练由 URDF 自动转换） |
-| 高度扫描 | `GridPatternCfg(resolution=0.1, size=[1.6, 1.0])`，机体上方 20 m 向下，yaw 对齐 |
-| 接触传感器 | `.*` 刚体，`history_length=3`，记录滞空时间 |
-| 光照 | DomeLight 强度 750 |
-| 物理 | `dt=0.005`（200 Hz），`decimation=4`（50 Hz），回合 20 s |
-| 并行环境 | 配置默认 1024；示例命令用 `--num_envs 512` 覆盖，按显存调整 |
+| 单帧 | 45 维：角速度 3、投影重力 3、指令 3、相对关节角 12、关节速度 12、上次动作 12 |
+| 历史 | 10 帧共 450 维；term-major，每项内部旧 → 新；首帧填满窗口 |
+| Actor | 最新帧 45 + 估计速度 3 + 隐变量均值 16 → 12 维动作 |
+| Critic | 真实速度 3 + 本体观测 45 + 高度扫描 187 = 235 维，仅训练使用 |
+| 关节顺序 | roll、pitch、knee 各组内均为 FL、FR、HL、HR |
+| 动作 | `q_target = q_default + 0.5 × action`；默认 roll=0、pitch=0.7、knee=−1.4 rad |
+| 训练/MuJoCo | 物理 200 Hz、策略 50 Hz，显式力矩 PD：Kp=40、Kd=1、±30 Nm |
+| 速度参数 | 20 rad/s 为名义参数；训练与 MuJoCo 不施加此硬速度制动 |
+| 实机 | 发送关节目标与 kp/kd，由 SDK/固件执行；不能视为与仿真动力学完全等价 |
 
-**地形类型**（按比例随机组合）
+当前默认固定缩放在网络内部执行，经验归一化关闭，二者互斥。
+不要把十个完整单帧直接拼起来，也不要在部署端重复缩放。
+完整布局和模块数据流见 [架构](docs/ARCHITECTURE.md)、[固定缩放](docs/FIXED_SCALING.md)。
 
-| 子地形 | 比例 | 参数 | 作用 |
-| --- | --- | --- | --- |
-| `random_rough` | 20% | 噪声 0.01–0.06 m，步长 0.01 | 连续崎岖路面 |
-| `boxes` | 20% | 网格 0.45 m，高度 0.03–0.12 m，平台 2.0 m | 离散方块 |
-| `pyramid_stairs` | 20% | 级高 0.03–0.15 m，踏面 0.10 m，平台 3.0 m | 上台阶 |
-| `pyramid_stairs_inv` | 20% | 同上 | 下台阶 |
-| `hf_pyramid_slope` | 10% | 坡度 0–0.4 | 上坡 |
-| `hf_pyramid_slope_inv` | 10% | 坡度 0–0.4 | 下坡 |
+## 8. 目录与文档索引
 
-`horizontal_scale=0.1`、`vertical_scale=0.005`、`slope_threshold=0.75`；
-`use_cache=False`，每次启动重新生成。
+```text
+assets/robots/bpx/   URDF、MJCF、网格、USD 缓存及资源许可证
+configs/            sim2sim/sim2real TOML 与训练栈版本
+scripts/            环境检查、训练、验收、导出、仿真与实机入口
+src/bpx_dreamwaq/
+  tasks/            Isaac Lab 环境、MDP、CENet、PPO、checkpoint 加载与验收指标
+  runtime/          共用关节/观测/历史、推理、手柄、路由和起身状态机
+  sim2sim/          MuJoCo 配置、地形、控制循环、CSV 和曲线
+  sim2real/         SDK、标定、控制、预检、只读窗口与录制回放
+  validation.py     工作区资源和配置检查
+policies/           本地导出模型（权重不入 Git）
+tests/              project、training、sim2sim、sim2real 测试
+outputs/            本地训练、仿真、验收和诊断产物
+```
 
-**指令**（`CommandsCfg` / `GridAdaptiveVelocityCommandCfg`）
-
-| 项目 | 值 |
+| 文档 | 内容 |
 | --- | --- |
-| 任务量程 | vx ∈ [−1.0, 1.0] m/s，vy ∈ [−0.5, 0.5] m/s，wz ∈ [−1.0, 1.0] rad/s |
-| 重采样 | 每 10 s（episode 内），站立指令保持到回合结束 |
-| 站立比例 | 每次抽样 20% 精确全零指令 |
-| 航向 | `heading_command=False`，直接采样角速度 |
-| 课程关闭时 | `TerrainAwareUniformVelocityCommand` 均匀采样（仍记录地形统计） |
+| [架构](docs/ARCHITECTURE.md) | 模块职责、路径规则、数据流 |
+| [训练环境](docs/TRAINING_ENV.md) | 本机环境参考、版本和 Warp 兼容 |
+| [训练设计](docs/TRAINING.md) | CENet/PPO、默认奖励、地形、课程、日志 |
+| [固定缩放](docs/FIXED_SCALING.md) | 输入尺度与旧 checkpoint 兼容 |
+| [数值异常隔离](docs/NUMERICAL_QUARANTINE.md) | 异常环境重置及样本排除 |
+| [sim2sim](docs/SIM2SIM.md) | MuJoCo 场地、起身、手柄和曲线 |
+| [sim2real](docs/SIM2REAL.md) / [窗口](docs/SIM2REAL_WINDOW.md) | 实机配置、控制、监控与回放 |
+| [策略文件](policies/README.md) | checkpoint 与部署模型、导出接口 |
+| [验证记录](docs/VALIDATION.md) | 按日期保留的测试结果和覆盖边界 |
+| [步态诊断](docs/GAIT_DIAGNOSIS.md) / [迁移记录](docs/MIGRATION.md) | 历史问题与工程演进 |
 
-**域随机化**（`EventCfg`）
-
-| 事件 | 模式 | 参数 |
-| --- | --- | --- |
-| 物理材质 | startup | 静摩擦 [0.5, 1.4]、动摩擦 [0.4, 1.0]；恢复系数 0、64 桶随机，与 BPX_test 相同 |
-| 初始位姿 | reset | x/y ∈ ±0.1 m，yaw ∈ ±π，初速度为零，与 BPX_test 粗糙地形任务相同 |
-| 关节复位 | reset | 默认关节角加 ±0.2 rad，关节速度 ±0.1 rad/s |
-| PD 增益 | startup | 刚度、阻尼各乘 [0.9, 1.1]，均匀分布 |
-| 本体测量噪声 | 每次观测 | 均匀噪声：角速度 ±0.2 rad/s、重力 ±0.05、关节角 ±0.01 rad、关节速度 ±1.5 rad/s |
-| 外力推挤 | interval 10–15 s | x/y 速度 ±0.5 m/s |
-
-**终止条件**（`TerminationsCfg`）
-
-| 终止 | 条件 |
-| --- | --- |
-| `time_out` | 20 s 回合超时（正常结束） |
-| `base_contact` | torso 接触力 > 1 N |
-| `base_tilt` | 机身倾角 > 1.0 rad |
-
-### 6.4 奖励设计
-
-所有奖励由 Isaac Lab `RewardManager` 统一乘权重和策略时间步 `dt=0.02 s`；
-`BPXManagerBasedRLEnv` 在求和后再对每个环境的**单步总奖励**施加下限
-`minimum_step_reward = −10.0`（只抬升负值，不缩放正奖励，NaN/Inf 仍交给
-训练器报错）。
-
-**任务奖励**
-
-| 奖励项 | 权重 | 实现 | 作用 |
-| --- | --- | --- | --- |
-| `track_lin_vel_xy_exp` | +1.5 | Isaac Lab 内置，`std=0.5` | 平面线速度跟踪 |
-| `track_ang_vel_z_exp` | +0.75 | 内置，`std=0.5` | 偏航角速度跟踪 |
-| `track_lin_vel_xy_stand_exp` | +1.5 | 本工程，`std=0.1` | 仅三轴指令 < 0.05 时生效的平面速度跟踪；非站立环境为 0 |
-| `track_ang_vel_z_stand_exp` | +1.0 | 本工程，`std=0.1` | 仅零指令时生效的偏航角速度跟踪；非站立环境为 0 |
-
-**姿态与能耗正则**
-
-| 奖励项 | 权重 | 实现 | 作用 |
-| --- | --- | --- | --- |
-| `lin_vel_z_l2` | −2.0 | 内置 | 抑制机身竖直速度 |
-| `ang_vel_xy_l2` | −0.05 | 内置 | 抑制 roll/pitch 角速度抖动 |
-| `base_height_l2` | −1.0 | 本工程 | `((机身高度 − 扫描地面均值 − 0.42) / 0.10)²`；无有效射线时跳过该环境 |
-| `flat_orientation_l2` | −0.3 | 内置 | 惩罚 roll/pitch 偏离水平（投影重力） |
-| `joint_pos_limits` | −0.2 | 内置 | 关节位置越界 |
-| `joint_pos_stand_l2` | −0.5 | 本工程 | 仅三轴指令精确为零时，惩罚12个受控关节相对默认站姿的角度偏差平方和 |
-| `dof_torques_l2` | −1.0e-4 | 内置 | 关节力矩平方和 |
-| `dof_acc_l2` | −2.5e-7 | 本工程 | 关节加速度平方和；单环境上限 1e8，异常加速度按上限计 |
-| `joint_power` | −2e−5 | 本工程 | `sum(abs(applied_torque * joint_vel))`，正负功率不抵消 |
-| `power_distribution` | −1e−8 | 本工程 | 按论文表 I 的字面公式：有符号功率的总体方差再平方，`Var(τ·q̇)²`（W⁴），原始代价上限 1e8 |
-| `action_rate_l2` | −0.01 | 内置 | 一阶动作变化率 |
-| `action_smoothness_l2` | −0.01 | 本工程 | 二阶动作差分 `sum((a_t − 2a_{t−1} + a_{t−2})²)` |
-
-**步态与接触**
-
-| 奖励项 | 权重 | 实现 | 作用 |
-| --- | --- | --- | --- |
-| `feet_air_time` | +0.1 | 本工程 | 触地瞬间，滞空时间超过 0.3 s 的部分给予奖励；平移或 yaw 指令超过 0.05 / 0.1 时启用 |
-| `feet_air_time_excess` | −1.0 | 本工程 | 单脚连续悬空超过 0.6 s 后线性惩罚，每脚上限 1 |
-| `feet_contact_balance` | −1.0 | 本工程 | 四脚触地占空比偏差平方，1 s 指数滑动平均；允许交替摆腿 |
-| `feet_clearance` | −0.01 | 本工程 | `toe_link` 距局部地面 0.10 m 的误差平方 × 足端水平速度 |
-| `feet_lateral_distance` | −0.3 | 本工程 | 前、后左右足横向间距超出 0.26–0.42 m 时，偏差除以 0.26 m 后平方求和 |
-| `feet_longitudinal_distance` | −0.4 | 本工程 | 同侧前后足纵向间距不足 0.40 m 的归一化缺口平方 |
-| `undesired_contacts` | −1.0 | 内置 | torso 接触力 > 1 N |
-
-所有权重都在 `tasks/rough_env_cfg.py` 的 `RewardsCfg` 中调整；修改奖励后需要
-重新训练，已导出的策略不会随之改变。
-
-**设计说明**
-
-- `joint_pos_stand_l2` 使用机器人 `default_joint_pos` 作为站立参考：髋外展0、
-  髋俯仰0.7、膝关节−1.4 rad，与复位及动作中心共用配置。它是软约束，仍允许
-  高度、足距与地形适应；任一轴指令非零即关闭，不使用0.1 m/s门限判断站立。
-  默认权重−0.5，12个关节各偏离0.1 rad时，奖励率为−0.06（每策略步−0.0012）。
-  TensorBoard 对应 `Episode_Reward/joint_pos_stand_l2`，设权重为0可关闭。
-- 高度项使用高度扫描的**平均地面**作参考，避免在坡面/台阶上按世界系高度误罚；
-  扫描均值是局部支撑面的近似，跨台阶时仍有地形估计误差。
-- 净空项的 `target_height=0.10 m` 指 `toe_link` 原点高度，不是鞋底净空；
-  扫描分辨率 0.1 m，台阶边缘只能近似。
-- 足距项只消除机身 yaw，不使用 roll/pitch，因此坡面上的高度差不会改变足距；
-  达到下限后代价为零，不鼓励无限张腿。
-- `feet_air_time` 只在落脚瞬间给奖励；`feet_air_time_excess` 持续惩罚超时悬空，
-  防止三足支撑策略通过始终不落脚逃避着地项。
-- 两个 `*_stand_exp` 项用比默认窄 5 倍的核（`std=0.1`）只覆盖近零指令：默认核下
-  0.01 m/s 残速仍拿到 99.96%，策略没有把速度压到零的动力；收紧后 0.07 m/s 与
-  0.07 rad/s 只剩约 61%，且这两项对运动指令为 0，不改变行走段的奖励结构。
-- 逐脚指标可在 TensorBoard 查看：`gait/{fl,fr,hl,hr}/contact_fraction`、
-  `air_time_max_s`、`long_air_fraction`。零指令表现看
-  `Metrics/base_velocity/stand_drift_vxy`、`stand_drift_wz`、`stand_fraction`
-  （只对站立步求均值，未站立的环境不参与）。左后腿长期抬起问题的复现与修正见
-  [步态诊断](docs/GAIT_DIAGNOSIS.md)。
-
-### 6.5 课程学习（模块 A / 模块 B）
-
-| 开关 | 位置 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `enable_terrain_curriculum` | `BPXRoughEnvCfg` / `--disable_terrain_curriculum` | 开 | 整回合表现与空间覆盖地形课程 |
-| `num_terrain_levels` | 同上 / `--num_terrain_levels` | 10 | 地形难度等级数 |
-| `terrain_curriculum_mode` | 同上 | `standard` | `standard` 升降级 / `upgrade_only` 只升不降 |
-| `terrain_curriculum_debug` | 同上 | 关 | 额外课程调试日志 |
-| `enable_grid_adaptive_command_curriculum` | 同上 / `--enable_command_curriculum` / `--disable_command_curriculum` | 开 | Grid-Adaptive 指令课程 |
-
-**模块 A：地形课程**（`tasks/mdp/curriculums.py`）。每个 episode 结束时按
-环境独立判定，整回合数据由指令模块逐步累计，不在 10 s 指令重采样时清零：
-
-- 升级：正常超时完成回合、无失败终止，累计平移指令路程 ≥ 1 m、移动时长
-  ≥ 2 s，且满足实际空间覆盖条件。不检查速度跟踪达标比例或误差容限。
-- 降级：未满足升级条件，本回合至少 50% 的时间有明确平移指令（平面指令速度
-  > 0.1 m/s），并发生失败终止，或在满足 1 m / 2 s 评价门槛后至少 50% 的
-  移动采样跟踪不良。明确移动任务中提前摔倒可直接降级；等级 0 不再下降。
-- 保持：零速、原地旋转、评价数据不足，或正常低速/转弯且跟踪良好但覆盖不足。
-
-降级统计中的跟踪良好定义为同一步平面速度误差 ≤ 0.1 m/s 且偏航误差
-≤ 0.5 rad/s。误差容限仅用于降级和日志；满足升级条件时优先升级。
-空间覆盖采用整回合的轴向最大距离：相对真实出生点、相对地形中心均须达到
-地形边长 × 0.25（8 m 地形为 2 m），避免往返被净位移误判，也避免只在中央
-方形平台绕小圈或沿对角线移动就升级。这是空间覆盖代理指标，并非精确障碍
-接触判定。`upgrade_only` 保留上述升级条件并禁用降级。
-
-终止步在机器人 reset 前补采，回合 reset 后重新记录出生点，各环境独立清零；
-指令课程开关关闭时，均匀指令采样也使用同一套地形统计。升降级互斥，达到
-最高级后随机分配等级。逐等级回合奖励/长度、实际升降级次数、保持次数写入
-TensorBoard（`curriculum/terrain/*`、`Curriculum/terrain_levels/*`）；
-开启 debug 可查看指令路程、移动时间、空间覆盖和跟踪达标占比。关闭课程时
-等级随机初始化且不再变化。
-
-**模块 B：Grid-Adaptive 指令课程**（`tasks/mdp/command_grid.py` + `commands.py`）。
-在 (vx, wz) 联合网格（默认 0.5 m/s × 0.5 rad/s 分辨率，中心在零速）上维护
-每个指令组合的采样概率与跟踪统计；初始激活 [−0.5, 0.5]²，最大扩展到任务
-指令量程（[−1, 1] × [−1, 1]）。单元在「区间平均 |Δvx| < 0.25 m/s 且
-|Δwz| < 0.5 rad/s」的 EMA 成功率达标且采样 ≥ `min_samples` 后激活 4 邻域。
-
-非站立样本中，默认 70% 指令使用原分布（90% 激活单元均匀 + 10% 全合法单元
-均匀探索），另外 30% 从一个避开零点的低速带采样；低速区尚未激活时退回原分布。
-低速分布按格与低速区域的交叠面积加权，不绕过课程激活门控。vx 与 wz 先联合
-选同一单元，再在格内连续采样；两端格截断到任务量程。常规分支 vy 均匀采样于
-任务量程，低速分支同步收窄到 ±0.1 m/s。低速带默认取 |vx| ∈ [0.05, 0.25] m/s
-（`command_low_speed_vx_range` 按无符号幅值解释，`command_low_speed_random_sign`
-在格内正负两侧按区间长度加权），使"慢走"与"站定"成为不同的训练状态；下限
-留出的 [0, 0.05) 只有精确零指令会进入。
-
-每次重采样独立以 20% 概率发送精确全零站立指令（`command_rel_standing_envs`），
-不参与课程成功统计，且在**回合结束前不再重采样**——重采样周期只对运动指令
-生效，因此站立环境会连续站满一个回合（默认 20 s），与验收时的长时站定同量级。
-因此默认最终采样比例约为 20% 精确零速、24% 低速带、56% 常规网格课程与探索；
-比例指重采样次数，实际步数占比受回合提前结束影响。
-
-统计按指令执行区间（episode 内 10 s 重采样周期）结算，不混入整个 episode。
-关闭时恢复 `UniformVelocityCommand` 均匀采样；两套课程同时关闭即为原始
-PPO 基线。网格数据（概率/采样数/成功率）随 checkpoint 导出
-`curriculum_<iter>.npz`，可用任意工具绘制热力图。
-
-### 6.6 设计决策与论文差异
-
-依据 DreamWaQ 论文（arXiv:2301.10602, ICRA 2023）核对后的实现差异与决策：
-
-1. **历史长度**：论文 H=5；本工程取 10 帧，与部署端 `ObservationHistory`
-   既有契约（450 维）一致。CENet 结构（共享编码器 + 速度头 + β-VAE 头 +
-   Decoder 预测下一时刻观测）与论文一致。
-2. **隐变量送入 Actor**：论文未说明用 μ 还是采样 z；本实现默认确定性 μ
-   （保证 PPO 概率比一致性），可配置 `"sample"`。
-3. **梯度连接**：默认 PPO 不回传 CENet。`algorithm.ppo_grad_to_cenet=True`
-   是更新阶段的控制开关，开启后重算特征并保留 rollout 的 AdaBoot 分支；
-   此模式要求 `latent_actor_mode="mean"`，不支持随机 latent 重采样。
-4. **损失权重**：论文未给出 λ_vel/λ_pred/β 数值；默认 1.0/1.0/1e-3。
-5. **观测归一化**：默认关闭（`empirical_normalization=False`），策略直接使用原始
-   观测，checkpoint 不保存 `obs_normalizer`/`critic_normalizer` 统计，可与早期
-   未归一化 checkpoint 互相恢复。置为 `True` 时，每轮优化结束后用整轮采样的
-   本体末帧和特权观测更新统计，供下一轮使用；采样与 PPO 更新期间冻结。
-   第一轮使用单位变换，避免只用 reset 状态初始化统计。
-   单帧、历史各帧、下一帧预测目标共用本体统计，速度监督保留 m/s。
-   标准差下限为 0.01，避免常量观测产生除零。统计保存在模型内并随 ONNX /
-   TorchScript 导出，部署继续输入原始 450 维历史，无需外部归一化。
-6. **AdaBoot**：论文按回合奖励变异系数 p = 1 − tanh(CV(R))；本实现默认关闭 AdaBoot，启用时采用
-   该公式，并提供按速度估计误差过渡的 `error` 模式与 `linear` 线性爬升模式。
-   回合奖励统计独立于日志目录；初始及无有效 CV 时使用 `p_min`（默认 0）。
-7. **Critic 特权信息**：论文含随机扰动力 d_t；本实现 Critic 为真实线速度 +
-   单帧观测 + 高度扫描（扰动只有 push 事件，未把扰动力显式入观测）。
-8. **地形课程**：DreamWaQ 使用游戏式课程规则（走半块升级/不足预期半程降级），
-   与 Isaac Lab `terrain_levels_vel` 一致，本实现复用该语义并增加低速保护、
-   只升不降模式与逐等级统计。地形类型为 DreamWaQ 风格的缩放组合，未逐字
-   复现论文地形生成器。
-9. **指令课程**：Grid-Adaptive Curriculum 出自 Lee et al. 2020
-   (Rapid Locomotion)，论文未公开完整概率更新细节；本实现的近似规则
-   （EMA 成功率 + min_samples 门控 + 4 邻域激活 + 探索下限）在
-   `command_grid.py` 模块注释中逐条记录。
-10. **最小步奖励**：`minimum_step_reward=−10` 是本工程的数值保护，用于限制
-    异常单步负奖励的量级；论文没有该项，训练时可通过环境配置调整。
-
----
-
-## 7. 测试与验证
+离线测试按当前环境运行，缺少依赖时查看跳过原因；数量以实际输出为准：
 
 ```bash
-# 一键运行当前解释器可执行的套件
 python scripts/setup_env.py --tests
-
-# 分套件运行
 PYTHONPATH=src python -m unittest discover -s tests/project -v
 PYTHONPATH=src python -m unittest discover -s tests/sim2sim -v
 PYTHONPATH=src python -m unittest discover -s tests/sim2real -v
 bash scripts/training_python.sh -m unittest discover -s tests/training -v
 ```
 
-| 套件 | 数量 | 需要 |
-| --- | --- | --- |
-| `tests/project` | 9 | NumPy；MuJoCo 测试按可用性跳过 |
-| `tests/sim2sim` | 42 | `mujoco` |
-| `tests/sim2real` | 80 | NumPy；ONNX/Tk 测试按依赖和桌面可用性跳过 |
-| `tests/training` | 136 | 训练环境（torch + rsl_rl） |
-
-测试使用模拟 SDK 和临时文件，不接入实机。已验证内容、实机前的离线验证
-与未覆盖范围见 [验证记录](docs/VALIDATION.md)。
-
----
-
-## 8. 文档与阅读顺序
-
-1. [工程架构](docs/ARCHITECTURE.md)——模块边界、数据流与扩展位置
-2. [训练环境](docs/TRAINING_ENV.md)——版本、Warp 兼容与检查结果
-3. [sim2sim 操作](docs/SIM2SIM.md)——场地、控制与曲线
-4. [实机部署](docs/SIM2REAL.md)——配置、标定、运行与安全边界
-5. [只读窗口说明](docs/SIM2REAL_WINDOW.md)——启动检查、三页界面与问题分析
-6. [验证记录](docs/VALIDATION.md)——已执行测试与实测数据
-7. [迁移记录](docs/MIGRATION.md)——从参考工程迁移的范围与取舍
-8. [策略文件说明](policies/README.md)——导出契约与模型放置
-
-模型许可证见 [assets/robots/bpx/LICENSE](assets/robots/bpx/LICENSE)。
-
-### 6.7 归一化与随机化升级后的训练 / 导出
-
-训练、PLAY/验收与 MuJoCo 部署统一使用显式力矩 PD（名义 Kp=40、Kd=1、力矩上限 30 Nm）。
-20 rad/s 保留为名义速度参数；两端均不施加该硬速度制动，PhysX 的求解器速度上限设为 `1e9`。
-控制律一致仍不代表 PhysX 与 MuJoCo 的接触和积分动力学完全一致。
-不启用质量、质心、电机强度或延迟随机化。PLAY 配置关闭材质、增益随机化、推扰与观测噪声。Runner 从
-历史末帧构造 Actor 单帧输入和下一帧预测目标，确保它们使用同一次噪声采样；
-Critic 保留无噪声特权观测。
-
-新模型的归一化统计随 checkpoint 恢复和导出。当前默认关闭经验归一化
-（`empirical_normalization=False`），旧 checkpoint 可直接按原始未归一化方式导出或
-继续训练；如需启用归一化训练，把配置改回 `True` 并开新运行，不要把旧权重
-直接视为已适配当前归一化、奖励和执行器配置。
-
-显式执行器的 `applied_torque` 是限幅后的电机力矩指令，功率奖励使用该值，
-它不包含接触与关节限位等约束力矩。
-功率分布平方项可能在极端力矩/速度时很大，训练时查看 `Episode_Reward/joint_power`
-与 `Episode_Reward/power_distribution` 及总奖励下限触发情况，再根据 BPX 表现调权重。
-
-### 6.8 微调与显式 PD 确定性验收
-
-训练、PLAY/验收和 sim2sim 均每 20 ms 更新一次目标，每个 5 ms 物理步重算
-`tau = clip(40 * (q_default + 0.5 * action - q) - dq, -30, 30)`。
-训练中的 ±10% 增益随机化仍生效，PLAY/验收关闭它；验收复用训练的执行器配置。
-旧隐式 PD 策略不能视为已适配新动力学，建议新结构从头训练并重新验收。
-
-使用与当前网络维度和归一化设置兼容的 checkpoint 开始微调：
-
-```bash
-bash scripts/training_python.sh scripts/train.py \
-  --headless --num_envs 512 --finetune \
-  --checkpoint outputs/training/20261027_113955/model_1200.pt \
-  --max_iterations 1000 --run_name implicit_pd
-```
-
-`--finetune` 加载全部网络权重与归一化统计，使用新优化器、从第 0 轮计数，默认初始
-学习率 `1e-4`，默认关闭 AdaBoot，使 Actor 在微调时全部使用 CENet 估计速度。
-Critic 和 CENet 的监督损失仍使用真实速度。可用 `--learning_rate` 和 `--adaboot`
-显式覆盖上述微调默认值。`--max_iterations` 是本次额外训练轮数。
-从头训练仍保留原有 AdaBoot 默认设置；`--resume` 保留优化器和轮次，适合继续同一配置训练。
-源 checkpoint 应使用与当前配置兼容的网络维度和归一化设置；形状/统计缺失会报错。
-每次运行在 `params/env.yaml`、`params/agent.yaml` 保存配置，checkpoint 元数据记录控制方式和源权重路径。
-
-微调结束后执行独立验收：
-
-```bash
-bash scripts/training_python.sh scripts/evaluate_policy.py \
-  --checkpoint outputs/training/bpx_dreamwaq/<新运行>/model_<轮次>.pt \
-  --num_envs 16 --duration 20 --output outputs/evaluation/explicit_pd.json
-```
-
-默认测试平地零指令和 `vx=0.3 m/s`，从默认站姿启动。输入为原始 450 维历史观测，
-内部归一化，CENet 使用确定性隐变量均值，Actor 输出动作均值；不使用 AdaBoot、真实速度替换
-或动作采样。验收与导出共享 checkpoint 加载器。Runner 的 `get_inference_policy()` 也接收
-`prop_history`，而不是 45 维单帧观测。
-
-每个环境都必须完成测试，且没有 terminated/truncated。前 1 秒只排除速度统计，
-其中的失败仍计入验收。之后逐环境计算平面速度向量误差和偏航角速度误差的 RMSE：
-站立默认门槛为 `0.05 m/s`、`0.10 rad/s`；移动为 `0.15 m/s`、`0.20 rad/s`。
-这些是可调整的工程验收门槛，不代表模型已经达标。JSON 同时记录每环境误差、失败次数、
-CENet 估计误差、checkpoint 哈希和控制参数。全部通过返回码为 0，未达标为 2。
-
-可重复 `--command VX VY WZ` 指定案例，或用 `--linear_tolerance`、`--yaw_tolerance`
-覆盖门槛。验收不覆盖起身、粗糙地形或 sim2sim；通过后仍需导出并在 MuJoCo 复核。
-
-偶发仿真数值异常的隔离、重置与训练样本排除机制见 [数值异常隔离](docs/NUMERICAL_QUARANTINE.md)。
+`task.md` 保留初始实现需求，不作为当前默认参数说明。模型资源许可证见
+[assets/robots/bpx/LICENSE](assets/robots/bpx/LICENSE)。

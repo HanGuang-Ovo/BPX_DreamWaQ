@@ -10,7 +10,8 @@ scripts/ → sim2real.cli → sim2real.runner → sim2real.sdk_robot → 官方 
                        ↘ sim2real.monitor → monitor_window / monitor_worker
                                                     ↘ diagnostics / monitor_input
 scripts/train.py → isaaclab（ManagerBasedRLEnv + RslRlVecEnvWrapper）
-                → tasks/agents/dreamwaq_ppo.DreamWaQRunner（CENet + PPO 联合训练）
+                → tasks/agents/dreamwaq_ppo.DreamWaQRunner（CENet + PPO，独立优化器）
+scripts/evaluate_policy.py → checkpoint 加载器 → 平地确定性验收 → JSON
 scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 → 12 维）
                         → policies/policy.onnx|pt → sim2sim / sim2real 推理
 ```
@@ -41,9 +42,14 @@ scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 �
 
 ## 当前部署契约
 
-- 仅一个策略模型：站立、行走和减速共用模型及连续历史。实机当前与
-  `bpx_mixed.toml` 共用 `policies/policy_20261023_iter2250_stable.onnx`，
+- 仅一个策略模型：站立、行走和减速共用模型及连续历史。当前实机模板引用
+  `policies/policy_20261023_iter2250_stable.onnx`，`bpx_mixed.toml` 引用
+  `policies/policy_20261029_iter5349.onnx`，两者不是同一权重；
   可通过 `--policy` 覆盖；通用导出入口仍默认输出 `policies/policy.onnx`。
+- 网络内部处理固定缩放或经验归一化；部署端输入原始观测，不重复缩放。
+- 训练使用 235 维 Critic 特权观测，部署只使用 450 维历史。
+- 训练/PLAY 与 MuJoCo 均为显式 PD；实机发送目标和 kp/kd，由固件执行。
+- 训练从站姿复位，历史接口 MuJoCo 配置从趴卧起身。
 - 起身由足端轨迹 + PD 执行，等待起身时保持初始姿态，不使用独立策略权重。
 - 12 维动作；`q_target = q_default + 0.5 × action`。
 - 默认角按策略顺序为 roll=0、pitch=0.7、knee=-1.4。
@@ -64,7 +70,12 @@ scripts/export_policy.py → checkpoint → DeployableDreamWaQPolicy（450 维 �
 - 命令行传入的配置、日志和策略覆盖路径相对于调用者当前目录。
 - 使用源码工作区或 `pip install -e .`；外部资源目前不制作独立 wheel 安装包。
 
-## 后续扩展位置
+## 配置与扩展位置
+
+训练默认值由 `tasks/rough_env_cfg.py` 和 `tasks/agents/rsl_rl_ppo_cfg.py` 定义，
+训练 CLI 覆盖后保存到运行目录 `params/`。部署 TOML 不参与训练配置。
+当前网络、奖励和课程见 [训练设计](TRAINING.md)。
+
 
 训练任务在 `tasks/` 添加，算法实验在 `algorithms/` 添加。奖励、课程、训练入口与
 Gym 环境注册已实现；新增奖励/课程时按现有 `RewardsCfg`、`CurriculumCfg` 接线，
