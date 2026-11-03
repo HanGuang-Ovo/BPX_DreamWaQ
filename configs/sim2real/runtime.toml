@@ -10,9 +10,9 @@ state_rate_hz = 100
 connect_timeout_s = 5.0
 
 [policy]
-# 与 configs/sim2sim/bpx_mixed.toml 使用同一份融合 CENet + Actor 模型。
-# 新训练导出后可改此路径，或通过入口的 --policy 临时指定。
-model = "../../policies/policy_20261023_iter2250_stable.onnx"
+# 融合 CENet + Actor 的单模型；实机与仿真独立选权重，接口契约保持一致。
+# 使用已验收权重时改此路径，或通过入口的 --policy 显式指定。
+model = "/home/hanguang/BPX_DreamWaQ/policies/policy_20261103_iter6300_stable.onnx"
 history_length = 10
 include_base_lin_vel = false
 observation_dimension = 450

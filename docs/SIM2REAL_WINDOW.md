@@ -6,6 +6,10 @@
 以下截图来自本工程实际 Tk 窗口，使用 DEMO 模拟反馈和当前 ONNX 模型，
 不是实机测量。截图字号为 20，默认启动字号仍为 32。
 
+在 VS Code 中按 `Ctrl+Shift+V` 打开 Markdown 预览，或按 `Ctrl+K V`
+在侧边预览；源码编辑视图只显示图片引用。若预览中图片未加载，可点击各图下方的
+“打开原图”链接（源码编辑视图中按住 `Ctrl` 点击链接），直接查看本地 PNG。
+
 ## 启动
 
 在本机图形桌面的终端中运行：
@@ -43,6 +47,8 @@ python scripts/visualize.py --gamepad-index 0
 
 ![启动前检查页，DEMO 模拟数据](images/sim2real/preflight-demo.png)
 
+[打开原图：启动前检查页](images/sim2real/preflight-demo.png)
+
 打开窗口后自动在后台检查模型和依赖，无需连接机器人。
 “重新检查模型（不连接）”可重新读取当前模型文件并试推理。
 `--no-policy` 会跳过模型加载。更换 TOML 配置或模型路径后需重启窗口。
@@ -65,6 +71,8 @@ python scripts/visualize.py --gamepad-index 0
 ## 实时反馈与姿态页
 
 ![关节反馈、姿态骨架和目标曲线，DEMO 模拟数据](images/sim2real/feedback-demo.png)
+
+[打开原图：实时反馈与姿态页](images/sim2real/feedback-demo.png)
 
 填写机器人 IP，点击“连接只读反馈”。窗口只创建 `RequestRobotState`，
 不创建运动控制对象，不发送速度、关节、起身、阻尼或标零命令。
@@ -93,6 +101,8 @@ DEMO 青色骨架是模拟反馈，不会跟随橙色目标执行行走。
 ## 官方定义 / 当前配置页
 
 ![官方定义与当前配置对照，DEMO 模拟数据](images/sim2real/parameters-demo.png)
+
+[打开原图：官方定义 / 当前配置页](images/sim2real/parameters-demo.png)
 
 对照官方示例与当前训练 / 部署参数，逐关节检查 SDK 通道、sign、offset、
 模型范围和 kp / kd。该页同时列出模型、runtime 和标定文件路径。

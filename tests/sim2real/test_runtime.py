@@ -446,11 +446,11 @@ class SDKTest(unittest.TestCase):
                 source.send(*[[0.0]*12]*5)
         self.assertEqual(r.setJointCommand.call_count,4)
         for call in r.setJointCommand.call_args_list[1:]:
-            self.assertEqual(call.args, ([0.]*12,[0.]*12,[1.]*12,[0.]*12,[0.]*12))
+            self.assertEqual(call.args, ([0.]*12,[0.]*12,[2.]*12,[0.]*12,[0.]*12))
         r.setZeroJointCommand.assert_not_called()
         r.disconnect.assert_called_once()
 
-    def test_normal_exit_uses_last_measured_position_and_unit_damping(self):
+    def test_normal_exit_uses_last_measured_position_and_increased_damping(self):
         r = self.robot()
         r.getJointPosition.return_value = [1.2]*12
         sdk=SimpleNamespace(JointLevelControl=Mock(return_value=r), __version__="1.0.9")
@@ -459,7 +459,7 @@ class SDKTest(unittest.TestCase):
         with source:
             source.send(*[[0.0]*12]*5)
         self.assertEqual(r.setJointCommand.call_args.args,
-                         ([0.]*12,[1.2]*12,[1.]*12,[0.]*12,[0.]*12))
+                         ([0.]*12,[1.2]*12,[2.]*12,[0.]*12,[0.]*12))
         r.setZeroJointCommand.assert_not_called()
 
     def test_exit_damping_error_does_not_mask_original_error(self):
@@ -470,6 +470,28 @@ class SDKTest(unittest.TestCase):
                 source.send(*[[0.0]*12]*5)
                 r.setJointCommand.side_effect=RuntimeError("damping failed")
                 raise ValueError("original failure")
+        r.disconnect.assert_called_once()
+
+    def test_disconnect_failure_preserves_original_control_error(self):
+        r = self.robot()
+        sdk = SimpleNamespace(JointLevelControl=Mock(return_value=r), __version__="1.0.9")
+        r.disconnect.side_effect = OSError("disconnect failed")
+        with self.assertRaisesRegex(ValueError, "control failed"):
+            with SDKSource(config(), joint_control=True, sdk=sdk) as source:
+                source.send(*[[0.] * 12] * 5)
+                raise ValueError("control failed")
+        self.assertEqual(r.setJointCommand.call_count, 4)  # one target + three damping attempts
+        r.disconnect.assert_called_once()
+
+    def test_connect_failure_is_preserved_when_cleanup_also_fails(self):
+        r = self.robot()
+        r.connect.side_effect = OSError("connect failed")
+        r.disconnect.side_effect = OSError("disconnect failed")
+        sdk = SimpleNamespace(RequestRobotState=Mock(return_value=r))
+        with self.assertRaisesRegex(OSError, "connect failed"):
+            with SDKSource(config(), sdk=sdk):
+                self.fail("A failed connection must not enter the context")
+        r.setJointCommand.assert_not_called()
         r.disconnect.assert_called_once()
 
 

@@ -1,4 +1,4 @@
-# DreamWaQ 450 维历史观测；崎岖路面 + 15 cm 踏面的分级上下楼梯，平地趴卧起身。
+# DreamWaQ 450 维历史观测；崎岖 + 上下楼梯 + 六类复杂路线，平地趴卧起身。
 # Term-major, oldest-to-newest; first frame fills history; updated at 50 Hz.
 [paths]
 mjcf = "assets/robots/bpx/mjcf/bpx.xml"
@@ -149,3 +149,11 @@ step_count = 5
 step_width = 0.15
 stair_width = 2.0
 platform_width = 1.20
+
+# 新路线位于 +Y 一侧，按列表顺序排列；均沿 +X，x=2..10 m。
+# 中心 y=4.5、7.5、10.5、13.5、16.5、19.5 m，宽 2 m，间隔 1 m。
+# 可删除部分名称关闭对应路线；位置按剩余列表重新排列。
+complex_sections = ["ramps", "cross_slope", "waves", "blocks", "hurdles", "stepping_stones"]
+# 高度倍率 0.25–2.0；默认坡道约 12°、横坡约 10°、波峰 8 cm、
+# 随机方块 3–12 cm、横向障碍 8 cm、踏石 10 cm。宽度与间距不随倍率变化。
+complex_scale = 1.0

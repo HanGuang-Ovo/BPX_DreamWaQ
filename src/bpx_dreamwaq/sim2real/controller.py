@@ -42,16 +42,24 @@ class ActorController:
         self.mode = self.router.mode
         return filtered
 
-    def step(self, sample, command, *, decision=None):
+    def observe(self, sample, command):
+        """按策略频率积累反馈，返回 (history, q, dq)，不运行模型或启动接管。
+
+        等待和起身阶段也调用此入口；上一动作来自最近成功发送的目标，
+        仅在尚无发送记录时用实测姿态初始化。
+        """
         cal = self.calibration
         q = cal.position_from_sdk(sample.q)
         dq = cal.velocity_from_sdk(sample.dq)
         gravity, angular = cal.imu(sample.quat_xyzw, sample.omega)
-        if self.started_at is None:
-            self.started_at = sample.host_time
-            self.initial_target = q.copy()
+        if self.last_action is None:
             self.last_action = ((q - cal.default) / self.config.policy["action_scale"]).astype(np.float32)
-            self.blender.start(self.last_action)
+        linear = sample.velocity_body if self.config.policy["include_base_lin_vel"] else None
+        frame = actor_frame(angular, gravity, command, q, dq, self.last_action, cal.default, linear)
+        return self.history.append(frame), q, dq
+
+    def step(self, sample, command, *, decision=None):
+        cal = self.calibration
         command = np.asarray(command, dtype=float)
         if command.shape != (3,) or not np.isfinite(command).all():
             raise ValueError("command 必须为三个有限值")
@@ -66,11 +74,14 @@ class ActorController:
             # 外部 decision 也必须遵守 Actor 的最终 command 范围。
             filtered = np.clip(filtered, -command_limit, command_limit)
             self.mode = decision.mode.value
-        linear = sample.velocity_body if self.config.policy["include_base_lin_vel"] else None
         if self.mode == "stand":
             filtered = np.zeros(3, dtype=np.float32)
-        frame = actor_frame(angular, gravity, filtered, q, dq, self.last_action, cal.default, linear)
-        observation = self.history.append(frame)
+        observation, q, dq = self.observe(sample, filtered)
+        if self.started_at is None:
+            self.started_at = sample.host_time
+            self.initial_target = q.copy()
+            # 接管仍从实测姿态插值，但不覆盖历史中的真实已发送动作。
+            self.blender.start(self.last_action)
         output = np.asarray(self.policy(observation), dtype=np.float32)
         if output.shape != (12,) or not np.isfinite(output).all():
             raise RuntimeError("Actor 输出无效")

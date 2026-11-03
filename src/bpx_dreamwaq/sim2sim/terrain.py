@@ -1,4 +1,4 @@
-"""Seeded rough ground and graded box stairs; terrain never enters policy input."""
+"""Seeded rough ground, stairs and complex lanes; terrain never enters policy input."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +8,7 @@ import mujoco
 import numpy as np
 
 from .config import Sim2SimConfig, TerrainConfig
+from .complex_terrain import add_complex_course, complex_lanes
 
 # One continuous heightfield includes flat shoulders, avoiding internal collider seams.
 X_MIN, X_MAX = -3.0, 11.0
@@ -73,6 +74,11 @@ def stair_lanes(config: TerrainConfig) -> tuple[StairLane, ...]:
 
 def region_at(x: float, y: float, config: TerrainConfig | None = None) -> str:
     if config is not None:
+        for lane in complex_lanes(config):
+            if abs(y - lane.y) <= lane.width / 2:
+                if lane.start <= x <= lane.end:
+                    return f"COMPLEX / {lane.label}"
+                return f"{lane.label} / APPROACH" if x < lane.start else "FLAT / RETURN PATH"
         if config.kind in ("stairs", "mixed"):
             for lane in stair_lanes(config):
                 if abs(y - lane.y) <= config.stair_width / 2:
@@ -122,19 +128,26 @@ def load_model(config: Sim2SimConfig) -> mujoco.MjModel:
         floor.set("size", "50 50 0.1")
     if config.terrain.kind in ("stairs", "mixed"):
         _add_stairs(world, config.terrain, ground_attributes)
+    complex_uploads = add_complex_course(asset, world, config.terrain, ground_attributes)
     model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
     # Bound rendering independently of the large flat return area.
     lanes = stair_lanes(config.terrain) if config.terrain.kind in ("stairs", "mixed") else ()
     y_min = lanes[-1].y - config.terrain.stair_width / 2 if lanes else -3.0
+    extra_lanes = complex_lanes(config.terrain)
+    y_max = extra_lanes[-1].y + extra_lanes[-1].width / 2 + 1 if extra_lanes else 3.0
     x_max = max(11.0, lanes[0].segments[-1][1] + 2) if lanes else 11.0
-    model.stat.center[:] = ((x_max - 3) / 2, (y_min + 3) / 2, 0.0)
-    model.stat.extent = max(x_max + 3, 3 - y_min)
+    model.stat.center[:] = ((x_max - 3) / 2, (y_min + y_max) / 2, 0.0)
+    model.stat.extent = max(x_max + 3, y_max - y_min)
     model.vis.map.shadowclip = 0.75
     model.vis.map.znear = 0.001
     if heights is not None:
         hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "three_level_course")
         address = model.hfield_adr[hid]
         model.hfield_data[address:address + heights.size] = normalized.ravel()
+    for name, values in complex_uploads:
+        hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, name)
+        address = model.hfield_adr[hid]
+        model.hfield_data[address:address + values.size] = values.ravel()
     return model
 
 
@@ -204,6 +217,9 @@ def add_course_labels(viewer, config: Sim2SimConfig) -> None:
             for lane in stair_lanes(config.terrain):
                 labels.append((2.5, lane.y - config.terrain.stair_width / 2 - 0.25,
                                f"STAIRS {lane.level} | {lane.step_height * 100:g} cm | UP / DOWN"))
+        for lane in complex_lanes(config.terrain):
+            labels.append((3.0, lane.y + lane.width / 2 + 0.25,
+                           f"{lane.label} | SCALE {config.terrain.complex_scale:g}"))
         for x, y, text in labels:
             if scene.ngeom >= scene.maxgeom:
                 raise RuntimeError("Viewer has insufficient capacity for course labels")

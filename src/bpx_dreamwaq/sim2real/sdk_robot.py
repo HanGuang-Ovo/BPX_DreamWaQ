@@ -46,7 +46,11 @@ class SDKSource:
             self._connection(True)
             return self
         except BaseException:
-            self.robot.disconnect()
+            try:
+                self.robot.disconnect()
+            except Exception:
+                # 连接失败时清理也可能失败，保留最初的连接/配置异常。
+                pass
             raise
 
     def _connection(self, connected):
@@ -210,10 +214,15 @@ class SDKSource:
                         if not self.robot.isConnected():
                             break
                         pos = self.last_position if self.last_position is not None else [0.] * 12
-                        self.robot.setJointCommand([0.] * 12, pos, [1.] * 12,
+                        self.robot.setJointCommand([0.] * 12, pos, [2.] * 12,
                                                    [0.] * 12, [0.] * 12)
                     except Exception:
                         pass
         finally:
-            self.robot.disconnect()
+            try:
+                self.robot.disconnect()
+            except Exception:
+                if exc is None:
+                    raise
+                # 已有控制/发送异常或 Ctrl+C 时，不让断开失败覆盖根因。
         return False

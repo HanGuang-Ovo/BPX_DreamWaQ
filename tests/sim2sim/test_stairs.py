@@ -63,7 +63,7 @@ class StairTerrainTest(unittest.TestCase):
         model = load_model(cfg)
 
         class Viewer:
-            user_scn = mujoco.MjvScene(model, maxgeom=10)
+            user_scn = mujoco.MjvScene(model, maxgeom=32)
             opt = mujoco.MjvOption()
             cam = mujoco.MjvCamera()
 
@@ -72,7 +72,7 @@ class StairTerrainTest(unittest.TestCase):
 
         viewer = Viewer()
         add_course_labels(viewer, cfg)
-        self.assertEqual(viewer.user_scn.ngeom, 7)
+        self.assertEqual(viewer.user_scn.ngeom, 13)
         for index, height in enumerate((3, 8, 10, 15), start=3):
             self.assertIn(f"{height} cm", viewer.user_scn.geoms[index].label)
         self.assertEqual(viewer.opt.geomgroup[5], 1)

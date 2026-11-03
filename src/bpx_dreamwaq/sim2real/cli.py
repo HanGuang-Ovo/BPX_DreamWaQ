@@ -173,7 +173,7 @@ def main(argv=None):
                         gamepad = stack.enter_context(GamepadCommandSource(
                             device, tuple(config.control["command_limit"]), init_button=BTN_TR,
                             deadman_button=BTN_TL if args.gamepad_deadman else None))
-                        print("手柄已连接：等待 RB 起身；摇杆控制速度。退出尝试 kp=0、kd=1 阻尼。", file=sys.stderr)
+                        print("手柄已连接：等待 RB 起身；摇杆控制速度。退出尝试 kp=0、kd=2 阻尼。", file=sys.stderr)
                     elif args.gamepad_device is not None or args.gamepad_index is not None or args.gamepad_deadman:
                         raise ValueError("constant 模式不能指定手柄参数")
                     count = run_live(

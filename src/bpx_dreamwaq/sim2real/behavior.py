@@ -91,9 +91,16 @@ class HardwareController:
             self.result = self.actor.step(sample, command)
             self.mode = self.actor.mode
             self.target = np.asarray(self.result["target_model"])
-        elif self.mode == "waiting_init":
-            self.target = self.waiting_target.copy()
-        if self.result is None or self.mode in ("waiting_init", "init"):
+        else:
+            if self.mode == "waiting_init":
+                self.target = self.waiting_target.copy()
+            if policy_due:
+                # CENet 在接管时读取最近十帧真实过程；100 Hz 发送帧不重复推进历史。
+                observation, q, dq = self.actor.observe(sample, np.zeros(3))
+                self.result = {"mode": self.mode, "command": [0., 0., 0.],
+                               "observation": observation.tolist(), "q_model": q.tolist(),
+                               "dq_model": dq.tolist()}
+        if self.result is None:
             self.result = {"mode": self.mode, "command": [0., 0., 0.]}
         init = self.config.init_controller
         desired_kp = np.full(12, init.stiffness) if self.mode == "init" else np.asarray(self.config.control["kp"])
@@ -103,6 +110,8 @@ class HardwareController:
         self.kp = self.gain_start[0] + alpha * (desired_kp - self.gain_start[0])
         self.kd = self.gain_start[1] + alpha * (desired_kd - self.gain_start[1])
         self.result.update(mode=self.mode, target_model=vector(self.target, 12, "target").tolist(),
+                           history_updated=bool(policy_due),
+                           inference_ran=bool(policy_due and self.mode in ("stand", "walk", "stopping")),
                            reason="waiting_for_RB" if self.mode == "waiting_init" else
                                   "timed_foot_trajectory" if self.mode == "init" else "policy_router",
                            init_phase=self.trajectory.phase if self.mode == "init" else "",

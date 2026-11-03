@@ -1,6 +1,6 @@
 # MuJoCo sim2sim
 
-按 2026-10-29 代码核对；文末有日期的结果保留为历史记录。
+按 2026-11-03 代码核对；文末有日期的结果保留为历史记录。
 
 ## 运行
 
@@ -37,7 +37,7 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 `--auto-init` 可让手柄模式也自动起身。`--direct-policy` 跳过状态机，供站姿接口对拍使用。
 默认 `zero` 后端只检查 PD 和流程，不产生策略步态。
 CLI 默认读取 `bpx_history.toml`（平地，450 维）；综合场地需显式传 `--config`。
-`bpx_mixed.toml` 当前引用 `policy_20261029_iter5349.onnx`，
+`bpx_mixed.toml` 当前引用 `policy_20261103_iter6300_stable.onnx`，
 而导出脚本默认生成 `policy.onnx`，使用新导出时请显式传 `--policy`。
 
 MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导致的自动退出。
@@ -54,7 +54,7 @@ MuJoCo 中已取消高度过低、倾角过大、躯干触地和 Init 超时导�
 | `flat` | 平地 |
 | `three_level` | 平地 → ±2 cm 崎岖 → ±4 cm 崎岖，含平地回程区域 |
 | `stairs` | 平地和多档上下楼梯 |
-| `mixed` | 同时包含崎岖路线和楼梯路线 |
+| `mixed` | 崎岖路线、楼梯路线，以及 TOML 启用的复杂路线 |
 
 综合场地出生点为 `(0, 0)`，面向 +X。崎岖路线位于 `x=2..10 m`、`y=-2..2 m`，
 边缘平滑过渡。`bpx_mixed.toml` 中楼梯起点均为 `x=2 m`，终点为 `x=4.4 m`，路线如下：
@@ -97,6 +97,62 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 仍在崎岖路线前的平地出生。`step_width=0.15` 指沿行走方向的单级踏面深度，
 `stair_width=2.0` 指整条楼梯的横向宽度。
 
+### 新增复杂路线
+
+综合配置还在 +Y 一侧加入六条复杂路线，每条宽 2 m，障碍区为 `x=2..10 m`，
+沿 +X 行进；路线间有 1 m 平地间隔，`x=0` 为平地起身区。
+原崎岖路线和楼梯在场地中的位置保持原有布局。
+
+| `--terrain-section` | 路线 | 默认几何尺寸 | 中心线 y |
+| --- | --- | --- | --- |
+| `ramps` | 上坡 → 高台 → 下坡 | 坡度约 12°，两端坡长各 2 m，顶部约 42.5 cm | 4.5 m |
+| `cross_slope` | 横向倾斜面 | 中部横坡约 10°，入口/出口及侧缘平滑连接平地 | 7.5 m |
+| `waves` | 连续波浪面 | 波峰 8 cm，波长 0.8 m，入口/出口渐变 | 10.5 m |
+| `blocks` | 随机方块 | 20×5 块，块宽 34 cm，格距 40 cm，高 3–12 cm | 13.5 m |
+| `hurdles` | 横向障碍 | 10 道，高 8 cm、厚 12 cm、宽 1.8 m，间距 0.8 m | 16.5 m |
+| `stepping_stones` | 交错踏石 | 13×3 块，高 10 cm、边长 45 cm、中心间距 60 cm | 19.5 m |
+
+坡道、横坡和波浪使用连续高度场，边界高度为零；高度场下方的回程地面已挖除对应区域，
+避免接缝重叠碰撞。方块、横障碍和踏石使用实体 box，保留竖直侧面，间隙下方仍是平地，
+因此踏石路线用于检验离散落脚与高差适应，不包含悬空深坑。
+所有新增碰撞体参与足端/机身接触检测和地面射线查询，CSV 的 `terrain_region` 显示路线名称。
+viewer 显示路线标签、颜色边线与高度倍率；标签和边线不参与碰撞。
+
+直接在某条路线前方出生：
+
+```bash
+# 使用综合配置中的默认模型，手柄 RB 起身后沿 +X 进入随机方块路线
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --backend onnx --terrain-section blocks --gamepad --viewer \
+    --log outputs/sim2sim/blocks.csv
+
+# 波浪路线，无手柄自动起身；显式选择权重，固定前进指令
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --backend onnx --policy policies/policy.onnx --terrain-section waves \
+    --complex-scale 0.5 --vx 0.2 --duration 45 --viewer
+
+# 仅检查新场地加载与起身，不加载策略权重
+python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
+    --terrain-section ramps --duration 6 --no-realtime
+```
+
+`--terrain-section` 与 `--stair-level` 互斥，只能选择当前 `mixed` 配置已启用的路线。
+不指定出生路线时仍从 `(0, 0)` 出生，可使用手柄横移到其他路线。
+切换到 `flat`、`stairs` 或 `three_level` 时不添加复杂路线。
+
+在 TOML `[terrain]` 中修改：
+
+```toml
+complex_sections = ["ramps", "cross_slope", "waves", "blocks", "hurdles", "stepping_stones"]
+complex_scale = 1.0
+```
+
+`complex_sections` 支持删减和重排，设为 `[]` 可关闭全部新增路线；中心线按列表顺序从
+`y=4.5 m` 开始，每次增加 3 m。`complex_scale` 或 CLI `--complex-scale` 取值为 `0.25–2.0`，
+统一缩放新增地形的高度，宽度、波长、间距保持不变；坡度随高度倍率变化。
+`--terrain-seed` 同时控制原崎岖面和随机方块，改变路线排列不改变方块的随机高度。
+这些参数只作用于 MuJoCo 验证场地，不调整训练地形或已训练策略。
+
 ## 关节与控制契约
 
 沿用 `/home/hanguang/BPX_test` 的映射与参数，实现均位于本工程，不依赖参考工程导入。
@@ -122,7 +178,7 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 | --- | --- | --- |
 | `bpx_history.toml` | 450 维历史 | 平地，CLI 默认 |
 | `bpx_terrain_history.toml` | 450 维历史 | 三段固定测试地形 |
-| `bpx_mixed.toml` | 450 维历史 | 崎岖 + 四档上下楼梯 |
+| `bpx_mixed.toml` | 450 维历史 | 崎岖 + 四档上下楼梯 + 六条复杂路线 |
 | `bpx_flat.toml` | 48 维单帧，含真实线速度 | 旧接口平地参考 |
 | `bpx_terrain_standing.toml` | 48 维单帧，含真实线速度 | 旧接口测试地形参考 |
 
@@ -131,6 +187,23 @@ python scripts/sim2sim.py --config configs/sim2sim/bpx_mixed.toml \
 `--velocity-window` / `--torque-window` 设置 1–30 秒窗口，默认 10 秒。
 `--log` 保存策略频率 CSV；`--no-realtime` 取消实时限速，便于离线仿真。
 训练和 MuJoCo 使用相同名义 PD，但物理引擎、接触与初始状态不同，不能只凭参数一致判断迁移成功。
+
+## 复杂地形验证记录（2026-11-03）
+
+`PYTHONPATH=src python -m unittest discover -s tests/sim2sim -v`：50 项通过。
+新增覆盖六类地形的米制高度、平地间隙、接缝、竖直侧面、足端与机身接触、
+种子复现、路线重排、高度倍率、可选路线、CLI 出生选择，以及每个平地出生区的 PD 起身与策略接管。
+`python scripts/check_project.py` 检查通过。
+
+另用综合配置默认的 `policy_20261103_iter6300_stable.onnx`，在六条路线各运行
+20 秒、固定 `vx=0.3 m/s`、自动起身：每条均完成 1000 个策略步并进入障碍区，
+状态保持有限值，最大前进位置为 `x=3.84–4.05 m`，最大倾角约 `0.285 rad`。
+这是起身、模型推理与新地形交互的短程冒烟验证，尚未覆盖每条路线至 `x=10 m` 的完整通过验收。
+本地报告和逐路线 CSV 位于 `outputs/sim2sim/complex_smoke/`，
+场地预览位于 `outputs/sim2sim/complex_course.png`。
+
+工程测试在修改前已有一项失败：`test_simulation_and_hardware_default_history_contract_matches`
+要求仿真与实机默认权重路径相同，而两个模板当前选择不同模型。本次保留各自模型选择。
 
 ## 验证记录（2026-10-21）
 

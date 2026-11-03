@@ -53,6 +53,49 @@ class SupportedSource(Source):
 
 
 class HardwareBehaviorTest(unittest.TestCase):
+    def test_init_history_is_continuous_and_uses_last_sent_action_at_takeover(self):
+        cfg, policy = config(), Policy(0.)
+        controller = HardwareController(cfg, policy=policy)
+        cal = controller.calibration
+        prone = np.array([0.] * 4 + [.98] * 4 + [-2.62] * 4)
+        controller.initialize(sample(cfg, q=cal.position_to_sdk(prone).tolist(),
+                                     telemetry={"motion_state": 0}))
+        expected = []
+        for tick in range(430):
+            t = tick * .01
+            # Deliberate tracking lag: measured angles differ from the sent trajectory.
+            measured = prone + .0002 * tick
+            feedback = sample(cfg, t=t, token=tick + 1, q=cal.position_to_sdk(measured).tolist(),
+                              omega=[t, 0., 0.], telemetry={"motion_state": 0})
+            policy_due = tick % 2 == 0
+            previous_action = controller.actor.last_action.copy()
+            before = None if controller.actor.history.frames is None else controller.actor.history.frames.copy()
+            if policy_due:
+                expected.append((t, measured - cal.default, previous_action))
+            result = controller.step(feedback, [.3, 0., 0.], now=t, policy_due=policy_due,
+                                     init_requested=tick == 10)
+            self.assertEqual(result["history_updated"], policy_due)
+            if not policy_due:
+                np.testing.assert_array_equal(controller.actor.history.frames, before)
+            if policy.observations:
+                self.assertEqual(tick, 410)
+                self.assertEqual(len(policy.observations), 1)
+                observation = policy.observations[0]
+                window = expected[-10:]
+                np.testing.assert_allclose(observation[:30].reshape(10, 3)[:, 0], [v[0] for v in window])
+                np.testing.assert_allclose(observation[90:210].reshape(10, 12), [v[1] for v in window], atol=1e-7)
+                np.testing.assert_allclose(observation[330:].reshape(10, 12), [v[2] for v in window], atol=1e-6)
+                np.testing.assert_allclose(observation[60:90], 0.)
+                # First target still holds measured pose, as in the verified BPX_test takeover.
+                np.testing.assert_allclose(result["target_model"], measured)
+                self.assertEqual(result["takeover_alpha"], 0.)
+                self.assertTrue(result["inference_ran"])
+                break
+            self.assertFalse(result["inference_ran"])
+            controller.commit_target(result["target_model"])
+        else:
+            self.fail("Init did not hand over to the policy")
+
     def test_live_constant_and_dynamic_commands_cannot_exceed_limits(self):
         for dynamic in (False, True):
             for sign in (1., -1.):

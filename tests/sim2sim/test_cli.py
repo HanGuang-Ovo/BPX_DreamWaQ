@@ -82,12 +82,31 @@ class CliTest(unittest.TestCase):
         for arguments in (["--terrain", "stairs", "--stair-level", "4"],
                           ["--stair-level", "1"], ["--terrain-seed", "-1"],
                           ["--step-heights", "0.1", "0.03"],
-                          ["--direct-policy", "--gamepad"], ["--direct-policy", "--auto-init"]):
+                          ["--direct-policy", "--gamepad"], ["--direct-policy", "--auto-init"],
+                          ["--terrain-section", "ramps"], ["--complex-scale", "3"],
+                          ["--config", "configs/sim2sim/bpx_mixed.toml", "--terrain", "stairs",
+                           "--terrain-section", "blocks"]):
             stderr = io.StringIO()
             with self.subTest(arguments=arguments), redirect_stderr(stderr):
                 self.assertEqual(main(arguments), 2)
                 self.assertIn("ERROR:", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_complex_route_spawn_and_scale_are_applied_before_runner_creation(self):
+        with patch("bpx_dreamwaq.sim2sim.cli.Sim2SimRunner") as runner, redirect_stdout(io.StringIO()):
+            runner.return_value.run.return_value.termination_reason = "duration"
+            runner.return_value.run.return_value.simulated_seconds = 1.
+            result = main(["--config", "configs/sim2sim/bpx_mixed.toml", "--terrain-section", "blocks",
+                           "--complex-scale", "0.5", "--duration", "1", "--no-realtime"])
+        self.assertEqual(result, 0)
+        config = runner.call_args.args[0]
+        self.assertEqual(config.initial_state.base_position, (0., 13.5, .13))
+        self.assertEqual(config.terrain.complex_scale, .5)
+        self.assertEqual(config.observation.dimension, 450)
+
+    def test_stair_and_complex_spawns_are_mutually_exclusive(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(["--stair-level", "1", "--terrain-section", "ramps"])
 
 
 if __name__ == "__main__":

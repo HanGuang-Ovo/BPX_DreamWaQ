@@ -4,6 +4,30 @@
 Stand/Walk/STOPPING 路由和退出阻尼。在本工程中，站立、行走和减速共用
 **一份融合 CENet + Actor 的 DreamWaQ ONNX 模型和连续观测历史**。
 
+## 与已验证 BPX_test 流程的对应关系
+
+按 2026-11-03 的 `BPX_test/sim2real` 实现及其本机配置核对：
+
+| 环节 | 本工程采用的方式 |
+| --- | --- |
+| 官方 SDK 通信 | 只读使用 `RequestRobotState`，控制使用 `JointLevelControl`；等待真实 TCP 连接后读取完整反馈 |
+| 高频反馈 | 以 `getJointStateSeqHighRate` 前后序号校验关节与 IMU 快照，读取中更新则重试 |
+| 坐标变换 | SDK 按腿排列、策略按关节类型排列；方向、偏移、四元数方向与 IMU 安装旋转由标定转换 |
+| 等待与起身 | 保持实测关节姿态，RB/R1 触发足端五次轨迹和解析 IK，按 4 秒轨迹时间完成 |
+| 接管 | 首次目标保持实测姿态，随后按接管时间平滑过渡；起身/策略增益独立混合 |
+| 行为切换 | Stand → Walk → STOPPING → Stand；保留参考工程的指令限幅、斜率限制、迟滞及驻留时间 |
+| 退出 | 首次尝试发送后，退出时尽力发送三次 `kp=0、kd=2` 阻尼，再断开；清理失败保留原始故障 |
+
+BPX_test 分别使用站立、行走模型。本工程使用同一份 DreamWaQ 模型，并让历史在等待、
+起身、站立、行走、减速之间连续保留。等待和起身时只按 50 Hz 构造零指令观测，不运行 Actor；
+100 Hz 的额外发送帧不推进历史。起身完成后的首次推理读取最近十帧真实反馈和已发送目标对应的动作，
+接管插值仍从当时的实测姿态开始，不用实测关节角覆盖“上一动作”。
+正常发送成功后才提交目标作为下一帧动作，发送失败进入退出清理。
+
+这部分逻辑分别位于 `sdk_robot.py`（SDK）、`calibration.py`（坐标）、
+`behavior.py`（实机起身与增益）、`controller.py`（观测与策略）、`runner.py`（双频率发送与录制），
+代码在 `src/bpx_dreamwaq/sim2real/` 下，不要求运行时导入参考工程。
+
 ## 运行环境
 
 本机已有 `bpx-real` 环境，可直接复用其中的 NumPy、ONNX Runtime、官方
@@ -40,13 +64,18 @@ cp -n configs/sim2real/joint_calibration.template.toml configs/sim2real/local.ca
 UDP 9873、关节 UDP 7895。本机配置已被 `.gitignore` 排除。
 
 实机模板默认模型为 `policies/policy_20261023_iter2250_stable.onnx`；
-当前 `configs/sim2sim/bpx_mixed.toml` 引用 `policy_20261029_iter5349.onnx`，两者不同。
+当前 `configs/sim2sim/bpx_mixed.toml` 引用 `policy_20261103_iter6300_stable.onnx`，两者不同。
 部署前应通过 `--policy` 或本机配置选择实际已验收的同一模型。模型文件不纳入 Git；
 其他机器需复制该文件，或使用本工程的 `scripts/export_policy.py` 导出模型。
 选用其他权重时，可修改 `[policy].model`，或在命令行中覆盖：
 
 ```bash
 python scripts/sim2real.py --policy policies/other.onnx check
+
+# scripts/monitor.py：打开监控窗口，显示关节反馈、姿态和策略目标等。
+# --policy policies/other.onnx：指定加载的 ONNX 模型。other.onnx 是示例名称，需要换成真实存在的模型文件。
+# --demo：使用模拟反馈，不连接机器人，也不发送控制命令。它用于检查界面和模型推理，不能验证机器人实际行走效果。
+
 python scripts/monitor.py --policy policies/other.onnx --demo
 ```
 
@@ -79,6 +108,8 @@ Actor 不读取真实机体线速度、里程计高度或地形扫描，速度�
 ```bash
 # 两者均不创建 SDK 对象、不连接机器人
 python scripts/sim2real.py check
+# 这条命令用于执行实机部署前的软件检查。虽然叫 run，但默认不会连接机器人，也不会发送控制命令。
+# 它会检查配置、ONNX 模型、依赖和输入输出尺寸等，并在终端输出检查结果，不打开监控窗口。
 python scripts/sim2real.py run
 
 # 模拟反馈 + 当前 ONNX 模型；不读取真实手柄
@@ -129,7 +160,7 @@ python scripts/sim2real.py --policy policies/other.onnx run --live
 3. 起身结束进入 Stand，平滑切换增益和策略目标；左摇杆控制 vx/vy，
    右摇杆水平控制 wz，持续推杆经防抖进入 Walk。
 4. 松杆后指令逐渐归零，经 STOPPING 回到 Stand。同一模型与历史始终连续。
-5. Ctrl+C、指定时长结束或运行异常时退出，尝试发送三次 kp=0、kd=1 阻尼
+5. Ctrl+C、指定时长结束或运行异常时退出，尝试发送三次 kp=0、kd=2 阻尼
    并断开 SDK。阻尼发送属于尽力处理，不能保证网络故障时送达。
 
 默认持续运行，日志自动保存至 `outputs/sim2real/live-<上海时间>.jsonl`。
@@ -145,6 +176,10 @@ python scripts/sim2real.py --policy policies/other.onnx run --live
 
 实机日志保存配置、标定、模型哈希、原始反馈、手柄指令、状态、动作、目标、
 增益和策略调度延迟。`inspect` 和 `run --live` 的日志均可离线分析与回放：
+
+`policy_due` 表示 50 Hz 策略时刻；`policy.history_updated` 表示本帧推进了历史，
+`policy.inference_ran` 表示本帧实际运行了 Actor。等待和起身期间前者可为真，后者为假；
+非策略发送帧保留最近一次观测与目标，并将这两个标志设为假。
 
 ```bash
 python scripts/sim2real.py analyze outputs/sim2real/live-01.jsonl
@@ -167,3 +202,18 @@ PYTHONPATH=src python -m unittest discover -s tests/project -v
 测试使用模拟 SDK、时钟与手柄；本地模型存在且安装 ONNX Runtime 时，
 还以当前 DreamWaQ 模型验证等待 → 起身 → Stand → Walk → STOPPING → Stand
 完整流程。这是软件链路验证，实机运动效果需在设备上另行验收。
+
+### 2026-11-03 本机核对结果
+
+- 使用 `bpx-real` 环境中的官方 SDK `1.0.9` 与 ONNX Runtime：软件预检 `ready: true`，
+  模型接口为 `[1,450] → [1,12]`，模型预热通过；检查过程未创建 SDK 对象。
+- 与参考工程的本机配置逐项核对网络、控制、起身、监控与策略接口参数；关节映射及 IMU 转换一致。
+  已创建本工程的 `local.runtime.toml` 和 `local.calibration.toml`，使用参考工程的网络/标定，
+  模型仍由本工程的 `[policy].model` 选择。这两个文件被 Git 忽略；其他机器按前文准备本机配置。
+- 401 个起身轨迹采样点与 BPX_test 相同；使用相同注入常量策略、跟随已发送目标的模拟反馈，
+  对照 900 个控制步骤，关节目标、增益和模式一致，最大数值差为零。
+  对照报告及参考文件哈希保存在本地 `outputs/sim2real/reference_alignment.json`。
+- sim2real 共 83 项测试：81 通过，2 项因没有图形桌面跳过；工程测试 9 项全部通过。
+  新增回归覆盖起身历史连续性、接管时反馈与已发送动作不一致，以及 SDK 清理失败时保留原始异常。
+
+以上结果是离线对照、模拟控制与模型试推理；本次未连接机器人，也未发送实机运动指令。

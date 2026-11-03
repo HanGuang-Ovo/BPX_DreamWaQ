@@ -12,6 +12,8 @@ from bpx_dreamwaq.runtime.init_controller import InitControllerConfig
 from bpx_dreamwaq.runtime.joints import POLICY_JOINT_NAMES
 from bpx_dreamwaq.paths import PROJECT_ROOT
 
+COMPLEX_TERRAIN_KINDS = ("ramps", "cross_slope", "waves", "blocks", "hurdles", "stepping_stones")
+
 
 @dataclass(frozen=True)
 class PathConfig:
@@ -89,12 +91,24 @@ class TerrainConfig:
     step_width: float = 0.30
     stair_width: float = 2.0
     platform_width: float = 1.20
+    complex_sections: tuple[str, ...] = ()
+    complex_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.kind not in ("flat", "three_level", "stairs", "mixed"):
             raise ValueError("terrain.kind must be flat, three_level, stairs or mixed")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("terrain.seed must be a nonnegative integer")
+        if not isinstance(self.complex_sections, (list, tuple)) or any(
+            section not in COMPLEX_TERRAIN_KINDS for section in self.complex_sections
+        ):
+            raise ValueError(f"terrain.complex_sections 必须为以下路线的列表：{COMPLEX_TERRAIN_KINDS}")
+        sections = tuple(self.complex_sections)
+        if len(set(sections)) != len(sections):
+            raise ValueError("terrain.complex_sections 不能包含重复路线")
+        object.__setattr__(self, "complex_sections", sections)
+        if not math.isfinite(self.complex_scale) or not 0.25 <= self.complex_scale <= 2.0:
+            raise ValueError("terrain.complex_scale 必须在 [0.25, 2.0] 内")
         if type(self.step_count) is not int or not 1 <= self.step_count <= 50:
             raise ValueError("terrain.step_count 必须是 1..50 的整数")
         heights = tuple(float(value) for value in self.step_heights)

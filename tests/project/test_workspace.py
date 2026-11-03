@@ -32,6 +32,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(all(assets["joint_contract"].values()))
 
     def test_simulation_and_hardware_default_history_contract_matches(self):
+        # 两端共用观测/动作契约，各自配置独立选择策略文件。
         sim = load_sim_config(CONFIGS_DIR / "sim2sim/bpx_mixed.toml")
         real = load_real_config(CONFIGS_DIR / "sim2real/runtime.toml")
         self.assertEqual(sim.observation.dimension, real.policy["observation_dimension"])
@@ -41,7 +42,6 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(sim.initial_state.default_joint_position, tuple(real.policy["default_joint_position"]))
         self.assertEqual(sim.control.action_scale, real.policy["action_scale"])
         self.assertEqual(sim.simulation.policy_dt, real.period)
-        self.assertEqual(sim.paths.policy, real.model_path())
 
     def test_source_has_no_imports_from_the_reference_project(self):
         legacy = {"BPX_test", "bpx_runtime", "bpx_sim2sim", "bpx_sim2real"}

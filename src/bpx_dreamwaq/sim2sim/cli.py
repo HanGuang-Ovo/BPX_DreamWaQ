@@ -11,7 +11,7 @@ import sys
 
 from bpx_dreamwaq.paths import CONFIGS_DIR
 
-from bpx_dreamwaq.sim2sim.config import load_config
+from bpx_dreamwaq.sim2sim.config import COMPLEX_TERRAIN_KINDS, load_config
 from bpx_dreamwaq.runtime.gamepad import (
     BTN_TL,
     BTN_TR,
@@ -32,12 +32,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="默认 zero，仅检查模型和控制框架；推理时显式选择 onnx/torchscript")
     parser.add_argument("--policy", type=Path, help="覆盖所选 ONNX 或 TorchScript 策略文件")
     parser.add_argument("--terrain", choices=("flat", "three_level", "stairs", "mixed"),
-                        help="覆盖地形：平地、分级崎岖、分级楼梯、崎岖+楼梯综合场地")
-    parser.add_argument("--terrain-seed", type=int, help="崎岖地形随机种子（固定种子可复现）")
+                        help="覆盖地形：平地、分级崎岖、分级楼梯、含可选复杂路线的综合场地")
+    parser.add_argument("--terrain-seed", type=int, help="崎岖面/随机方块种子（固定种子可复现）")
+    parser.add_argument("--complex-scale", type=float, help="复杂地形高度倍率，0.25–2.0，默认 1.0")
     parser.add_argument("--step-heights", type=float, nargs="+", metavar="METRES",
                         help="楼梯各等级单级高度，递增排列，例如 0.03 0.08 0.15")
-    parser.add_argument("--stair-level", type=int, metavar="N",
-                        help="在第 N 级楼梯前方的平地趴卧出生（从 1 开始；需要 stairs/mixed）")
+    spawn = parser.add_mutually_exclusive_group()
+    spawn.add_argument("--stair-level", type=int, metavar="N",
+                       help="在第 N 级楼梯前方的平地趴卧出生（从 1 开始；需要 stairs/mixed）")
+    spawn.add_argument("--terrain-section", choices=COMPLEX_TERRAIN_KINDS,
+                       help="在指定复杂路线前方出生（需要 mixed 配置启用该路线）")
     parser.add_argument("--device", default="cpu", help="TorchScript 设备，例如 cpu 或 cuda:0")
     parser.add_argument("--vx", type=float, default=None, help="机体 x 方向目标线速度，m/s")
     parser.add_argument("--vy", type=float, default=None, help="机体 y 方向目标线速度，m/s")
@@ -118,7 +122,7 @@ def _run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     terrain_overrides = {}
     for argument, field in ((args.terrain, "kind"), (args.terrain_seed, "seed"),
-                            (args.step_heights, "step_heights")):
+                            (args.step_heights, "step_heights"), (args.complex_scale, "complex_scale")):
         if argument is not None:
             terrain_overrides[field] = argument
     if terrain_overrides:
@@ -129,6 +133,14 @@ def _run(args: argparse.Namespace) -> int:
             raise ValueError("--stair-level 需要 stairs/mixed 地形，且等级必须在 step_heights 范围内")
         from .terrain import stair_lanes
         lane = stair_lanes(config.terrain)[args.stair_level - 1]
+        config = replace(config, initial_state=replace(
+            config.initial_state, base_position=(0.0, lane.y, config.initial_state.base_position[2]),
+        ))
+    if args.terrain_section is not None:
+        from .complex_terrain import complex_lanes
+        lane = next((lane for lane in complex_lanes(config.terrain) if lane.kind == args.terrain_section), None)
+        if lane is None:
+            raise ValueError("--terrain-section 需要 mixed 地形，并在 terrain.complex_sections 中启用对应路线")
         config = replace(config, initial_state=replace(
             config.initial_state, base_position=(0.0, lane.y, config.initial_state.base_position[2]),
         ))
