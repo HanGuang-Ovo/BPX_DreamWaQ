@@ -535,7 +535,7 @@ class RewardsCfg:
     # 移动/转向时在落脚瞬间评价腾空时间；加大权重以抑制短促碎步。
     feet_air_time = RewTerm(
         func=bpx_rewards.feet_air_time,
-        weight=0.75,
+        weight=1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*toe_link"),
             "command_name": "base_velocity",
