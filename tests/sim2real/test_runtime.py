@@ -101,6 +101,8 @@ class Source:
     def read(self):
         self.reads += 1
         connected = self.disconnect_at is None or self.clock.now() < self.disconnect_at
+        if not connected:
+            return Sample(self.clock.now(), session=1, connected=False)
         return sample(self.cfg, t=self.clock.now(), token=self.reads, q=list(self.q), connected=connected)
 
     def send(self, kp, target, kd, velocity, ff):
@@ -186,6 +188,18 @@ class RuntimeTest(unittest.TestCase):
         expected = np.asarray(DEFAULT_JOINT_POSITION)+50.
         np.testing.assert_allclose(result["target_model"], expected)
         self.assertGreater(result["target_model"][8], cfg.joints[8].maximum)
+
+    def test_state_guard_reports_disconnect_before_missing_or_cached_feedback(self):
+        cfg = config()
+        guard = StateGuard(cfg)
+        for state in (Sample(0., connected=False), replace(sample(cfg), connected=False)):
+            with self.subTest(state=state), self.assertRaisesRegex(RuntimeError, "TCP.*断开"):
+                guard.check(state)
+
+    def test_state_guard_distinguishes_incomplete_feedback_from_invalid_numbers(self):
+        cfg = config()
+        with self.assertRaisesRegex(ValueError, "SDK 反馈不完整，缺少：q, dq"):
+            StateGuard(cfg).check(replace(sample(cfg), q=None, dq=None))
 
     def test_nonfinite_policy_output_never_reaches_motor_command(self):
         for value in (np.nan, np.inf, -np.inf):
@@ -333,18 +347,26 @@ class RuntimeTest(unittest.TestCase):
         cfg, clock = config(True), Clock()
         source = Source(cfg, clock, disconnect_at=0.025)
         policy = Policy()
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(RuntimeError, "断开"):
-            run_live(
-                cfg,
-                Path(tmp) / "log.jsonl",
-                (0, 0, 0),
-                0.2,
-                armed=True,
-                policy=policy,
-                source_factory=lambda *a, **k: source,
-                clock=clock.now,
-                sleep=clock.sleep,
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.jsonl"
+            with self.assertRaisesRegex(RuntimeError, "TCP.*断开"):
+                run_live(
+                    cfg,
+                    path,
+                    (0, 0, 0),
+                    0.2,
+                    armed=True,
+                    policy=policy,
+                    source_factory=lambda *a, **k: source,
+                    clock=clock.now,
+                    sleep=clock.sleep,
+                )
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            fault = rows[-2]
+            self.assertEqual(fault["type"], "fault")
+            self.assertFalse(fault["connected"])
+            self.assertIn("q", fault["missing_feedback"])
+            self.assertEqual(rows[-1]["error"], fault["error"])
         self.assertLessEqual(len(source.commands), 3)
         self.assertTrue(source.exited)
 

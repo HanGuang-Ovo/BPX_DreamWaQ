@@ -24,8 +24,9 @@ joint_names = ["fl_hip_roll_joint", "fr_hip_roll_joint", "hl_hip_roll_joint", "h
 # command_limit/command_slew_rate 定义手柄速度与 Stand/Walk 路由，不限制关节运动目标。
 policy_rate_hz = 50
 send_rate_hz = 100
-kp = [40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
-kd = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+# 起身后的 Stand/Walk/STOPPING 使用此增益；训练基准为 kp=40、kd=1。
+kp = [60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60]
+kd = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
 takeover_duration_s = 2.0
 action_blend_duration_s = 0.3
 command_limit = [0.7, 0.4, 0.7]

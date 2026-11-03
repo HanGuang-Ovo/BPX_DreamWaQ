@@ -1,4 +1,4 @@
-"""实机仅检查数值有效性和四元数模长。"""
+"""检查连接、必需反馈是否完整、数值有效性和四元数模长。"""
 
 import numpy as np
 
@@ -23,6 +23,16 @@ class StateGuard:
         self.config = config
 
     def check(self, sample, now=None, *, require_imu=True, hardware=False, require_odometry=False):
+        if not sample.connected:
+            raise RuntimeError("SDK TCP 连接已断开；本次控制已停止，不自动恢复运动")
+        required = ["q", "dq"]
+        if require_imu:
+            required.extend(("quat_xyzw", "omega"))
+        if require_odometry or self.config.policy["include_base_lin_vel"]:
+            required.append("velocity_body")
+        missing = [name for name in required if getattr(sample, name) is None]
+        if missing:
+            raise ValueError("SDK 反馈不完整，缺少：" + ", ".join(missing))
         if not np.isfinite(sample.host_time):
             raise ValueError("反馈主机时间必须为有限数")
         vector(sample.q, 12, "joint position")

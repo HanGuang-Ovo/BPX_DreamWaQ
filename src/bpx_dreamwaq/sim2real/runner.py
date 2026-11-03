@@ -86,7 +86,14 @@ def run_live(config, output_path, command, duration, *, armed=False, policy=None
                 if duration is not None and now - start + 1e-9 >= duration:
                     break
                 sample = source.read()
-                guard.check(sample)
+                try:
+                    guard.check(sample)
+                except (RuntimeError, ValueError) as exc:
+                    log.write({"type": "fault", "host_time": clock(), "error": str(exc),
+                               "mode": controller.mode, "connected": bool(sample.connected),
+                               "missing_feedback": [name for name in ("q", "dq", "quat_xyzw", "omega", "velocity_body")
+                                                    if getattr(sample, name) is None]})
+                    raise
                 now = clock()
                 policy_due = now + 1e-9 >= next_policy
                 policy_lateness = max(0., now - next_policy) if policy_due else 0.

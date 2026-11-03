@@ -91,7 +91,7 @@ TOML 中的模型和标定路径相对于配置文件；命令行 `--policy` 路
 | 策略关节顺序 | FL/FR/HL/HR roll，然后四腿 pitch，然后四腿 knee |
 | 对应 SDK 通道 | `[0,3,6,9,1,4,7,10,2,5,8,11]` |
 | 动作目标 | `q_default + 0.5 × action`；每腿默认 `[0,0.7,-1.4]` rad |
-| 策略增益 | kp=40、kd=1；起身增益 kp=80、kd=2 |
+| 策略增益 | 实机调试 kp=60、kd=1.5（待实机验证；训练基准 kp=40、kd=1）；起身增益 kp=80、kd=2 |
 | 手柄最大指令 | vx=±0.7 m/s、vy=±0.4 m/s、wz=±0.7 rad/s |
 
 Actor 不读取真实机体线速度、里程计高度或地形扫描，速度估计在 CENet
@@ -167,6 +167,9 @@ python scripts/sim2real.py --policy policies/other.onnx run --live
 `--gamepad-deadman` 可要求按住 LB 才接受摇杆速度，RB 起身仍独立生效。
 `--command-source constant --vx ...` 用于已站立状态的固定指令接管，
 不提供 RB 起身请求。手柄断开或事件丢失时结束当前控制会话。
+SDK 报告 TCP 断开或必需反馈缺失时，同样结束本次控制，不自动恢复运动。
+运行循环中的反馈检查失败会记录一条 `fault`，包含控制阶段、连接状态和缺失字段；
+随后 `end` 记录保留原始错误。SDK 自身提示“automatic reconnect enabled”不表示应用会恢复控制。
 
 沿用 `BPX_test` 的实机处理范围：检查有限数和四元数模长 `[0.5,1.5]`，
 不增加高度、接地、倾角、跟踪误差、身份或 verified 启动门槛。
